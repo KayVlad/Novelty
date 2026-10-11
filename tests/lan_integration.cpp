@@ -25,22 +25,20 @@ int main(int argc, char **argv) {
         if (!QDir().mkpath(temp.path() + "/deck") || !QDir().mkpath(temp.path() + "/desktop"))
             throw std::runtime_error("Cannot create LAN fixture Games folders.");
         QDir().mkpath(temp.path() + "/deck/Game/saves");
-        QDir().mkpath(temp.path() + "/desktop/Another folder");
-        QFile deckExe(temp.path() + "/deck/Game/game.exe"), desktopExe(temp.path() + "/desktop/Another folder/game.exe");
+        QDir().mkpath(temp.path() + "/desktop/Game");
+        QFile deckExe(temp.path() + "/deck/Game/game.exe"), desktopExe(temp.path() + "/desktop/Game/game.exe");
         if (!deckExe.open(QIODevice::WriteOnly) || !desktopExe.open(QIODevice::WriteOnly))
             throw std::runtime_error("Cannot create LAN fixture executables.");
         deckExe.close(); desktopExe.close();
         Library deck(temp.path() + "/deck"), desktop(temp.path() + "/desktop");
         deck.import({inspect(temp.path() + "/deck/Game")}, {});
-        desktop.import({inspect(temp.path() + "/desktop/Another folder")}, {});
+        desktop.import({inspect(temp.path() + "/desktop/Game")}, {});
         const auto deckGame = deck.games().first(), desktopGame = desktop.games().first();
         auto sourceConfig = loadSaveConfig(deck, deckGame.id);
-        sourceConfig.gameIdentity = "fixture:story"; sourceConfig.releaseIdentity = "build-1";
-        sourceConfig.saveCompatibility = "format-1"; sourceConfig.mappings = {{"game", "saves"}};
+        sourceConfig.mappings = {{"game", "saves"}};
         saveSaveConfig(deck, deckGame.id, sourceConfig);
         auto targetConfig = loadSaveConfig(desktop, desktopGame.id);
-        targetConfig.gameIdentity = sourceConfig.gameIdentity; targetConfig.releaseIdentity = sourceConfig.releaseIdentity;
-        targetConfig.saveCompatibility = sourceConfig.saveCompatibility; targetConfig.mappings = sourceConfig.mappings;
+        targetConfig.mappings = sourceConfig.mappings;
         saveSaveConfig(desktop, desktopGame.id, targetConfig);
         QFile save(deckGame.folder + "/saves/slot1.sav");
         if (!save.open(QIODevice::WriteOnly) || save.write("LAN progress") != 12)
@@ -50,7 +48,7 @@ int main(int argc, char **argv) {
         LanListener listener(deck, true);
         if (!listener.listen(QHostAddress::LocalHost, 0)) {
             std::puts("SKIP: localhost TCP binding is unavailable here");
-            return 0;
+            return 77;
         }
         QString firstPhrase, secondPhrase, error;
         bool serverReady = false, clientReady = false;

@@ -433,6 +433,7 @@ void Library::relink(const RelinkPlan &plan) {
         store(g);
         sql(db_, "COMMIT");
     } catch (...) { db_.rollback(); throw; }
+    recordSaveFolderRename(*this, id, QFileInfo(plan.original.folder).fileName());
     if (duplicateLock) { duplicateLock->unlock(); QDir().rmdir(duplicateDirectory); }
 }
 int Library::reconcileFolders(const DiscoverySnapshot &snapshot) {

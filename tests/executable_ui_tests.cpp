@@ -1,8 +1,10 @@
 #include "window.h"
 #include "provisioning.h"
 #include "metadata.h"
+#include "saves.h"
 #include <QtWidgets/qapplication.h>
 #include <QtWidgets/qdialog.h>
+#include <QtWidgets/qdialogbuttonbox.h>
 #include <QtWidgets/qlabel.h>
 #include <QtWidgets/qlineedit.h>
 #include <QtWidgets/qlistwidget.h>
@@ -22,6 +24,7 @@
 #include <QtCore/qtimer.h>
 #include <stdexcept>
 #include <cstdio>
+#include <cstdlib>
 
 using namespace novelty;
 
@@ -61,6 +64,19 @@ int main(int argc, char **argv) {
     QApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QApplication app(argc, argv);
     if (argc < 2) return 1;
+    QTimer fixtureWatchdog;
+    fixtureWatchdog.setSingleShot(true);
+    QObject::connect(&fixtureWatchdog, &QTimer::timeout, &app, [&] {
+        const auto modal = QApplication::activeModalWidget();
+        std::fprintf(stderr, "FAIL: UI fixture stalled in %s %s: %s\n",
+                     modal ? modal->metaObject()->className() : "none",
+                     modal ? modal->objectName().toUtf8().constData() : "no modal dialog",
+                     modal ? modal->windowTitle().toUtf8().constData() : "");
+        if (modal) for (const auto label : modal->findChildren<QLabel *>())
+            std::fprintf(stderr, "  %s\n", label->text().toUtf8().constData());
+        std::_Exit(2);
+    });
+    fixtureWatchdog.start(20000);
     QTemporaryDir temporary;
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, temporary.path());
@@ -149,11 +165,18 @@ int main(int argc, char **argv) {
         while (firstPlayDeadline.elapsed() < 8000 && !QFileInfo::exists(library.prefix(pending.id) + "/played")) {
             QCoreApplication::processEvents(); QThread::msleep(10);
         }
-        require(QFileInfo::exists(library.prefix(pending.id) + "/played"),
-                "First Play did not continue to launch after executable selection");
-        while (firstPlayDeadline.elapsed() < 8000 && library.busy(pending.id)) {
+        if (!QFileInfo::exists(library.prefix(pending.id) + "/played")) {
+            const auto status = readJson(library.gamePath(pending.id, "status.json"));
+            throw std::runtime_error(("First Play did not continue after executable selection: " +
+                status["message"].toString() + " (state=" + status["state"].toString() + ")").toStdString());
+        }
+        while (firstPlayDeadline.elapsed() < 12000 &&
+               (library.busy(pending.id) ||
+                readJson(library.gamePath(pending.id, "status.json"))["state"].toString() == "Starting")) {
             QCoreApplication::processEvents(); QThread::msleep(10);
         }
+        require(readJson(library.gamePath(pending.id, "status.json"))["state"].toString() == "Ready",
+                "First Play did not finish before the next Add flow");
         QThread::msleep(550); QCoreApplication::processEvents(); // Let the window's launch poll clear its pending ID.
         const auto setup = temporary.path() + "/Media/setup.exe";
         touch(setup);
@@ -205,15 +228,42 @@ int main(int argc, char **argv) {
             table->setCurrentIndex(table->model()->index(row, 0)); selected = true; break;
         }
         require(selected, "First Play game missing from the library");
+        bool savedSimplePath = false;
+        QTimer::singleShot(0, &firstPlay, [&] {
+            auto dialog = firstPlay.findChild<QDialog *>("manageDialog");
+            auto location = dialog ? dialog->findChild<QLineEdit *>("saveLocation") : nullptr;
+            auto history = dialog ? dialog->findChild<QListWidget *>("saveSnapshots") : nullptr;
+            auto sync = dialog ? dialog->findChild<QPushButton *>("syncSavesFromPeer") : nullptr;
+            auto buttons = dialog ? dialog->findChild<QDialogButtonBox *>() : nullptr;
+            if (!location || !history || !sync || !buttons ||
+                dialog->findChild<QLineEdit *>("saveGameIdentity") ||
+                dialog->findChild<QPushButton *>("saveMappingsButton") ||
+                dialog->findChild<QPushButton *>("createSaveSnapshot")) {
+                if (dialog) dialog->reject(); return;
+            }
+            location->setText("UserData"); location->setModified(true);
+            savedSimplePath = true;
+            buttons->button(QDialogButtonBox::Save)->click();
+        });
+        firstPlay.manage();
+        require(savedSimplePath && loadSaveConfig(library, firstPlayGame.id).mappings.size() == 1 &&
+                loadSaveConfig(library, firstPlayGame.id).mappings.first().path == "UserData",
+                "simple Saves tab persists the one manual path through global Save");
         firstPlay.launch();
         deadline.restart();
         while (deadline.elapsed() < 8000 && !QFileInfo::exists(library.prefix(firstPlayGame.id) + "/played")) {
             QCoreApplication::processEvents(); QThread::msleep(10);
         }
-        require(library.game(firstPlayGame.id).runner == managedRunner &&
-                QFileInfo::exists(library.prefix(firstPlayGame.id) + "/played") &&
-                QFileInfo::exists(library.dataRoot() + "/runtime/preflight-invoked"),
-                "First Play did not choose GE, prepare its Steam Linux Runtime and launch");
+        if (library.game(firstPlayGame.id).runner != managedRunner ||
+            !QFileInfo::exists(library.prefix(firstPlayGame.id) + "/played") ||
+            !QFileInfo::exists(library.dataRoot() + "/runtime/preflight-invoked")) {
+            const auto status = readJson(library.gamePath(firstPlayGame.id, "status.json"));
+            throw std::runtime_error(("First Play did not continue: " +
+                status["message"].toString() + " (runner=" + library.game(firstPlayGame.id).runner +
+                ", played=" + QString::number(QFileInfo::exists(library.prefix(firstPlayGame.id) + "/played")) +
+                ", preflight=" + QString::number(QFileInfo::exists(library.dataRoot() + "/runtime/preflight-invoked")) +
+                ")").toStdString());
+        }
         const auto runtimeRoot = temporary.path() + "/Runtime preparation";
         const auto runtimeRunner = temporary.path() + "/Runtime runner";
         touch(runtimeRoot + "/Game/play.exe"); touch(runtimeRunner + "/proton");

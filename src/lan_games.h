@@ -70,5 +70,6 @@ private:
 // Validate the complete untrusted manifest before creating or fetching files.
 void validateLanGameManifest(const QJsonObject &descriptor,
                              const QList<LanGameExchange::Entry> &entries, qint64 totalBytes);
+QPair<QList<LanGameExchange::Entry>, qint64> previewLanGameManifest(const Library &, const QString &gameId);
 
 } // namespace novelty

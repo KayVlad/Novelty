@@ -18,8 +18,7 @@ PeerRefreshResult refreshLinkedPeerSaves(Library &library, const QString &gameId
     if (library.busy(gameId)) throw std::runtime_error("Wait for the game to finish before checking peer saves.");
     const auto config = loadSaveConfig(library, gameId);
     PeerRefreshResult result;
-    if (config.gameIdentity.isEmpty() || config.releaseIdentity.isEmpty() ||
-        config.saveCompatibility.isEmpty() || config.mappings.isEmpty()) return result;
+    if (config.mappings.isEmpty()) return result;
     const auto peers = trustedPeers(library);
     for (const auto &peer : peers) {
         QString linkedId;
@@ -63,6 +62,21 @@ PeerRefreshResult refreshLinkedPeerSaves(Library &library, const QString &gameId
                             if (!match.isEmpty()) { finish("Peer reported duplicate game identities."); return; }
                             match = item;
                         }
+                    }
+                    if (match.isEmpty() && matches.size() == 1 && linkedId == config.profileGameId) {
+                        match = matches.first().toObject();
+                        const auto remoteId = match["profile_game_id"].toString();
+                        if (QUuid(remoteId).isNull()) { finish("Peer reported an invalid game identity."); return; }
+                        try {
+                            linkPeerSaveGame(library, gameId, peer.fingerprint, remoteId);
+                            linkedId = remoteId;
+                        } catch (const std::exception &e) { finish(QString::fromUtf8(e.what())); return; }
+                    } else if (match.isEmpty() && matches.size() > 1) {
+                        finish("Several peer games share this folder name. Choose the matching game in Saves."); return;
+                    }
+                    if (match["compatibility_issue"].toBool()) {
+                        finish("This linked game's saved edition or compatibility labels differ. Review them before syncing.");
+                        return;
                     }
                     const auto snapshotId = match["snapshot_id"].toString();
                     if (snapshotId.isEmpty() || snapshotId == appliedSaveSnapshotId(library, gameId)) {

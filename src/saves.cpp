@@ -39,6 +39,14 @@ bool profileGameMatches(const SaveConfig &config, const QString &profileGameId,
             (authenticatedPeer.isEmpty() || link.fingerprint == authenticatedPeer)) return true;
     return false;
 }
+bool labelCompatible(const QString &expected, const QString &actual) {
+    return expected.isEmpty() || actual.isEmpty() || expected == actual;
+}
+bool labelsCompatible(const SaveConfig &config, const QJsonObject &manifest) {
+    return labelCompatible(config.gameIdentity, manifest["game_identity"].toString()) &&
+           labelCompatible(config.releaseIdentity, manifest["release_identity"].toString()) &&
+           labelCompatible(config.saveCompatibility, manifest["save_compatibility"].toString());
+}
 QString configPath(const Library &lib, const QString &id) { return lib.gamePath(id, "saves.json"); }
 QString journalPath(const Library &lib, const QString &id) { return lib.gamePath(id, "save-restore.json"); }
 QString pendingPath(const Library &lib, const QString &id) { return lib.gamePath(id, "save-pending.json"); }
@@ -119,6 +127,10 @@ void validate(const Library &lib, const Game &game, const SaveConfig &config) {
         if (identity.size() > 256 || identity.contains(QChar::Null)) fail("Save identity is too long or invalid.");
     if (config.mappings.size() > 32) fail("Use at most 32 save locations per game.");
     if (config.peerLinks.size() > 32) fail("Use at most 32 paired game links.");
+    if (config.folderAliases.size() > 8) fail("Too many previous game folder names.");
+    for (const auto &alias : config.folderAliases)
+        if (alias.isEmpty() || alias.size() > 100 || alias.contains('/') || alias.contains(QChar::Null))
+            fail("A previous game folder name is invalid.");
     QSet<QString> linkedPeers;
     for (const auto &link : config.peerLinks) {
         if (!validFingerprint(link.fingerprint) || !validToken(link.profileGameId) ||
@@ -145,7 +157,8 @@ QJsonObject configJson(const SaveConfig &config) {
     return {{"schema", 2}, {"profile_id", config.profileId}, {"profile_game_id", config.profileGameId},
             {"game_identity", config.gameIdentity}, {"release_identity", config.releaseIdentity},
             {"save_compatibility", config.saveCompatibility}, {"discovery_state", config.discoveryState},
-            {"discovery_source", config.discoverySource}, {"candidates", config.candidates}, {"mappings", mappings},
+            {"discovery_source", config.discoverySource}, {"candidates", config.candidates},
+            {"folder_aliases", QJsonArray::fromStringList(config.folderAliases)}, {"mappings", mappings},
             {"peer_links", peerLinks}};
 }
 SaveConfig parseConfig(const QJsonObject &data, const QString &gameId) {
@@ -159,6 +172,11 @@ SaveConfig parseConfig(const QJsonObject &data, const QString &gameId) {
         config.discoveryState = data["discovery_state"].toString();
         config.discoverySource = data["discovery_source"].toString();
         config.candidates = data["candidates"].toArray();
+        if (data.contains("folder_aliases") && !data["folder_aliases"].isArray()) fail("Previous folder names are damaged.");
+        for (const auto &value : data["folder_aliases"].toArray()) {
+            if (!value.isString()) fail("Previous folder name is damaged.");
+            config.folderAliases.append(value.toString());
+        }
         if (data.contains("peer_links") && !data["peer_links"].isArray()) fail("Paired game links are damaged.");
         for (const auto &value : data["peer_links"].toArray()) {
             if (!value.isObject()) fail("Paired game link is damaged.");
@@ -237,175 +255,98 @@ void resolveDeclaredSavePaths(Library &lib, const Game &game, SaveConfig &config
     validate(lib, game, config);
     if (config.discoveryState == "identified") writeJson(configPath(lib, game.id), configJson(config));
 }
-struct ObservedRoot { SaveMapping mapping; QString absolute; };
-QList<ObservedRoot> likelyRoots(const Library &lib, const Game &game) {
-    QList<ObservedRoot> roots;
-    const auto add = [&](const SaveMapping &mapping) {
-        const auto path = targetPath(lib, game, mapping);
-        roots.append({mapping, path});
+QString saveNameKey(const QString &name) {
+    QString key;
+    for (const auto ch : name.normalized(QString::NormalizationForm_KC).toCaseFolded())
+        if (ch.isLetterOrNumber()) key.append(ch);
+    return key;
+}
+QList<SaveMapping> heuristicSaveMappings(const Library &lib, const Game &game) {
+    QList<SaveMapping> found;
+    QSet<QString> paths;
+    const auto add = [&](const QString &absolute) {
+        if (!QFileInfo(absolute).isDir() || QFileInfo(absolute).isSymbolicLink()) return;
+        try {
+            const auto mapping = saveMappingFromPath(lib, game, absolute);
+            if (!paths.contains(absolute)) { paths.insert(absolute); found.append(mapping); }
+        } catch (const std::exception &) { /* Unsafe or unsupported paths are never candidates. */ }
     };
-    for (const auto &relative : {"save", "saves", "savedata", "save_data", "game/saves", "game/savedata"})
-        add({"game", relative});
-    const auto appdata = mappingRoot(lib, game, "appdata");
-    const auto renpy = appdata + "/RenPy";
-    if (QFileInfo(renpy).isDir() && !QFileInfo(renpy).isSymbolicLink()) {
-        int count = 0;
-        for (const auto &folder : QDir(renpy).entryInfoList(QDir::Dirs | QDir::NoSymLinks | QDir::NoDotAndDotDot, QDir::Name)) {
-            if (++count > 24) break;
-            add({"appdata", "RenPy/" + folder.fileName()});
+    const QStringList conventional = {"save", "saves", "savedata", "save_data", "userdata", "user_data",
+                                      "game/saves", "game/savedata"};
+    QStringList bases{game.folder};
+    const auto executableDirectory = QFileInfo(game.executable).absolutePath();
+    if (executableDirectory.startsWith(game.folder + '/') && executableDirectory != game.folder)
+        bases.append(executableDirectory);
+    for (const auto &base : bases) {
+        for (const auto &relative : conventional) {
+            QStringList current{base};
+            for (const auto &part : QString(relative).split('/')) {
+                QStringList next;
+                for (const auto &parent : current) {
+                    if (QFileInfo(parent).isSymbolicLink()) continue;
+                    for (const auto &child : QDir(parent).entryInfoList(QDir::Dirs | QDir::NoSymLinks |
+                                                      QDir::NoDotAndDotDot, QDir::Name))
+                        if (child.fileName().compare(part, Qt::CaseInsensitive) == 0)
+                            next.append(child.absoluteFilePath());
+                }
+                current = next;
+                if (current.isEmpty()) break;
+            }
+            for (const auto &path : current) add(path);
         }
     }
-    const auto myGames = mappingRoot(lib, game, "documents") + "/My Games";
-    if (QFileInfo(myGames).isDir() && !QFileInfo(myGames).isSymbolicLink()) {
-        int count = 0;
-        for (const auto &folder : QDir(myGames).entryInfoList(QDir::Dirs | QDir::NoSymLinks | QDir::NoDotAndDotDot, QDir::Name)) {
-            if (++count > 24) break;
-            add({"documents", "My Games/" + folder.fileName()});
+
+    QSet<QString> titles;
+    for (const auto &name : {game.name, QFileInfo(game.folder).fileName(), game.metadata["title"].toString(),
+                             game.metadata["original_title"].toString()})
+        if (auto key = saveNameKey(name); key.size() >= 3) titles.insert(key);
+    const auto stem = saveNameKey(QFileInfo(game.executable).completeBaseName());
+    if (stem.size() >= 4 && !QSet<QString>{"game", "start", "launcher", "setup", "play", "autorun"}.contains(stem))
+        titles.insert(stem);
+    const auto users = lib.prefix(game.id) + "/drive_c/users";
+    int userCount = 0;
+    for (const auto &user : QDir(users).entryInfoList(QDir::Dirs | QDir::NoSymLinks |
+                                                     QDir::NoDotAndDotDot, QDir::Name)) {
+        if (user.fileName().compare("Public", Qt::CaseInsensitive) == 0 || ++userCount > 4) continue;
+        for (const auto &relative : {"Saved Games", "Documents", "AppData/Roaming", "AppData/Local",
+                                     "AppData/LocalLow"}) {
+            const auto root = user.absoluteFilePath() + '/' + relative;
+            if (!QFileInfo(root).isDir() || QFileInfo(root).isSymbolicLink()) continue;
+            int budget = 512;
+            const auto walk = [&](auto &&self, const QString &directory, int depth) -> void {
+                if (depth > 4 || budget <= 0) return;
+                for (const auto &child : QDir(directory).entryInfoList(QDir::Dirs | QDir::NoSymLinks |
+                                                                  QDir::NoDotAndDotDot, QDir::Name)) {
+                    if (--budget < 0) break;
+                    const auto key = saveNameKey(child.fileName());
+                    if (QSet<QString>{"cache", "caches", "logs", "temp", "tmp", "shadercache"}.contains(key)) continue;
+                    if (titles.contains(key)) add(child.absoluteFilePath());
+                    else if (depth < 4) self(self, child.absoluteFilePath(), depth + 1);
+                }
+            };
+            walk(walk, root, 1);
         }
     }
-    return roots;
+    return found;
 }
-void scanObservedFiles(const QString &directory, const QString &relative, int depth, int maxDepth,
-                       int &budget, QJsonArray &files) {
-    if (depth > maxDepth || !QFileInfo(directory).isDir()) return;
-    noLinks(directory);
-    for (const auto &entry : QDir(directory).entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot, QDir::Name)) {
-        if (entry.isSymbolicLink()) continue;
-        if (--budget < 0) fail("Save discovery reached its file limit; choose a save path manually.");
-        const auto path = relative.isEmpty() ? entry.fileName() : relative + '/' + entry.fileName();
-        if (entry.isFile())
-            files.append(QJsonObject{{"path", path}, {"size", static_cast<double>(entry.size())},
-                                     {"modified", static_cast<double>(entry.lastModified().toMSecsSinceEpoch())}});
-        else if (entry.isDir()) scanObservedFiles(entry.absoluteFilePath(), path, depth + 1, maxDepth, budget, files);
-    }
-}
-QJsonArray observedState(const Library &lib, const Game &game) {
-    QJsonArray roots;
-    int likelyBudget = 1024;
-    for (const auto &root : likelyRoots(lib, game)) {
-        QJsonArray files;
-        scanObservedFiles(root.absolute, {}, 0, 2, likelyBudget, files);
-        roots.append(QJsonObject{{"scope", root.mapping.scope}, {"path", root.mapping.path}, {"files", files}});
-    }
-    // Compare a wider inventory as well. Games can save under arbitrary names in their
-    // own folder or anywhere on Wine's C: drive. These locations are suggestions only.
-    int broadBudget = 100000;
-    for (const auto &root : QList<ObservedRoot>{{{"game", ""}, game.folder},
-                                                {{"prefix", "drive_c"}, lib.prefix(game.id) + "/drive_c"}}) {
-        QJsonArray files;
-        scanObservedFiles(root.absolute, {}, 0, 12, broadBudget, files);
-        roots.append(QJsonObject{{"scope", root.mapping.scope}, {"path", root.mapping.path},
-                                 {"broad", true}, {"files", files}});
-    }
-    return roots;
-}
-SaveMapping observedFolder(const Library &lib, const Game &game, const QJsonObject &root, const QString &file) {
-    const auto relative = QFileInfo(file).path();
-    const auto rootPath = root["path"].toString();
-    const auto path = relative == "." ? rootPath : rootPath.isEmpty() ? relative : rootPath + '/' + relative;
-    if (root["scope"].toString() == "game")
-        return {"game", path.isEmpty() ? file : path};
-    const auto prefix = lib.prefix(game.id) + '/';
-    const auto absolute = prefix + path;
-    for (const auto &scope : {QString("appdata"), QString("documents")}) {
-        const auto base = mappingRoot(lib, game, scope) + '/';
-        if (absolute == base.chopped(1)) return {scope, QFileInfo(file).fileName()};
-        if (absolute.startsWith(base)) return {scope, absolute.mid(base.size())};
-    }
-    return {"prefix", relative == "." ? rootPath + '/' + file : path};
-}
-bool eligibleSaveFile(const QString &path, const QString &rootPath) {
-    const auto lower = path.toLower(), name = QFileInfo(lower).fileName();
-    for (const auto &part : lower.split('/'))
-        if (QStringList{"cache", "logs", "log", "shadercache", "__pycache__", "temp", "tmp"}.contains(part)) return false;
-    if (name.endsWith(".log") || name.endsWith(".ini") || name.endsWith(".cfg") || name.endsWith(".json") ||
-        name.endsWith(".tmp") || name.endsWith(".lock") || name == "log.txt") return false;
-    if (name == "persistent" || name.contains("save") || name.contains("slot") || name.contains("progress") ||
-        name.endsWith(".sav") || name.endsWith(".rpgsave") || name.endsWith(".rvdata2")) return true;
-    return rootPath.toLower().contains("savedata") && name.endsWith(".dat");
-}
-void evaluateObservation(Library &lib, const Game &game) {
-    const auto before = readJson(observationPath(lib, game.id));
-    if (before.isEmpty()) return;
-    if (before["schema"].toInt() != 1 || before["game_id"].toString() != game.id || !before["roots"].isArray())
-        fail("Invalid save observation record; inspect it before rescanning.");
+void discoverSavePaths(Library &lib, const Game &game) {
     auto config = loadSaveConfig(lib, game.id);
-    if (config.discoveryState != "searching") { QFile::remove(observationPath(lib, game.id)); return; }
-    const auto after = observedState(lib, game);
-    QMap<QString, QJsonObject> previous;
-    for (const auto &value : before["roots"].toArray()) {
-        const auto object = value.toObject(); previous.insert(object["scope"].toString() + '/' + object["path"].toString(), object);
+    if (!config.mappings.isEmpty()) return;
+    if (config.discoveryState == "unidentified") {
+        config.discoveryState = "searching";
+        config.discoverySource.clear();
     }
-    QMap<QString, QJsonObject> candidates;
-    QSet<QString> strongCandidates;
-    for (const auto &value : after) {
-        const auto root = value.toObject();
-        const auto key = root["scope"].toString() + '/' + root["path"].toString();
-        // An observation written by an older build has no broad baseline.
-        if (root["broad"].toBool() && !previous.contains(key)) continue;
-        const auto oldFiles = previous.value(key)["files"].toArray();
-        QMap<QString, QJsonObject> oldByPath;
-        for (const auto &item : oldFiles) oldByPath.insert(item.toObject()["path"].toString(), item.toObject());
-        int changed = 0;
-        for (const auto &item : root["files"].toArray()) {
-            const auto file = item.toObject();
-            const auto path = file["path"].toString();
-            if (oldByPath.value(path) == file) continue;
-            if (!root["broad"].toBool()) {
-                if (eligibleSaveFile(path, root["path"].toString())) ++changed;
-                continue;
-            }
-            const auto mapping = observedFolder(lib, game, root, path);
-            const auto candidateKey = mapping.scope + '/' + mapping.path;
-            auto candidate = candidates.value(candidateKey);
-            const int count = candidate["count"].toInt() + 1;
-            auto examples = candidate["examples"].toArray();
-            if (examples.size() < 3) examples.append(QFileInfo(path).fileName());
-            QStringList names;
-            for (const auto &example : examples) names.append(example.toString());
-            candidate = {{"scope", mapping.scope}, {"path", mapping.path}, {"count", count},
-                         {"examples", examples},
-                         {"evidence", QString::number(count) + " new or changed file(s) after Play (" +
-                             names.join(", ") + "); review before using"}};
-            candidates.insert(candidateKey, candidate);
-        }
-        if (changed) {
-            const auto candidateKey = key;
-            strongCandidates.insert(candidateKey);
-            candidates.insert(candidateKey, QJsonObject{{"scope", root["scope"]}, {"path", root["path"]},
-                {"evidence", QString::number(changed) + " likely save file(s) changed after Play"}});
-        }
+    resolveDeclaredSavePaths(lib, game, config);
+    if (config.discoveryState == "identified") return;
+    const auto found = heuristicSaveMappings(lib, game);
+    config.candidates = {}; // Old observation suggestions are not trusted as confirmed paths.
+    if (found.size() == 1) {
+        config.mappings = found;
+        config.discoveryState = "identified";
+        config.discoverySource = "heuristic";
     }
-    QJsonArray combined = config.candidates;
-    for (auto it = candidates.cbegin(); it != candidates.cend(); ++it) {
-        const auto item = it.value(); bool known = false;
-        for (int i = 0; i < combined.size(); ++i)
-            if (combined[i].toObject()["scope"] == item["scope"] && combined[i].toObject()["path"] == item["path"]) {
-                combined.replace(i, item); known = true; break;
-            }
-        if (!known && combined.size() < 64) combined.append(item);
-    }
-    QJsonArray distinct;
-    for (const auto &value : combined) {
-        const auto item = value.toObject();
-        const auto key = item["scope"].toString() + '/' + item["path"].toString();
-        bool covered = false;
-        for (const auto &strong : strongCandidates)
-            if (key != strong && key.startsWith(strong + '/')) { covered = true; break; }
-        if (!covered) distinct.append(item);
-    }
-    combined = distinct;
-    if (combined.size() == 1 && strongCandidates.contains(
-            combined.first().toObject()["scope"].toString() + '/' + combined.first().toObject()["path"].toString()) &&
-        config.mappings.isEmpty()) {
-        const auto item = combined.first().toObject();
-        config.mappings.append(SaveMapping{item["scope"].toString(), item["path"].toString()});
-        config.discoveryState = "identified"; config.discoverySource = "observed";
-        config.candidates = {};
-    } else if (!combined.isEmpty()) config.candidates = combined;
     validate(lib, game, config);
     writeJson(configPath(lib, game.id), configJson(config));
-    if (!QFile::remove(observationPath(lib, game.id))) fail("Cannot clear completed save observation.");
 }
 QByteArray digest(const QString &path) {
     QFile file(path); if (!file.open(QIODevice::ReadOnly)) fail("Cannot read save file: " + path);
@@ -531,9 +472,9 @@ SaveSnapshot snapshotLocked(Library &lib, const Game &game, const SaveConfig &co
             verifySnapshot(root + '/' + head, older);
             if (older["schema"].toInt() != 2 ||
                 !profileGameMatches(config, older["profile_game_id"].toString()) ||
-                older["game_identity"].toString() != config.gameIdentity ||
-                older["release_identity"].toString() != config.releaseIdentity ||
-                older["save_compatibility"].toString() != config.saveCompatibility) head.clear();
+                (!config.gameIdentity.isEmpty() && older["game_identity"].toString() != config.gameIdentity) ||
+                (!config.releaseIdentity.isEmpty() && older["release_identity"].toString() != config.releaseIdentity) ||
+                (!config.saveCompatibility.isEmpty() && older["save_compatibility"].toString() != config.saveCompatibility)) head.clear();
             if (!head.isEmpty()) {
                 parent = head;
                 bool identical = older["items"].toArray() == items;
@@ -585,10 +526,10 @@ void finishPendingLocked(Library &lib, const Game &game) {
 }
 struct SaveLocks {
     QLockFile mutation, launch;
-    SaveLocks(const Library &lib, const QString &id)
+    SaveLocks(const Library &lib, const QString &id, int mutationWaitMs = 0)
         : mutation(lib.dataRoot() + "/mutation.lock"), launch(lib.gamePath(id, "launch.lock")) {
         mutation.setStaleLockTime(0); launch.setStaleLockTime(0);
-        if (!mutation.tryLock()) fail("Library maintenance is in progress. Retry shortly.");
+        if (!mutation.tryLock(mutationWaitMs)) fail("Library maintenance is in progress. Retry shortly.");
         if (!QDir().mkpath(QFileInfo(launch.fileName()).absolutePath()) || !launch.tryLock())
             fail("This game is running or being prepared. Close it before changing saves.");
         if (!runtimeRecoveryIssue(lib, id).isEmpty()) fail("Resolve the game's interrupted launch before changing saves.");
@@ -687,6 +628,8 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
 }
 } // namespace
 
+QString normalizedSaveGameName(const QString &name) { return saveNameKey(name); }
+
 SaveConfig loadSaveConfig(const Library &lib, const QString &gameId) {
     const auto game = lib.game(gameId);
     auto config = parseConfig(readJson(configPath(lib, gameId)), gameId);
@@ -732,23 +675,29 @@ SaveMapping saveMappingFromPath(const Library &lib, const Game &game, const QStr
     fail("Choose a path inside this game's folder or Wine prefix.");
 }
 void beginSaveObservation(Library &lib, const Game &game) {
-    if (exists(observationPath(lib, game.id))) evaluateObservation(lib, game);
-    auto config = loadSaveConfig(lib, game.id);
-    resolveDeclaredSavePaths(lib, game, config);
-    if (config.discoveryState != "searching") return;
-    writeJson(observationPath(lib, game.id), {{"schema", 1}, {"game_id", game.id},
-        {"created", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
-        {"roots", observedState(lib, game)}});
+    discoverSavePaths(lib, game);
 }
-void finishSaveObservation(Library &lib, const Game &game) { evaluateObservation(lib, game); }
+void finishSaveObservation(Library &lib, const Game &game) { discoverSavePaths(lib, game); }
+QStringList unresolvedGameSaveLocations(const Library &lib, const QString &gameId) {
+    const auto game = lib.game(gameId);
+    if (!loadSaveConfig(lib, gameId).mappings.isEmpty()) return {};
+    const auto candidates = heuristicSaveMappings(lib, game);
+    if (candidates.size() < 2) return {};
+    QStringList paths;
+    for (const auto &candidate : candidates)
+        if (candidate.scope == "game") paths.append(candidate.path);
+    paths.removeDuplicates();
+    return paths;
+}
 QStringList recoverSaveObservations(Library &lib) {
     QStringList messages;
     for (const auto &game : lib.games()) {
         if (!exists(observationPath(lib, game.id)) || lib.supervisorActive(game.id)) continue;
         try {
             SaveLocks locks(lib, game.id);
-            evaluateObservation(lib, game);
-            messages.append("Checked save discovery after the last Play for " + game.name + ".");
+            discoverSavePaths(lib, game);
+            if (!QFile::remove(observationPath(lib, game.id))) fail("Cannot clear obsolete save observation.");
+            messages.append("Updated save discovery for " + game.name + ".");
         } catch (const std::exception &e) {
             messages.append("Save discovery for " + game.name + " needs attention: " + QString::fromUtf8(e.what()));
         }
@@ -778,7 +727,7 @@ QList<SaveMapping> suggestedSaveMappings(const Library &lib, const QString &game
     return suggestions;
 }
 void saveSaveConfig(Library &lib, const QString &gameId, const SaveConfig &config) {
-    SaveLocks locks(lib, gameId);
+    SaveLocks locks(lib, gameId, 2000);
     if (!saveRestoreIssue(lib, gameId).isEmpty()) fail("Recover the interrupted save restore before editing mappings.");
     if (!pendingSaveSnapshotIssue(lib, gameId).isEmpty()) fail("Finish the pending post-play snapshot before editing save mappings.");
     const auto game = lib.game(gameId);
@@ -797,16 +746,31 @@ void linkPeerSaveGame(Library &lib, const QString &gameId, const QString &peerFi
     if (!validFingerprint(peerFingerprint) || !validToken(peerProfileGameId) ||
         !isTrustedPeer(lib, peerFingerprint)) fail("Pair and verify this device before linking its game.");
     auto config = loadSaveConfig(lib, gameId);
-    if (config.gameIdentity.isEmpty() || config.releaseIdentity.isEmpty() ||
-        config.saveCompatibility.isEmpty() || config.mappings.isEmpty())
-        fail("Confirm the game, edition, save format and save paths before linking a peer game.");
+    if (config.mappings.isEmpty()) fail("Choose this game's save location before linking peer saves.");
     if (peerProfileGameId == config.profileGameId) return;
+    for (const auto &other : lib.games()) {
+        if (other.id == gameId) continue;
+        const auto otherConfig = loadSaveConfig(lib, other.id);
+        for (const auto &link : otherConfig.peerLinks)
+            if (link.fingerprint == peerFingerprint && link.profileGameId == peerProfileGameId)
+                fail("This peer game is already linked to another local game.");
+    }
     bool found = false;
     for (auto &link : config.peerLinks) if (link.fingerprint == peerFingerprint) {
         link.profileGameId = peerProfileGameId; found = true; break;
     }
     if (!found) config.peerLinks.append({peerFingerprint, peerProfileGameId});
     saveSaveConfig(lib, gameId, config);
+}
+void recordSaveFolderRename(Library &lib, const QString &gameId, const QString &previousName) {
+    const auto current = QFileInfo(lib.game(gameId).folder).fileName();
+    if (previousName.isEmpty() || normalizedSaveGameName(previousName) == normalizedSaveGameName(current)) return;
+    auto config = loadSaveConfig(lib, gameId);
+    config.folderAliases.removeAll(previousName);
+    config.folderAliases.prepend(previousName);
+    while (config.folderAliases.size() > 8) config.folderAliases.removeLast();
+    validate(lib, lib.game(gameId), config);
+    writeJson(configPath(lib, gameId), configJson(config));
 }
 void setSaveDiscoveryState(Library &lib, const QString &gameId, const QString &state) {
     if (state != "searching" && state != "unidentified") fail("Choose Rescan or Stop searching.");
@@ -824,6 +788,23 @@ SaveSnapshot createSaveSnapshot(Library &lib, const QString &gameId, const QStri
     const auto snapshot = snapshotLocked(lib, game, config, reason.left(80));
     queuePeerSync(lib, gameId, snapshot.id);
     return snapshot;
+}
+bool captureAvailableSaveSnapshot(Library &lib, const QString &gameId, const QString &reason) {
+    SaveLocks locks(lib, gameId, 2000);
+    if (!saveRestoreIssue(lib, gameId).isEmpty())
+        fail("Recover the interrupted save restore before transferring this game.");
+    if (!pendingSaveSnapshotIssue(lib, gameId).isEmpty())
+        fail("Finish the pending post-play snapshot before transferring this game.");
+    const auto game = lib.game(gameId);
+    const auto config = loadSaveConfig(lib, gameId);
+    if (config.mappings.isEmpty()) return false;
+    try {
+        const auto snapshot = snapshotLocked(lib, game, config, reason.left(80));
+        queuePeerSync(lib, gameId, snapshot.id);
+        return true;
+    } catch (const NoSaveData &) {
+        return false;
+    }
 }
 QList<SaveSnapshot> listSaveSnapshots(const Library &lib, const QString &gameId) {
     lib.game(gameId);
@@ -879,9 +860,7 @@ QList<ImportedSaveCandidate> importedSaveCandidates(const Library &lib, const QS
         const auto manifest = snapshotManifest(lib, gameId, snapshot.id);
         if (manifest["schema"].toInt() != 2 || manifest["profile_id"].toString() == config.profileId ||
             !profileGameMatches(config, manifest["profile_game_id"].toString()) ||
-            manifest["game_identity"].toString() != config.gameIdentity ||
-            manifest["release_identity"].toString() != config.releaseIdentity ||
-            manifest["save_compatibility"].toString() != config.saveCompatibility || snapshot.id == head)
+            !labelsCompatible(config, manifest) || snapshot.id == head)
             continue;
         const QString relation = head.isEmpty() ? "available" :
             hasAncestor(lib, gameId, snapshot.id, head) ? "ahead" :
@@ -906,9 +885,7 @@ void restoreSaveSnapshot(Library &lib, const QString &gameId, const QString &sna
     const auto manifest = snapshotManifest(lib, gameId, snapshotId);
     if (manifest["schema"].toInt() == 2 &&
         (!profileGameMatches(config, manifest["profile_game_id"].toString()) ||
-         manifest["game_identity"].toString() != config.gameIdentity ||
-         manifest["release_identity"].toString() != config.releaseIdentity ||
-         manifest["save_compatibility"].toString() != config.saveCompatibility))
+         !labelsCompatible(config, manifest)))
         fail("This snapshot belongs to a different game edition or save format. No files were changed.");
     const auto items = manifest["items"].toArray();
     if (items.size() != config.mappings.size()) fail("Save mappings changed since this snapshot. Restore the original mappings before continuing.");
@@ -973,8 +950,7 @@ SaveImportResult importSaveSnapshot(Library &lib, const QString &gameId, const Q
     if (!saveRestoreIssue(lib, gameId).isEmpty()) fail("Recover the interrupted save restore before importing saves.");
     const auto game = lib.game(gameId);
     const auto config = loadSaveConfig(lib, gameId);
-    if (config.gameIdentity.isEmpty() || config.releaseIdentity.isEmpty() || config.saveCompatibility.isEmpty() ||
-        config.mappings.isEmpty()) fail("Confirm this game's identity, edition, compatibility and save paths before syncing.");
+    if (config.mappings.isEmpty()) fail("Choose this game's save location before syncing.");
     const auto source = QDir::cleanPath(bundleDirectory);
     noLinks(source);
     if (!QFileInfo(source).isDir() || QFileInfo(source + "/manifest.json").size() > 1024 * 1024)
@@ -985,9 +961,7 @@ SaveImportResult importSaveSnapshot(Library &lib, const QString &gameId, const Q
         fail("The source device is not trusted for this Games library.");
     if (manifest["schema"].toInt() != 2 || !validToken(id) ||
         !profileGameMatches(config, manifest["profile_game_id"].toString(), authenticatedPeer) ||
-        manifest["game_identity"].toString() != config.gameIdentity ||
-        manifest["release_identity"].toString() != config.releaseIdentity ||
-        manifest["save_compatibility"].toString() != config.saveCompatibility)
+        !labelsCompatible(config, manifest))
         fail("Save bundle belongs to a different game, edition or save format.");
     const auto items = manifest["items"].toArray();
     if (items.size() != config.mappings.size() || items.size() > 32) fail("Save bundle mappings do not match this installation.");

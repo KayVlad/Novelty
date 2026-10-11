@@ -2,18 +2,7 @@
 
 A game lifecycle manager for Linux and Steam Deck, with visual novels first and support for other Proton games. Add a game folder or install the game, select its executable when needed, then press Play with suitable metadata and setup defaults. A sole suitable executable is selected automatically. Across devices, the target is to install from a peer over the LAN when needed, sync saves and continue playing.
 
-Status: folder/installer import, executable choice, editable settings, prefix preparation, generic VN/game and Ren'Py profiles, cached VNDB metadata, local save discovery and verified snapshots are implemented. New managed libraries can prepare missing GE-Proton, umu and a known Steam Linux Runtime on first Play. LAN pairing, save exchange and staged peer game installation are implemented; live two-device validation remains open. A native portable test package can be built, while clean-device packaging and platform acceptance remain open. See the checklist for the specific remaining gates.
-
-- [Product direction and user requirements](docs/PRODUCT_VISION.md)
-- [Current priority checklist](docs/STATUS_CHECKLIST.md)
-- [Current session handoff](docs/SESSION_HANDOFF.md)
-- [Original handoff (historical)](docs/HANDOFF.md)
-- [Current staged MVP plan and proposed stack](docs/MVP_PLAN.md)
-- [Earlier engineering research](docs/PLAN.md)
-- [Progress log, including the original proposal](docs/PROGRESS.md)
-- [Build, run and test instructions](docs/DEVELOPMENT.md)
-- [Engine research and current test evidence](docs/ENGINE_RESEARCH.md)
-- [Library layout and interaction notes](docs/UI_LAYOUT.md)
+Status: folder/installer import, executable choice, editable settings, prefix preparation, generic VN/game and Ren'Py profiles, cached VNDB metadata, local save discovery and verified snapshots are implemented. New managed libraries can prepare missing GE-Proton, umu and a known Steam Linux Runtime on first Play. LAN pairing, save exchange and staged peer game installation are implemented; live two-device validation remains open. A native portable test package can be built, while clean-device packaging and platform acceptance remain open. Detailed planning and progress notes are kept locally under `docs/`, which is excluded from Git.
 
 Steam Deck is the primary target; Bazzite desktop follows. Novelty uses progressive disclosure: simple defaults for ordinary play, with editable metadata, save paths, Proton versions and advanced configuration when needed. Stage 1 completes local installation/setup/play; Stage 2 adds saves and continuation across devices. Current folder import moves an external game folder into Games and prompts for an executable if detection is ambiguous or finds none. The umu path supports DRM-free execution without a Steam client/account. Planned Steam support is a shortcut that invokes Novelty's managed launch.
 

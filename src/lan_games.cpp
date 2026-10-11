@@ -66,30 +66,40 @@ void noLinks(const QString &path, const QString &root) {
             throw std::runtime_error("LAN game path contains a symbolic link.");
     }
 }
-void collect(const QString &folder, QList<LanGameExchange::Entry> &entries, qint64 &bytes,
-             std::stop_token stop) {
+void collect(const QString &folder, const QSet<QString> &excluded,
+             QList<LanGameExchange::Entry> &entries, qint64 &bytes, std::stop_token stop) {
     if (QFileInfo(folder).isSymbolicLink() || !QFileInfo(folder).isDir())
         throw std::runtime_error("Only a real game folder can be transferred.");
-    QDirIterator it(folder, QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
-                    QDirIterator::Subdirectories);
-    while (it.hasNext()) {
-        if (stop.stop_requested()) throw std::runtime_error("Game manifest scan was cancelled.");
-        const auto info = it.nextFileInfo();
-        const auto relative = QDir(folder).relativeFilePath(info.absoluteFilePath());
-        if (!safePath(relative) || info.isSymbolicLink() ||
-            (!info.isDir() && !info.isFile()))
-            throw std::runtime_error("Game folder contains an unsupported or unsafe path.");
-        if (info.isDir()) entries.append({relative, true, 0, {}});
-        else {
-            if (info.size() < 0 || info.size() > maxGameBytes - bytes)
-                throw std::runtime_error("Game exceeds the LAN transfer limit.");
-            bytes += info.size();
-            entries.append({relative, false, info.size(), QString::fromLatin1(fileHash(info.absoluteFilePath(), stop))});
+    const auto walk = [&](auto &&self, const QString &directory) -> void {
+        for (const auto &info : QDir(directory).entryInfoList(QDir::AllEntries | QDir::Hidden |
+                                                            QDir::System | QDir::NoDotAndDotDot, QDir::Name)) {
+            if (stop.stop_requested()) throw std::runtime_error("Game manifest scan was cancelled.");
+            const auto relative = QDir(folder).relativeFilePath(info.absoluteFilePath());
+            if (!safePath(relative) || info.isSymbolicLink() || (!info.isDir() && !info.isFile()))
+                throw std::runtime_error("Game folder contains an unsupported or unsafe path.");
+            if (excluded.contains(relative)) continue;
+            if (info.isDir()) {
+                entries.append({relative, true, 0, {}});
+                self(self, info.absoluteFilePath());
+            } else {
+                if (info.size() < 0 || info.size() > maxGameBytes - bytes)
+                    throw std::runtime_error("Game exceeds the LAN transfer limit.");
+                bytes += info.size();
+                entries.append({relative, false, info.size(), QString::fromLatin1(fileHash(info.absoluteFilePath(), stop))});
+            }
+            if (entries.size() > maxGameEntries)
+                throw std::runtime_error("Game contains too many files for LAN transfer.");
         }
-        if (entries.size() > maxGameEntries)
-            throw std::runtime_error("Game contains too many files for LAN transfer.");
-    }
+    };
+    walk(walk, folder);
     std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) { return a.path < b.path; });
+}
+QSet<QString> transferExclusions(const SaveConfig &config) {
+    QSet<QString> excluded;
+    if (config.discoveryState != "identified") return excluded;
+    for (const auto &mapping : config.mappings)
+        if (mapping.scope == "game") excluded.insert(mapping.path);
+    return excluded;
 }
 QJsonObject descriptor(const Library &lib, const Game &game) {
     const auto config = loadSaveConfig(lib, game.id);
@@ -153,6 +163,15 @@ bool validDescriptor(const QJsonObject &item) {
     }
     return true;
 }
+}
+
+QPair<QList<LanGameExchange::Entry>, qint64> previewLanGameManifest(const Library &lib, const QString &gameId) {
+    const auto game = lib.game(gameId);
+    const auto excluded = transferExclusions(loadSaveConfig(lib, gameId));
+    QList<LanGameExchange::Entry> entries;
+    qint64 bytes = 0;
+    collect(game.folder, excluded, entries, bytes, {});
+    return {entries, bytes};
 }
 
 void validateLanGameManifest(const QJsonObject &item,
@@ -310,19 +329,33 @@ void LanGameExchange::sendManifest(const QJsonObject &request) {
         library_.busy(chosen.id) || QFileInfo(chosen.folder).absolutePath() != library_.root() ||
         folderIdentity(chosen.folder) != chosen.folderIdentity)
         throw std::runtime_error("That game is unavailable for LAN installation.");
+    beginSaveObservation(library_, chosen);
+    const auto undecided = unresolvedGameSaveLocations(library_, chosen.id);
+    if (!undecided.isEmpty()) {
+        connection_.send({{"type", "game-error"}, {"request_id", id},
+            {"message", ("Choose the save location on the source device before transfer: " +
+                         undecided.join(", ")).left(180)}});
+        return;
+    }
     if (manifestWorker_.joinable()) manifestWorker_.join();
     sendingFolder_ = chosen.folder; sendingRequest_ = id;
     sendingDescriptor_ = descriptor(library_, chosen);
+    const auto excluded = transferExclusions(loadSaveConfig(library_, chosen.id));
     if (!validDescriptor(sendingDescriptor_))
         throw std::runtime_error("This game's portable settings exceed the LAN transfer limit.");
     lastManifestHeartbeat_ = QDateTime::currentMSecsSinceEpoch();
     std::promise<QPair<QList<Entry>, qint64>> promise;
     manifestFuture_ = promise.get_future();
-    manifestWorker_ = std::jthread([folder = chosen.folder, promise = std::move(promise)]
+    manifestWorker_ = std::jthread([folder = chosen.folder, excluded, root = library_.root(),
+                                    gameId = chosen.id, promise = std::move(promise)]
                                    (std::stop_token stop) mutable {
         try {
+            if (stop.stop_requested()) throw std::runtime_error("Game manifest scan was cancelled.");
+            Library worker(root);
+            captureAvailableSaveSnapshot(worker, gameId, "before game transfer");
+            if (stop.stop_requested()) throw std::runtime_error("Game manifest scan was cancelled.");
             QList<Entry> entries; qint64 bytes = 0;
-            collect(folder, entries, bytes, stop);
+            collect(folder, excluded, entries, bytes, stop);
             promise.set_value({std::move(entries), bytes});
         } catch (...) { promise.set_exception(std::current_exception()); }
     });
@@ -630,6 +663,12 @@ void LanGameExchange::handle(const QJsonObject &message) {
         if (type == "game-list") { sendCatalogue(message); return; }
         if (type == "game-manifest") { sendManifest(message); return; }
         if (type == "game-file-get") { sendFile(message); return; }
+        if (type == "game-error") {
+            if (message["request_id"].toString() != requestId_ || !uuid(requestId_) ||
+                message["message"].toString().size() > 180)
+                throw std::runtime_error("Unexpected paired-device game error.");
+            fail(message["message"].toString()); return;
+        }
         if (type == "game-found") {
             if (message["request_id"].toString() != requestId_ || !message["games"].isArray() ||
                 message["games"].toArray().size() > 64)

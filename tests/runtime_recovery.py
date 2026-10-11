@@ -32,6 +32,10 @@ if sys.argv[1] == '':
     with (p / 'attempts').open('a') as f: f.write('prepare\n')
 else:
     (p / 'invocation.json').write_text(json.dumps(dict(args=sys.argv[1:], cwd=os.getcwd())))
+    if (p / 'write-game-save').exists():
+        save = pathlib.Path(sys.argv[1]).parent / 'UserData' / 'slot.sav'
+        save.parent.mkdir(parents=True, exist_ok=True)
+        save.write_bytes(b'headless saved progress')
 if (p / 'spawn-child').exists():
     subprocess.Popen([sys.executable, __file__, '--child'], start_new_session=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -115,6 +119,18 @@ with tempfile.TemporaryDirectory(prefix='novelty-process-tests-') as temporary:
         assert process.wait(timeout=5) == 0
         assert not (state / 'runtime.json').exists(), 'normal completion kept crash barrier'
         assert read(state / 'setup.json')['state'] == 'complete'
+
+        # The ordinary headless --run path must discover and snapshot a save made by the game.
+        save_root, save_id, save_prefix, save_state = fixture('Headless after-exit saves')
+        assert command(save_root, '--prepare', save_id).returncode == 0
+        (save_prefix / 'write-game-save').touch()
+        assert command(save_root, '--run', save_id).returncode == 0
+        save_config = read(save_state / 'saves.json')
+        assert save_config['mappings'] == [{'scope': 'game', 'path': 'UserData'}], 'headless Play did not discover UserData'
+        save_head = read(save_state / 'save-head.json')['snapshot_id']
+        save_manifest = read(save_state / 'snapshots' / save_head / 'manifest.json')
+        assert save_manifest['files'] == 1 and save_manifest['items'][0]['path'] == 'UserData', 'headless Play did not capture its save'
+        assert (save_state / 'snapshots' / save_head / 'items' / '0' / 'slot.sav').read_bytes() == b'headless saved progress'
 
         # Kill the supervisor during a real game invocation, leaving its descendant alive.
         (prefix / 'release').unlink()

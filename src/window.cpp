@@ -403,15 +403,24 @@ void Window::openRoot(const QString &root, bool allowCreation) {
                 try {
                     for (const auto &game : library_->games()) {
                         const auto config = loadSaveConfig(*library_, game.id);
-                        if (config.gameIdentity != offer["game_identity"].toString() ||
-                            config.releaseIdentity != offer["release_identity"].toString() ||
-                            config.saveCompatibility != offer["save_compatibility"].toString() ||
-                            config.mappings.isEmpty()) continue;
+                        const auto compatible = [](const QString &local, const QString &remote) {
+                            return local.isEmpty() || remote.isEmpty() || local == remote;
+                        };
+                        if (config.mappings.isEmpty()) continue;
                         bool linked = config.profileGameId == remoteId;
                         for (const auto &link : config.peerLinks)
                             if (link.fingerprint == connection->peerFingerprint() &&
                                 link.profileGameId == remoteId) linked = true;
-                        if (linked) { if (!localId.isEmpty()) { localId.clear(); break; } localId = game.id; }
+                        if (linked) {
+                            if (!compatible(config.gameIdentity, offer["game_identity"].toString()) ||
+                                !compatible(config.releaseIdentity, offer["release_identity"].toString()) ||
+                                !compatible(config.saveCompatibility, offer["save_compatibility"].toString())) {
+                                exchange->deferOffer(offerId, "This linked game's saved edition or compatibility labels differ.");
+                                return;
+                            }
+                            if (!localId.isEmpty()) { localId.clear(); break; }
+                            localId = game.id;
+                        }
                     }
                     if (localId.isEmpty()) {
                         exchange->deferOffer(offerId, "Confirm the matching game in Manage → Saves first."); return;
@@ -1156,143 +1165,55 @@ void Window::installFromPeer() {
 }
 void Window::syncSavesFromPeer(const QString &gameId, QWidget *parent) {
     if (!library_ || !rootAvailable()) throw std::runtime_error("Reconnect the Games folder before syncing saves.");
-    const auto config = loadSaveConfig(*library_, gameId);
-    if (config.gameIdentity.isEmpty() || config.releaseIdentity.isEmpty() ||
-        config.saveCompatibility.isEmpty() || config.mappings.isEmpty())
-        throw std::runtime_error("Confirm this game's identity, edition, save format and save paths first.");
-    QDialog dialog(parent); dialog.setObjectName("syncSavesDialog"); dialog.setWindowTitle("Sync saves from peer");
-    dialog.resize(530, 250);
-    auto layout = new QVBoxLayout(&dialog);
-    auto instructions = new QLabel("Enter a paired device's LAN IP and save-sync port from its Devices screen. Both devices must have Novelty open.", &dialog);
-    instructions->setWordWrap(true); layout->addWidget(instructions);
-    auto row = new QHBoxLayout;
-    auto host = new QLineEdit(&dialog); host->setPlaceholderText("Peer LAN IP address");
-    auto port = new QLineEdit("38373", &dialog); port->setValidator(new QIntValidator(1, 65535, port));
-    port->setMaximumWidth(90);
-    auto connectButton = new QPushButton("Check saves", &dialog);
-    row->addWidget(host, 1); row->addWidget(port); row->addWidget(connectButton); layout->addLayout(row);
-    auto status = new QLabel("Ready to check the paired device.", &dialog); status->setWordWrap(true);
-    status->setTextFormat(Qt::PlainText); layout->addWidget(status); layout->addStretch();
-    auto buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog); layout->addWidget(buttons);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    LanConnection *active = nullptr;
-    connect(connectButton, &QPushButton::clicked, &dialog, [&, this] {
-        if (active) return;
-        bool validPort = false; const auto number = port->text().toUShort(&validPort);
-        if (QHostAddress(host->text().trimmed()).isNull() || !validPort || number == 0) {
-            status->setText("Enter the paired device's LAN IP address and port."); return;
-        }
-        auto connection = new LanConnection(*library_, false, &dialog);
-        active = connection; connectButton->setEnabled(false); status->setText("Connecting to the trusted device…");
-        connection->onError = [&, connection](const QString &reason) {
-            if (active != connection) return;
-            status->setText(reason); connectButton->setEnabled(true); active = nullptr;
-            connection->deleteLater();
-        };
-        connection->onReady = [&, connection, config, gameId](const QString &peerFingerprint) {
-            if (active != connection) return;
-            status->setText("Checking compatible saves…");
-            try { rememberPeerEndpoint(*library_, peerFingerprint, host->text().trimmed(), quint16(port->text().toUShort())); }
-            catch (const std::exception &e) { status->setText(QString::fromUtf8(e.what())); connection->close(); return; }
-            auto exchange = new LanSaveExchange(*library_, *connection, connection);
-            exchange->onError = [status](const QString &reason) { status->setText(reason); };
-            exchange->onProgress = [status](qint64 bytes, qint64 total) {
-                status->setText("Receiving verified saves: " + QString::number(bytes) + " / " +
-                                QString::number(total) + " bytes");
-            };
-            exchange->onImported = [&, status, gameId](const SaveImportResult &result) {
-                if (result.relation == "current" || result.relation == "behind") {
-                    status->setText("Your current saves are already at least as recent as this peer snapshot."); return;
-                }
-                if (result.relation == "conflict") {
-                    status->setText("Both devices changed saves. The peer copy is preserved in snapshot history. Choose which snapshot to restore in Manage → Saves.");
-                    return;
-                }
-                status->setText("Verified peer snapshot received. Choose whether to restore it now.");
-                QTimer::singleShot(0, &dialog, [&, gameId, snapshotId = result.snapshotId] {
-                    if (QMessageBox::question(&dialog, "Restore peer saves?",
-                        "Restore the verified peer snapshot into this installation? Novelty keeps a backup of the current saves.",
-                        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
-                    try {
-                        const auto root = library_->root();
-                        auto work = std::async(std::launch::async, [root, gameId, snapshotId] {
-                            Library worker(root); restoreSaveSnapshot(worker, gameId, snapshotId);
-                        });
-                        RemovalProgress progress(&dialog); progress.setWindowTitle("Restoring peer saves");
-                        auto progressLayout = new QVBoxLayout(&progress);
-                        progressLayout->addWidget(new QLabel("Verifying and restoring mapped saves…", &progress));
-                        QTimer poll; poll.setInterval(60);
-                        connect(&poll, &QTimer::timeout, &progress, [&] {
-                            if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
-                        });
-                        poll.start(); progress.exec(); poll.stop(); work.get();
-                        status->setText("Peer saves restored. Local replaced progress was kept in snapshot history.");
-                    } catch (const std::exception &e) { status->setText(QString::fromUtf8(e.what())); }
-                });
-            };
-            exchange->onMatches = [&, exchange, peerFingerprint, gameId](const QJsonArray &matches) {
-                if (matches.isEmpty()) { status->setText("No game with the same confirmed edition and save format is available on that device."); return; }
-                QJsonObject selected;
-                if (matches.size() == 1) selected = matches.first().toObject();
-                else {
-                    QDialog choose(&dialog); choose.setWindowTitle("Choose peer game");
-                    auto column = new QVBoxLayout(&choose);
-                    column->addWidget(new QLabel("Several installations match. Choose the one whose saves you want.", &choose));
-                    auto options = new QComboBox(&choose);
-                    for (const auto &value : matches) {
-                        const auto item = value.toObject();
-                        options->addItem(item["name"].toString() + " · " + item["profile_game_id"].toString().left(8), item);
-                    }
-                    column->addWidget(options);
-                    auto actions = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &choose);
-                    column->addWidget(actions);
-                    connect(actions, &QDialogButtonBox::accepted, &choose, &QDialog::accept);
-                    connect(actions, &QDialogButtonBox::rejected, &choose, &QDialog::reject);
-                    if (choose.exec() != QDialog::Accepted) return;
-                    selected = options->currentData().toJsonObject();
-                }
-                const auto remoteId = selected["profile_game_id"].toString();
-                const auto head = selected["snapshot_id"].toString();
-                if (QUuid(remoteId).isNull() || (!head.isEmpty() && QUuid(head).isNull())) {
-                    status->setText("The peer returned an invalid game or snapshot ID."); return;
-                }
-                if (head.isEmpty()) { status->setText("This peer has no captured save data for that game yet."); return; }
-                try {
-                    if (remoteId != config.profileGameId) {
-                        if (QMessageBox::question(&dialog, "Link matching games?",
-                            "Link this installation with the peer's “" + selected["name"].toString() +
-                            "” save history? The confirmed game, edition and save-format labels match.",
-                            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
-                        linkPeerSaveGame(*library_, gameId, peerFingerprint, remoteId);
-                    }
-                    status->setText("Checking the peer's save history…");
-                    const auto reportImported = exchange->onImported;
-                    connection->close(); active = nullptr; connection->deleteLater();
-                    connectButton->setEnabled(true);
-                    QTimer::singleShot(0, &dialog, [&, gameId, reportImported] {
-                        try {
-                            const auto result = refreshLinkedPeerSaves(*library_, gameId);
-                            if (!result.issues.isEmpty()) { status->setText(result.issues.join(" ")); return; }
-                            const auto candidates = importedSaveCandidates(*library_, gameId);
-                            if (candidates.isEmpty()) {
-                                status->setText("Your local saves are up to date with the paired device."); return;
-                            }
-                            if (candidates.size() != 1 || candidates.first().relation == "conflict") {
-                                status->setText("Both devices changed saves. Both copies are preserved in Manage → Saves."); return;
-                            }
-                            reportImported({result.snapshotsImported > 0,
-                                            candidates.first().relation, candidates.first().snapshotId});
-                        } catch (const std::exception &e) { status->setText(QString::fromUtf8(e.what())); }
-                    });
-                } catch (const std::exception &e) { status->setText(QString::fromUtf8(e.what())); }
-            };
-            try { exchange->locate(config); }
-            catch (const std::exception &e) { status->setText(QString::fromUtf8(e.what())); }
-        };
-        connection->connectTo(host->text().trimmed(), number);
+    if (loadSaveConfig(*library_, gameId).mappings.isEmpty())
+        throw std::runtime_error("Choose this game's save location before syncing.");
+    if (trustedPeers(*library_).isEmpty()) {
+        devices();
+        if (trustedPeers(*library_).isEmpty()) return;
+    }
+    const auto root = library_->root();
+    auto work = std::async(std::launch::async, [root, gameId] {
+        Library worker(root); return refreshLinkedPeerSaves(worker, gameId);
     });
-    connect(&dialog, &QDialog::finished, &dialog, [&] { if (active) active->close(); });
-    dialog.exec();
+    RemovalProgress progress(parent); progress.setWindowTitle("Syncing saves");
+    auto progressLayout = new QVBoxLayout(&progress);
+    progressLayout->addWidget(new QLabel("Checking paired devices and verified save history…", &progress));
+    progress.resize(420, 100);
+    QTimer poll; poll.setInterval(60);
+    connect(&poll, &QTimer::timeout, &progress, [&] {
+        if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
+    });
+    poll.start(); progress.exec(); poll.stop();
+    const auto result = work.get();
+    if (!result.issues.isEmpty())
+        QMessageBox::information(parent, "Save sync", result.issues.join("\n"));
+    if (result.peersChecked == 0) {
+        QMessageBox::information(parent, "Save sync", "No paired device has a remembered address yet. Open Devices to connect to your peer.");
+        return;
+    }
+    const auto candidates = importedSaveCandidates(*library_, gameId);
+    if (candidates.isEmpty()) return;
+    if (candidates.size() != 1 || candidates.first().relation == "conflict") {
+        QMessageBox::information(parent, "Save conflict",
+            "Both devices have save progress. Both copies are preserved in Backup history; choose one to restore there.");
+        return;
+    }
+    const auto snapshotId = candidates.first().snapshotId;
+    if (QMessageBox::question(parent, "Continue with peer saves?",
+        "Restore the verified peer save? Novelty keeps a backup of your current progress.",
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+    auto restore = std::async(std::launch::async, [root, gameId, snapshotId] {
+        Library worker(root); restoreSaveSnapshot(worker, gameId, snapshotId);
+    });
+    RemovalProgress restoring(parent); restoring.setWindowTitle("Restoring peer saves");
+    auto restoringLayout = new QVBoxLayout(&restoring);
+    restoringLayout->addWidget(new QLabel("Verifying and restoring peer progress…", &restoring));
+    restoring.resize(420, 100);
+    QTimer restorePoll; restorePoll.setInterval(60);
+    connect(&restorePoll, &QTimer::timeout, &restoring, [&] {
+        if (restore.wait_for(std::chrono::seconds(0)) == std::future_status::ready) restoring.accept();
+    });
+    restorePoll.start(); restoring.exec(); restorePoll.stop(); restore.get();
 }
 void Window::manage() {
     auto g = selected(); if (!library_ || g.id.isEmpty()) return;
@@ -1588,47 +1509,28 @@ void Window::manage() {
     connect(runExtra, &QPushButton::clicked, &d, [this, &d] { runExecutable(&d); });
     runtimeScroll->setWidget(runtimeTab); tabs->addTab(runtimeScroll, "Runtime");
     auto savesTab = new QWidget(&d); auto savesLayout = new QVBoxLayout(savesTab);
-    auto savesIntro = new QLabel("Confirm where this game stores progress. Novelty snapshots only these locations. Identity and compatibility labels prepare matching between your devices; enter them only when you know they refer to the same game and save format.", savesTab);
+    auto savesIntro = new QLabel("Novelty checks common save folders and captures progress after Play. Choose a path only if it does not find one.", savesTab);
     savesIntro->setWordWrap(true); savesLayout->addWidget(savesIntro);
-    auto saveIdentity = new QLineEdit(savesTab), saveRelease = new QLineEdit(savesTab), saveCompatibility = new QLineEdit(savesTab);
-    saveIdentity->setObjectName("saveGameIdentity"); saveRelease->setObjectName("saveReleaseIdentity");
-    saveCompatibility->setObjectName("saveCompatibility");
-    auto saveForm = new QFormLayout; saveForm->addRow("Game identity", saveIdentity);
-    saveForm->addRow("Release / build", saveRelease); saveForm->addRow("Compatible saves", saveCompatibility);
-    savesLayout->addLayout(saveForm);
     auto discoveryStatus = new QLabel(savesTab); discoveryStatus->setObjectName("saveDiscoveryStatus");
     discoveryStatus->setWordWrap(true); discoveryStatus->setTextFormat(Qt::PlainText);
     savesLayout->addWidget(discoveryStatus);
-    auto saveCandidates = new QListWidget(savesTab); saveCandidates->setObjectName("saveCandidates");
-    saveCandidates->setMaximumHeight(80); savesLayout->addWidget(saveCandidates);
-    auto mappingList = new QListWidget(savesTab); mappingList->setObjectName("saveMappings");
-    mappingList->setMaximumHeight(120); savesLayout->addWidget(mappingList);
     auto mappingRow = new QHBoxLayout;
-    auto mappingPath = new QLineEdit(savesTab); mappingPath->setPlaceholderText("Save path, for example UserData");
-    mappingPath->setToolTip("Paths you type are relative to the game folder. Browse to choose a file or folder elsewhere.");
-    auto browseSaveFile = new QPushButton("File…", savesTab), browseSaveFolder = new QPushButton("Folder…", savesTab);
-    mappingRow->addWidget(mappingPath, 1);
-    mappingRow->addWidget(browseSaveFile); mappingRow->addWidget(browseSaveFolder); savesLayout->addLayout(mappingRow);
-    auto mappingActions = new QHBoxLayout;
-    auto addMapping = new QPushButton("Add path", savesTab), removeMapping = new QPushButton("Remove path", savesTab);
-    auto useCandidate = new QPushButton("Use selected suggestion", savesTab);
-    auto findMappings = new QPushButton("Find likely Ren'Py saves", savesTab); findMappings->setObjectName("findSaveMappings");
-    auto persistSaves = new QPushButton("Save mappings", savesTab); persistSaves->setObjectName("saveMappingsButton");
-    mappingActions->addWidget(addMapping); mappingActions->addWidget(removeMapping); mappingActions->addWidget(useCandidate);
-    mappingActions->addWidget(findMappings); mappingActions->addStretch();
-    mappingActions->addWidget(persistSaves); savesLayout->addLayout(mappingActions);
-    auto discoveryActions = new QHBoxLayout;
-    auto stopSearching = new QPushButton("Stop searching", savesTab), rescanSaves = new QPushButton("Search again", savesTab);
-    stopSearching->setObjectName("stopSaveDiscovery"); rescanSaves->setObjectName("rescanSaveDiscovery");
-    discoveryActions->addWidget(stopSearching); discoveryActions->addWidget(rescanSaves); discoveryActions->addStretch();
-    savesLayout->addLayout(discoveryActions);
-    auto snapshots = new QListWidget(savesTab); snapshots->setObjectName("saveSnapshots"); savesLayout->addWidget(snapshots, 1);
+    auto mappingPath = new QLineEdit(savesTab); mappingPath->setObjectName("saveLocation");
+    mappingPath->setPlaceholderText("Save folder or file, for example UserData");
+    mappingPath->setToolTip("Type a path relative to this game, or Browse within its folder or Wine prefix. Save this change with the Manage dialog's Save button.");
+    auto browseSave = new QPushButton("Browse…", savesTab);
+    mappingRow->addWidget(mappingPath, 1); mappingRow->addWidget(browseSave);
+    savesLayout->addLayout(mappingRow);
+    auto legacyPaths = new QLabel(savesTab); legacyPaths->setWordWrap(true); legacyPaths->setTextFormat(Qt::PlainText);
+    savesLayout->addWidget(legacyPaths);
+    savesLayout->addWidget(new QLabel("Backup history", savesTab));
+    auto snapshots = new QListWidget(savesTab); snapshots->setObjectName("saveSnapshots");
+    savesLayout->addWidget(snapshots, 1);
     auto snapshotActions = new QHBoxLayout;
-    auto makeSnapshot = new QPushButton("Create snapshot", savesTab), restoreSnapshot = new QPushButton("Restore selected…", savesTab);
-    auto syncFromPeer = new QPushButton("Sync from peer…", savesTab); syncFromPeer->setObjectName("syncSavesFromPeer");
-    makeSnapshot->setObjectName("createSaveSnapshot"); restoreSnapshot->setObjectName("restoreSaveSnapshot");
-    snapshotActions->addWidget(makeSnapshot); snapshotActions->addWidget(restoreSnapshot);
-    snapshotActions->addWidget(syncFromPeer); snapshotActions->addStretch();
+    auto restoreSnapshot = new QPushButton("Restore selected…", savesTab);
+    restoreSnapshot->setObjectName("restoreSaveSnapshot");
+    auto syncFromPeer = new QPushButton("Sync", savesTab); syncFromPeer->setObjectName("syncSavesFromPeer");
+    snapshotActions->addWidget(restoreSnapshot); snapshotActions->addWidget(syncFromPeer); snapshotActions->addStretch();
     savesLayout->addLayout(snapshotActions);
     auto saveMessage = new QLabel(savesTab); saveMessage->setWordWrap(true); saveMessage->setTextFormat(Qt::PlainText);
     savesLayout->addWidget(saveMessage);
@@ -1652,137 +1554,65 @@ void Window::manage() {
                            mapping.scope == "documents" ? "Documents" : "Prefix";
         return QString(scope) + ":/" + mapping.path;
     };
-    auto renderSaveStatus = [this, discoveryStatus, saveCandidates, g, displaySaveLocation] {
+    auto renderSaveStatus = [this, discoveryStatus, mappingPath, legacyPaths, g, displaySaveLocation] {
         const auto config = loadSaveConfig(*library_, g.id);
-        saveCandidates->clear();
-        for (const auto &candidate : config.candidates) {
-            const auto item = candidate.toObject();
-            const SaveMapping mapping{item["scope"].toString(), item["path"].toString()};
-            const auto location = displaySaveLocation(mapping);
-            auto row = new QListWidgetItem(location, saveCandidates);
-            row->setToolTip(location);
-            row->setData(Qt::UserRole, mapping.scope); row->setData(Qt::UserRole + 1, mapping.path);
+        if (config.mappings.isEmpty()) {
+            discoveryStatus->setText("Not found — select a save folder or file. Novelty will check again after Play.");
+            legacyPaths->clear();
+            return;
         }
-        saveCandidates->setVisible(!config.candidates.isEmpty());
-        if (config.discoveryState == "unidentified") {
-            discoveryStatus->setText("Unidentified · You stopped save discovery. Local snapshots require a confirmed path."); return;
-        }
-        if (config.discoveryState == "searching") {
-            discoveryStatus->setText("Searching · Novelty will check likely save locations on future launches. " +
-                (config.candidates.isEmpty() ? "No save sync is configured." :
-                 QString::number(config.candidates.size()) + " possible location(s) need confirmation. No save sync is configured.")); return;
-        }
-        const auto snapshots = listSaveSnapshots(*library_, g.id);
-        const bool hasData = std::any_of(snapshots.begin(), snapshots.end(), [](const SaveSnapshot &item) { return item.files > 0; });
-        discoveryStatus->setText(hasData ? "Identified · Local save snapshots are available." :
-                                           "Identified · Save location is known, but no saved data has been captured yet.");
-    };
-    auto addRow = [mappingList, displaySaveLocation](const SaveMapping &mapping) {
-        auto item = new QListWidgetItem(displaySaveLocation(mapping), mappingList);
-        item->setData(Qt::UserRole, mapping.scope); item->setData(Qt::UserRole + 1, mapping.path);
+        discoveryStatus->setText("Detected: " + displaySaveLocation(config.mappings.first()));
+        if (config.mappings.size() > 1) {
+            QStringList others;
+            for (const auto &mapping : config.mappings) others.append(displaySaveLocation(mapping));
+            legacyPaths->setText(QString::number(config.mappings.size()) +
+                " save locations are configured. They remain protected unless you replace them with a new path:\n" +
+                others.join("\n"));
+        } else legacyPaths->clear();
+        if (!mappingPath->isModified()) mappingPath->setText(displaySaveLocation(config.mappings.first()));
     };
     try {
-        const auto config = loadSaveConfig(*library_, g.id);
-        saveIdentity->setText(config.gameIdentity); saveRelease->setText(config.releaseIdentity);
-        saveCompatibility->setText(config.saveCompatibility);
-        if (config.gameIdentity.isEmpty() && g.metadata.value("id").isString())
-            saveIdentity->setPlaceholderText("Suggested: vndb:" + g.metadata.value("id").toString());
-        for (const auto &mapping : config.mappings) addRow(mapping);
         renderSnapshots(); renderSaveStatus();
     } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
-    auto browseMapping = [&, mappingPath, displaySaveLocation](bool directory) {
-        const auto chosen = directory ? QFileDialog::getExistingDirectory(&d, "Choose save folder", g.folder) :
-                                        QFileDialog::getOpenFileName(&d, "Choose save file", g.folder);
+    connect(browseSave, &QPushButton::clicked, &d, [&, mappingPath, displaySaveLocation] {
+        QMenu choices(&d);
+        auto folder = choices.addAction("Select folder…");
+        auto file = choices.addAction("Select file…");
+        auto selected = choices.exec(browseSave->mapToGlobal(QPoint(0, browseSave->height())));
+        if (!selected) return;
+        const auto chosen = selected == folder ?
+            QFileDialog::getExistingDirectory(&d, "Choose save folder", g.folder) :
+            QFileDialog::getOpenFileName(&d, "Choose save file", g.folder);
         if (chosen.isEmpty()) return;
-        try { mappingPath->setText(displaySaveLocation(saveMappingFromPath(*library_, g, chosen))); saveMessage->clear(); }
-        catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
-    };
-    connect(browseSaveFile, &QPushButton::clicked, &d, [browseMapping] { browseMapping(false); });
-    connect(browseSaveFolder, &QPushButton::clicked, &d, [browseMapping] { browseMapping(true); });
-    connect(addMapping, &QPushButton::clicked, &d, [=, this] {
         try {
-            const auto mapping = saveMappingFromPath(*library_, g, mappingPath->text());
-            addRow(mapping); mappingPath->clear(); saveMessage->clear();
+            mappingPath->setText(displaySaveLocation(saveMappingFromPath(*library_, g, chosen)));
+            mappingPath->setModified(true); saveMessage->clear();
         } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
     });
-    connect(useCandidate, &QPushButton::clicked, &d, [=] {
-        auto item = saveCandidates->currentItem();
-        if (!item) { saveMessage->setText("Select a suggested location first."); return; }
-        addRow({item->data(Qt::UserRole).toString(), item->data(Qt::UserRole + 1).toString()});
-        saveMessage->setText("Review the location, choose Save mappings, then Create snapshot to capture this play.");
-    });
-    connect(removeMapping, &QPushButton::clicked, &d, [mappingList] { delete mappingList->takeItem(mappingList->currentRow()); });
-    connect(findMappings, &QPushButton::clicked, &d, [&, addRow] {
-        try {
-            int added = 0;
-            for (const auto &mapping : suggestedSaveMappings(*library_, g.id)) {
-                bool present = false;
-                for (int i = 0; i < mappingList->count(); ++i)
-                    if (mappingList->item(i)->data(Qt::UserRole).toString() == mapping.scope &&
-                        mappingList->item(i)->data(Qt::UserRole + 1).toString() == mapping.path) { present = true; break; }
-                if (!present) { addRow(mapping); ++added; }
-            }
-            saveMessage->setText(added ? "Found likely save folders. Review them, then choose Save mappings." :
-                                         "No populated Ren'Py save folders were found. Add a path manually after you save in the game.");
-        } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
-    });
-    auto saveMappingsNow = [&, saveIdentity, saveRelease, saveCompatibility, mappingList] {
-        SaveConfig config = loadSaveConfig(*library_, g.id);
-        config.gameIdentity = saveIdentity->text().trimmed();
-        config.releaseIdentity = saveRelease->text().trimmed();
-        config.saveCompatibility = saveCompatibility->text().trimmed();
-        config.mappings.clear();
-        for (int i = 0; i < mappingList->count(); ++i)
-            config.mappings.append({mappingList->item(i)->data(Qt::UserRole).toString(),
-                                    mappingList->item(i)->data(Qt::UserRole + 1).toString()});
-        if (!config.mappings.isEmpty()) { config.discoveryState = "identified"; config.discoverySource = "manual"; }
-        else if (config.discoveryState == "identified") { config.discoveryState = "searching"; config.discoverySource.clear(); }
+    auto saveMappingsNow = [this, &g, mappingPath] {
+        if (!mappingPath->isModified()) return false;
+        auto config = loadSaveConfig(*library_, g.id);
+        const auto path = mappingPath->text().trimmed();
+        if (path.isEmpty()) {
+            config.mappings.clear(); config.discoveryState = "searching"; config.discoverySource.clear();
+        } else {
+            config.mappings = {saveMappingFromPath(*library_, g, path)};
+            config.discoveryState = "identified"; config.discoverySource = "manual";
+        }
         saveSaveConfig(*library_, g.id, config);
+        mappingPath->setModified(false);
+        return true;
     };
-    connect(persistSaves, &QPushButton::clicked, &d, [&, saveMappingsNow, renderSaveStatus] {
-        try { saveMappingsNow(); renderSaveStatus(); saveMessage->setText("Save mappings and identity saved."); }
-        catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
-    });
-    connect(stopSearching, &QPushButton::clicked, &d, [&, renderSaveStatus] {
+    connect(syncFromPeer, &QPushButton::clicked, &d, [&, renderSnapshots, renderSaveStatus] {
         try {
-            if (!loadSaveConfig(*library_, g.id).mappings.isEmpty()) {
-                saveMessage->setText("Remove confirmed paths and save before stopping discovery."); return;
-            }
-            setSaveDiscoveryState(*library_, g.id, "unidentified");
-            mappingList->clear(); renderSaveStatus(); saveMessage->setText("Save discovery stopped for this game.");
-        } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
-    });
-    connect(rescanSaves, &QPushButton::clicked, &d, [&, renderSaveStatus] {
-        try {
-            setSaveDiscoveryState(*library_, g.id, "searching"); renderSaveStatus();
-            saveMessage->setText("Save discovery will continue on the next Play.");
-        } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
-    });
-    connect(makeSnapshot, &QPushButton::clicked, &d, [&, saveMappingsNow, renderSnapshots, renderSaveStatus] {
-        try {
-            saveMappingsNow();
-            const auto root = library_->root(), id = g.id;
-            auto work = std::async(std::launch::async, [root, id] { Library worker(root); return createSaveSnapshot(worker, id); });
-            RemovalProgress progress(&d); progress.setWindowTitle("Creating save snapshot");
-            auto progressLayout = new QVBoxLayout(&progress);
-            progressLayout->addWidget(new QLabel("Copying and verifying mapped saves…", &progress)); progress.resize(420, 100);
-            QTimer poll; poll.setInterval(60);
-            connect(&poll, &QTimer::timeout, &progress, [&] {
-                if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
-            });
-            poll.start(); progress.exec(); poll.stop();
-            const auto result = work.get();
-            renderSnapshots(); renderSaveStatus(); saveMessage->setText("Saves checked. Latest verified snapshot: " + result.created);
-        } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
-    });
-    connect(syncFromPeer, &QPushButton::clicked, &d, [&, saveMappingsNow, renderSnapshots, renderSaveStatus] {
-        try {
-            saveMappingsNow();
+            if (mappingPath->isModified()) { saveMessage->setText("Save the new location before syncing."); return; }
             syncSavesFromPeer(g.id, &d);
             renderSnapshots(); renderSaveStatus();
+            saveMessage->clear();
         } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
     });
     connect(restoreSnapshot, &QPushButton::clicked, &d, [&, renderSnapshots, renderSaveStatus] {
+        if (mappingPath->isModified()) { saveMessage->setText("Save the new location before restoring."); return; }
         const auto item = snapshots->currentItem(); if (!item) { saveMessage->setText("Select a snapshot first."); return; }
         if (QMessageBox::question(&d, "Restore saves?", "Restore the selected snapshot? Novelty will first make a verified backup of the current mapped saves.",
                                   QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
@@ -1887,7 +1717,28 @@ void Window::manage() {
                 const int pos = line.indexOf('='); if (pos <= 0) throw std::runtime_error("Environment entries must use KEY=value.");
                 g.environment.insert(line.left(pos).trimmed(), line.mid(pos + 1));
             }
+            const bool savePathChanged = saveMappingsNow();
             library_->save(g); d.accept();
+            if (savePathChanged && !loadSaveConfig(*library_, g.id).mappings.isEmpty()) {
+                const auto root = library_->root(), id = g.id;
+                auto work = std::async(std::launch::async, [root, id] {
+                    Library worker(root); return createSaveSnapshot(worker, id);
+                });
+                RemovalProgress progress(this); progress.setWindowTitle("Checking saved progress");
+                auto progressLayout = new QVBoxLayout(&progress);
+                progressLayout->addWidget(new QLabel("Verifying the selected save location…", &progress));
+                progress.resize(420, 100);
+                QTimer poll; poll.setInterval(60);
+                connect(&poll, &QTimer::timeout, &progress, [&] {
+                    if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
+                });
+                poll.start(); progress.exec(); poll.stop();
+                try { work.get(); }
+                catch (const std::exception &e) {
+                    if (!QString::fromUtf8(e.what()).startsWith("No saved data yet"))
+                        message("Save location was saved, but progress could not be captured: " + QString::fromUtf8(e.what()));
+                }
+            }
         } catch (const std::exception &e) { QMessageBox::warning(&d, "Cannot save", QString::fromUtf8(e.what())); }
     }); d.exec(); refresh();
 }

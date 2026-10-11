@@ -65,6 +65,45 @@ void testLanGameManifest() {
     rejects([&] { validateLanGameManifest(unsafeDescriptor, valid, 4); }, "LAN install rejects unsafe save mapping before import");
     unsafeDescriptor = descriptor; unsafeDescriptor["executable"] = "missing.exe";
     rejects([&] { validateLanGameManifest(unsafeDescriptor, valid, 4); }, "LAN install requires declared executable");
+
+    QTemporaryDir transferRoot;
+    require(transferRoot.isValid(), "LAN transfer fixture root exists");
+    touch(transferRoot.path() + "/Game/game.exe", "exe");
+    touch(transferRoot.path() + "/Game/assets/background.bin", "asset");
+    touch(transferRoot.path() + "/Game/UserData/slot.sav", "progress");
+    Library transfer(transferRoot.path()); transfer.import({inspect(transferRoot.path() + "/Game")}, {});
+    const auto transferGame = transfer.games().first();
+    const auto paths = [](const auto &manifest) {
+        QSet<QString> names;
+        for (const auto &entry : manifest.first) names.insert(entry.path);
+        return names;
+    };
+    require(paths(previewLanGameManifest(transfer, transferGame.id)).contains("UserData/slot.sav"),
+            "unconfirmed folder names are not silently omitted from game transfer");
+    QDir().mkpath(transferGame.folder + "/saves");
+    require(unresolvedGameSaveLocations(transfer, transferGame.id).contains("UserData") &&
+            unresolvedGameSaveLocations(transfer, transferGame.id).contains("saves"),
+            "ambiguous game-local save folders require a source-side choice before LAN transfer");
+    require(QDir(transferGame.folder + "/saves").removeRecursively(), "clear ambiguous transfer fixture");
+    auto transferConfig = loadSaveConfig(transfer, transferGame.id);
+    transferConfig.mappings = {{"game", "UserData"}};
+    saveSaveConfig(transfer, transferGame.id, transferConfig);
+    const auto protectedManifest = paths(previewLanGameManifest(transfer, transferGame.id));
+    require(protectedManifest.contains("game.exe") && protectedManifest.contains("assets/background.bin") &&
+            !protectedManifest.contains("UserData") && !protectedManifest.contains("UserData/slot.sav"),
+            "confirmed game-local saves are excluded while game assets remain transferable");
+    require(captureAvailableSaveSnapshot(transfer, transferGame.id, "before game transfer") &&
+            listSaveSnapshots(transfer, transferGame.id).size() == 1,
+            "peer game transfer captures existing progress before excluding its save folder");
+    const auto transferHead = appliedSaveSnapshotId(transfer, transferGame.id);
+    require(captureAvailableSaveSnapshot(transfer, transferGame.id, "before game transfer") &&
+            appliedSaveSnapshotId(transfer, transferGame.id) == transferHead &&
+            listSaveSnapshots(transfer, transferGame.id).size() == 1,
+            "retrying a peer game transfer reuses unchanged verified progress");
+    require(QFile::remove(transferGame.folder + "/UserData/slot.sav") &&
+            !captureAvailableSaveSnapshot(transfer, transferGame.id, "before game transfer") &&
+            appliedSaveSnapshotId(transfer, transferGame.id) == transferHead,
+            "an empty save folder does not publish an empty transfer snapshot or erase history");
 }
 void testSetupRecipePrecedence() {
     const QList<SetupRule> rules{{{}, {}, "Ren'Py", "generic-proton-v1"},
@@ -402,20 +441,20 @@ void testSaveDiscovery(const QString &base) {
             "manual save path cannot point outside the game or its prefix");
     rejects([&] { saveMappingFromPath(lib, game, "/Game/../outside-save"); },
             "displayed game path cannot escape the game folder");
-    for (int i = 0; i < 3; ++i) {
-        beginSaveObservation(lib, game);
-        touch(game.folder + "/saves/config.ini", QByteArray::number(i));
-        touch(game.folder + "/saves/logs/session.log", QByteArray::number(i));
-        finishSaveObservation(lib, game);
-        require(loadSaveConfig(lib, game.id).discoveryState == "searching" &&
-                listSaveSnapshots(lib, game.id).isEmpty(), "save-free launches keep discovery searching");
-    }
     beginSaveObservation(lib, game);
-    touch(game.folder + "/saves/slot1.sav", "fourth launch progress");
+    require(loadSaveConfig(lib, game.id).discoveryState == "searching" &&
+            !QFileInfo::exists(lib.gamePath(game.id, "save-observation.json")),
+            "no save folder leaves discovery ready for the next Play without an inventory");
+    QDir().mkpath(game.folder + "/UserData");
     finishSaveObservation(lib, game);
     auto found = loadSaveConfig(lib, game.id);
-    require(found.discoveryState == "identified" && found.discoverySource == "observed" &&
-            found.mappings.size() == 1 && found.mappings.first().path == "saves", "fourth launch identifies changed save root");
+    require(found.discoveryState == "identified" && found.discoverySource == "heuristic" &&
+            found.mappings.size() == 1 && found.mappings.first().path == "UserData",
+            "empty conventional UserData folder is detected after Play");
+    queuePostExitSaveSnapshot(lib, game);
+    finishPostExitSaveSnapshot(lib, game);
+    require(listSaveSnapshots(lib, game.id).isEmpty(), "empty detected folder produces no snapshot");
+    touch(game.folder + "/UserData/slot1.sav", "first launch progress");
     const auto first = createSaveSnapshot(lib, game.id);
     require(createSaveSnapshot(lib, game.id).id == first.id && listSaveSnapshots(lib, game.id).size() == 1,
             "unchanged save creates no duplicate snapshot");
@@ -424,10 +463,10 @@ void testSaveDiscovery(const QString &base) {
     require(createSaveSnapshot(lib, game.id).id != first.id,
             "identical bytes under a different edition do not reuse an incompatible snapshot");
     otherEdition.releaseIdentity.clear(); saveSaveConfig(lib, game.id, otherEdition);
-    require(QDir(game.folder + "/saves").removeRecursively(), "clear saves for fresh-install restore fixture");
+    require(QDir(game.folder + "/UserData").removeRecursively(), "clear saves for fresh-install restore fixture");
     const auto count = listSaveSnapshots(lib, game.id).size();
     restoreSaveSnapshot(lib, game.id, first.id);
-    require(contents(game.folder + "/saves/slot1.sav") == "fourth launch progress" &&
+    require(contents(game.folder + "/UserData/slot1.sav") == "first launch progress" &&
             listSaveSnapshots(lib, game.id).size() == count,
             "fresh empty save root restores without publishing an empty backup");
     setSaveDiscoveryState(lib, game.id, "searching");
@@ -435,7 +474,9 @@ void testSaveDiscovery(const QString &base) {
     setSaveDiscoveryState(lib, game.id, "unidentified");
     require(loadSaveConfig(lib, game.id).discoveryState == "unidentified", "explicit stop persists unidentified state");
     beginSaveObservation(lib, game);
-    require(!QFileInfo::exists(lib.gamePath(game.id, "save-observation.json")), "unidentified state skips observation");
+    require(loadSaveConfig(lib, game.id).discoveryState == "identified" &&
+            loadSaveConfig(lib, game.id).mappings.first().path == "UserData",
+            "legacy stopped discovery resumes the bounded detector");
 
     const auto recipeRoot = base + "/Save recipe";
     touch(recipeRoot + "/Game/game.exe");
@@ -474,64 +515,61 @@ void testSaveDiscovery(const QString &base) {
     touch(ambiguousRoot + "/Game/game.exe");
     Library ambiguous(ambiguousRoot); ambiguous.import({inspect(ambiguousRoot + "/Game")}, {});
     const auto ambiguousGame = ambiguous.games().first();
+    QDir().mkpath(ambiguousGame.folder + "/saves");
+    QDir().mkpath(ambiguousGame.folder + "/savedata");
     beginSaveObservation(ambiguous, ambiguousGame);
-    touch(ambiguousGame.folder + "/saves/slot1.sav", "first possible save");
-    touch(ambiguousGame.folder + "/savedata/progress.sav", "second possible save");
-    require(recoverSaveObservations(ambiguous).size() == 1, "unfinished observation is recovered after the game exits");
     const auto uncertain = loadSaveConfig(ambiguous, ambiguousGame.id);
-    require(uncertain.discoveryState == "searching" && uncertain.candidates.size() == 2 &&
-            uncertain.mappings.isEmpty(), "ambiguous changed roots remain suggestions");
+    require(uncertain.discoveryState == "searching" && uncertain.mappings.isEmpty(),
+            "two conventional save folders require a manual choice");
     auto manual = uncertain; manual.mappings = {{"game", "savedata"}};
     saveSaveConfig(ambiguous, ambiguousGame.id, manual);
     require(loadSaveConfig(ambiguous, ambiguousGame.id).discoveryState == "identified" &&
             loadSaveConfig(ambiguous, ambiguousGame.id).discoverySource == "manual", "manual confirmation overrides ambiguity");
 
+    const auto titleRoot = base + "/Title saves";
+    touch(titleRoot + "/Amairo Chocolata/game.exe");
+    Library titles(titleRoot); titles.import({inspect(titleRoot + "/Amairo Chocolata")}, {});
+    const auto titleGame = titles.games().first();
+    QDir().mkpath(titles.prefix(titleGame.id) + "/drive_c/users/steamuser/AppData/Roaming/Publisher/Amairo Chocolata");
+    beginSaveObservation(titles, titleGame);
+    const auto titleConfig = loadSaveConfig(titles, titleGame.id);
+    require(titleConfig.discoveryState == "identified" && titleConfig.mappings.size() == 1 &&
+            titleConfig.mappings.first().scope == "appdata" &&
+            titleConfig.mappings.first().path == "Publisher/Amairo Chocolata",
+            "title-named AppData folder is detected within bounded Wine locations");
+
+    const auto adjacentRoot = base + "/Executable adjacent saves";
+    touch(adjacentRoot + "/Game/bin/game.exe");
+    QDir().mkpath(adjacentRoot + "/Game/bin/UserData");
+    Library adjacent(adjacentRoot); adjacent.import({inspect(adjacentRoot + "/Game")}, {});
+    const auto adjacentGame = adjacent.games().first();
+    beginSaveObservation(adjacent, adjacentGame);
+    require(loadSaveConfig(adjacent, adjacentGame.id).mappings.first().path == "bin/UserData",
+            "save directory beside selected executable is detected");
+
     const auto unusualRoot = base + "/Unusual saves";
     touch(unusualRoot + "/Game/game.exe");
     Library unusual(unusualRoot); unusual.import({inspect(unusualRoot + "/Game")}, {});
     const auto unusualGame = unusual.games().first();
-    touch(unusualGame.folder + "/Data/Progress/old.bin", "before");
-    beginSaveObservation(unusual, unusualGame);
-    touch(unusualGame.folder + "/Data/Progress/old.bin", "updated progress");
     touch(unusualGame.folder + "/Data/Progress/user0.bin", "game folder progress");
-    touch(unusual.prefix(unusualGame.id) + "/drive_c/users/steamuser/AppData/Local/Vendor/Title/state.bin",
-          "prefix progress");
-    touch(unusual.prefix(unusualGame.id) + "/drive_c/users/steamuser/AppData/Roaming/AnotherTitle/progress.bin",
-          "portable progress");
+    touch(unusual.prefix(unusualGame.id) + "/drive_c/users/steamuser/AppData/Local/Vendor/OtherTitle/state.bin",
+          "unrelated prefix data");
+    beginSaveObservation(unusual, unusualGame);
     finishSaveObservation(unusual, unusualGame);
-    const auto unusualConfig = loadSaveConfig(unusual, unusualGame.id);
-    require(unusualConfig.discoveryState == "searching" && unusualConfig.mappings.isEmpty() &&
-            unusualConfig.candidates.size() == 3,
-            "new files outside known save roots are reviewable rather than auto-mapped");
-    QSet<QString> unusualPaths;
-    for (const auto &candidate : unusualConfig.candidates) {
-        const auto item = candidate.toObject();
-        unusualPaths.insert(item["scope"].toString() + '/' + item["path"].toString());
-    }
-    require(unusualPaths.contains("game/Data/Progress") &&
-            unusualPaths.contains("appdata/AnotherTitle") &&
-            unusualPaths.contains("prefix/drive_c/users/steamuser/AppData/Local/Vendor/Title"),
-            "wide observation identifies the actual folders for user confirmation");
-    for (const auto &candidate : unusualConfig.candidates)
-        if (candidate.toObject()["path"].toString() == "Data/Progress")
-            require(candidate.toObject()["count"].toInt() == 2 &&
-                    candidate.toObject()["evidence"].toString().contains("old.bin"),
-                    "review evidence includes an existing changed file with an unfamiliar name");
+    require(loadSaveConfig(unusual, unusualGame.id).discoveryState == "searching" &&
+            loadSaveConfig(unusual, unusualGame.id).mappings.isEmpty(),
+            "unmatched paths remain unconfigured for manual selection");
 
     const auto priorRoot = base + "/Legacy observation";
     touch(priorRoot + "/Game/game.exe");
     Library prior(priorRoot); prior.import({inspect(priorRoot + "/Game")}, {});
     const auto priorGame = prior.games().first();
-    beginSaveObservation(prior, priorGame);
-    auto priorObservation = readJson(prior.gamePath(priorGame.id, "save-observation.json"));
-    QJsonArray focusedRoots;
-    for (const auto &rootValue : priorObservation["roots"].toArray())
-        if (!rootValue.toObject()["broad"].toBool()) focusedRoots.append(rootValue);
-    priorObservation["roots"] = focusedRoots;
-    writeJson(prior.gamePath(priorGame.id, "save-observation.json"), priorObservation);
-    finishSaveObservation(prior, priorGame);
-    require(loadSaveConfig(prior, priorGame.id).candidates.isEmpty(),
-            "old observations do not report every preexisting file as new");
+    writeJson(prior.gamePath(priorGame.id, "save-observation.json"), {{"schema", 1}, {"game_id", priorGame.id}});
+    QDir().mkpath(priorGame.folder + "/UserData");
+    require(recoverSaveObservations(prior).size() == 1 &&
+            !QFileInfo::exists(prior.gamePath(priorGame.id, "save-observation.json")) &&
+            loadSaveConfig(prior, priorGame.id).mappings.first().path == "UserData",
+            "legacy observation metadata is cleared after bounded discovery");
 
     const auto renpyRoot = base + "/Engine saves";
     touch(renpyRoot + "/Game/game.exe");
@@ -615,6 +653,39 @@ void testSaveDiscovery(const QString &base) {
     wrongEdition.releaseIdentity = "other build"; saveSaveConfig(destination, targetGame.id, wrongEdition);
     rejects([&] { importSaveSnapshot(destination, targetGame.id, sourceBranchDir, sourceFingerprint); },
             "incoming snapshot from another edition is refused before touching saves");
+
+    const auto simpleSourceRoot = base + "/Simple peer source", simpleTargetRoot = base + "/Simple peer target";
+    touch(simpleSourceRoot + "/Same Name/game.exe");
+    touch(simpleTargetRoot + "/Same Name/game.exe");
+    Library simpleSource(simpleSourceRoot), simpleTarget(simpleTargetRoot);
+    simpleSource.import({inspect(simpleSourceRoot + "/Same Name")}, {});
+    simpleTarget.import({inspect(simpleTargetRoot + "/Same Name")}, {});
+    const auto sourceSimpleGame = simpleSource.games().first(), targetSimpleGame = simpleTarget.games().first();
+    auto sourceSimpleConfig = loadSaveConfig(simpleSource, sourceSimpleGame.id);
+    sourceSimpleConfig.mappings = {{"game", "UserData"}};
+    saveSaveConfig(simpleSource, sourceSimpleGame.id, sourceSimpleConfig);
+    auto targetSimpleConfig = loadSaveConfig(simpleTarget, targetSimpleGame.id);
+    targetSimpleConfig.mappings = {{"game", "UserData"}};
+    saveSaveConfig(simpleTarget, targetSimpleGame.id, targetSimpleConfig);
+    touch(sourceSimpleGame.folder + "/UserData/slot.sav", "simple peer progress");
+    const auto simpleSnapshot = createSaveSnapshot(simpleSource, sourceSimpleGame.id);
+    const auto simpleBundle = QFileInfo(simpleSource.gamePath(sourceSimpleGame.id, "saves.json")).absolutePath() +
+                              "/snapshots/" + simpleSnapshot.id;
+    const auto simpleFingerprint = ensureDeviceIdentity(simpleSource).fingerprint;
+    approvePairedPeer(simpleTarget, simpleFingerprint, "Simple source");
+    linkPeerSaveGame(simpleTarget, targetSimpleGame.id, simpleFingerprint, sourceSimpleConfig.profileGameId);
+    require(importSaveSnapshot(simpleTarget, targetSimpleGame.id, simpleBundle, simpleFingerprint).added,
+            "linked games exchange verified saves without identity, build or compatibility labels");
+    restoreSaveSnapshot(simpleTarget, targetSimpleGame.id, simpleSnapshot.id);
+    require(contents(targetSimpleGame.folder + "/UserData/slot.sav") == "simple peer progress",
+            "unlabeled peer snapshot restores through confirmed portable mapping");
+    const auto renamed = simpleSourceRoot + "/Renamed folder";
+    require(QDir().rename(sourceSimpleGame.folder, renamed), "rename source game folder");
+    simpleSource.relink(simpleSource.planRelink(sourceSimpleGame.id, renamed));
+    require(loadSaveConfig(simpleSource, sourceSimpleGame.id).folderAliases.contains("Same Name") &&
+            simpleSource.game(sourceSimpleGame.id).id == sourceSimpleGame.id &&
+            !listSaveSnapshots(simpleSource, sourceSimpleGame.id).isEmpty(),
+            "folder rename retains stable ID, previous name and snapshot history");
 }
 void testSteamShortcut(const QString &base) {
     const auto root = base + "/Steam shortcut game";

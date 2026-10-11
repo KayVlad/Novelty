@@ -23,6 +23,7 @@ struct SaveConfig {
     QString discoveryState = "searching"; // searching, identified or explicitly unidentified.
     QString discoverySource;       // manual, recipe, engine or observed.
     QJsonArray candidates;         // Unconfirmed portable locations and evidence.
+    QStringList folderAliases;     // Previous local folder names for first-time peer matching after a rename.
     QList<SaveMapping> mappings;
     QList<PeerSaveGameLink> peerLinks; // Explicitly confirmed existing-install matches, scoped to a trusted peer.
 };
@@ -42,6 +43,10 @@ QList<SaveMapping> suggestedSaveMappings(const Library &, const QString &gameId)
 void saveSaveConfig(Library &, const QString &gameId, const SaveConfig &);
 void setSaveDiscoveryState(Library &, const QString &gameId, const QString &state);
 SaveSnapshot createSaveSnapshot(Library &, const QString &gameId, const QString &reason = "manual");
+// Capture populated mapped roots before a peer game transfer. Empty roots are valid.
+bool captureAvailableSaveSnapshot(Library &, const QString &gameId, const QString &reason);
+// Game-local candidates that still need a choice before transferring game files.
+QStringList unresolvedGameSaveLocations(const Library &, const QString &gameId);
 QList<SaveSnapshot> listSaveSnapshots(const Library &, const QString &gameId);
 QString appliedSaveSnapshotId(const Library &, const QString &gameId);
 QString verifiedSaveSnapshotBundle(const Library &, const QString &gameId, const QString &snapshotId);
@@ -52,6 +57,8 @@ SaveImportResult importSaveSnapshot(Library &, const QString &gameId, const QStr
                                     const QString &authenticatedPeer = {});
 void linkPeerSaveGame(Library &, const QString &gameId, const QString &peerFingerprint,
                       const QString &peerProfileGameId);
+void recordSaveFolderRename(Library &, const QString &gameId, const QString &previousName);
+QString normalizedSaveGameName(const QString &name);
 QStringList recoverSaveRestores(Library &);
 QString saveRestoreIssue(const Library &, const QString &gameId);
 // Called by the detached supervisor while it holds launch.lock.

@@ -4,6 +4,7 @@
 #include <QtCore/qfileinfo.h>
 #include <QtCore/qjsondocument.h>
 #include <QtCore/qpointer.h>
+#include <QtCore/qset.h>
 #include <QtCore/quuid.h>
 #include <stdexcept>
 
@@ -78,10 +79,17 @@ LanSaveExchange::~LanSaveExchange() {
 }
 
 void LanSaveExchange::locate(const SaveConfig &config) {
-    if (!connection_.ready() || config.gameIdentity.isEmpty() || config.releaseIdentity.isEmpty() ||
-        config.saveCompatibility.isEmpty()) throw std::runtime_error("Confirm this game's save identity before LAN sync.");
+    if (!connection_.ready()) throw std::runtime_error("Connect to a trusted peer before checking saves.");
+    QString folderName;
+    for (const auto &game : library_.games())
+        if (loadSaveConfig(library_, game.id).profileGameId == config.profileGameId) {
+            folderName = QFileInfo(game.folder).fileName(); break;
+        }
+    if (folderName.isEmpty()) throw std::runtime_error("Local game folder is unavailable for peer matching.");
     locateRequest_ = QUuid::createUuid().toString(QUuid::WithoutBraces);
     connection_.send({{"type", "save-locate"}, {"request_id", locateRequest_},
+        {"profile_game_id", config.profileGameId}, {"folder_name", folderName.left(100)},
+        {"folder_aliases", QJsonArray::fromStringList(config.folderAliases)},
         {"game_identity", config.gameIdentity}, {"release_identity", config.releaseIdentity},
         {"save_compatibility", config.saveCompatibility}});
 }
@@ -108,9 +116,7 @@ void LanSaveExchange::offer(const QString &gameId, const QString &snapshotId) {
         appliedSaveSnapshotId(library_, gameId) != snapshotId)
         throw std::runtime_error("Only the current verified save head can be offered.");
     const auto config = loadSaveConfig(library_, gameId);
-    if (config.gameIdentity.isEmpty() || config.releaseIdentity.isEmpty() ||
-        config.saveCompatibility.isEmpty() || config.mappings.isEmpty())
-        throw std::runtime_error("Confirm save identity and paths before offering saves.");
+    if (config.mappings.isEmpty()) throw std::runtime_error("Choose a save location before offering saves.");
     verifiedSaveSnapshotBundle(library_, gameId, snapshotId);
     outgoingOfferId_ = QUuid::createUuid().toString(QUuid::WithoutBraces);
     offeredGameId_ = gameId; offeredSnapshot_ = snapshotId;
@@ -138,22 +144,44 @@ void LanSaveExchange::sendError(const QString &requestId, const QString &message
 
 void LanSaveExchange::answerLocate(const QJsonObject &request) {
     const auto id = request["request_id"].toString();
+    const auto remoteGameId = request["profile_game_id"].toString();
+    const auto folderName = request["folder_name"].toString();
     const auto gameIdentity = request["game_identity"].toString();
     const auto release = request["release_identity"].toString();
     const auto compatibility = request["save_compatibility"].toString();
-    if (!uuid(id) || gameIdentity.isEmpty() || release.isEmpty() || compatibility.isEmpty() ||
+    const auto aliases = request["folder_aliases"].toArray();
+    if (!uuid(id) || !uuid(remoteGameId) || folderName.isEmpty() || folderName.size() > 100 ||
+        folderName.contains('/') || !request["folder_aliases"].isArray() || aliases.size() > 8 ||
         gameIdentity.size() > 256 || release.size() > 256 || compatibility.size() > 256)
         throw std::runtime_error("Invalid save lookup request.");
+    QSet<QString> remoteNames{normalizedSaveGameName(folderName)};
+    for (const auto &alias : aliases) {
+        if (!alias.isString() || alias.toString().size() > 100 || alias.toString().contains('/'))
+            throw std::runtime_error("Invalid previous folder name in save lookup.");
+        remoteNames.insert(normalizedSaveGameName(alias.toString()));
+    }
     QJsonArray matches;
     for (const auto &game : library_.games()) {
         const auto config = loadSaveConfig(library_, game.id);
-        if (config.gameIdentity != gameIdentity || config.releaseIdentity != release ||
-            config.saveCompatibility != compatibility || config.mappings.isEmpty()) continue;
+        bool linked = config.profileGameId == remoteGameId;
+        for (const auto &link : config.peerLinks)
+            if (link.fingerprint == connection_.peerFingerprint() && link.profileGameId == remoteGameId) linked = true;
+        const bool labelsMatch =
+            (config.gameIdentity.isEmpty() || gameIdentity.isEmpty() || config.gameIdentity == gameIdentity) &&
+            (config.releaseIdentity.isEmpty() || release.isEmpty() || config.releaseIdentity == release) &&
+            (config.saveCompatibility.isEmpty() || compatibility.isEmpty() ||
+             config.saveCompatibility == compatibility);
+        if (config.mappings.isEmpty() || (!linked && !labelsMatch)) continue;
+        bool named = remoteNames.contains(normalizedSaveGameName(QFileInfo(game.folder).fileName()));
+        for (const auto &alias : config.folderAliases)
+            if (remoteNames.contains(normalizedSaveGameName(alias))) named = true;
+        if (!linked && !named) continue;
         QJsonArray history;
         for (const auto &snapshotId : saveSnapshotLineage(library_, game.id)) history.append(snapshotId);
         matches.append(QJsonObject{{"profile_game_id", config.profileGameId},
                                    {"snapshot_id", appliedSaveSnapshotId(library_, game.id)},
-                                   {"snapshot_ids", history}, {"name", game.name.left(100)}});
+                                   {"snapshot_ids", history}, {"name", game.name.left(100)},
+                                   {"compatibility_issue", !labelsMatch}});
         if (matches.size() >= 8) break;
     }
     connection_.send({{"type", "save-found"}, {"request_id", id}, {"matches", matches}});
@@ -303,9 +331,6 @@ void LanSaveExchange::handle(const QJsonObject &message) {
         if (type == "save-offer") {
             if (!uuid(id) || !uuid(message["profile_game_id"].toString()) ||
                 !uuid(message["snapshot_id"].toString()) ||
-                message["game_identity"].toString().isEmpty() ||
-                message["release_identity"].toString().isEmpty() ||
-                message["save_compatibility"].toString().isEmpty() ||
                 message["game_identity"].toString().size() > 256 ||
                 message["release_identity"].toString().size() > 256 ||
                 message["save_compatibility"].toString().size() > 256)

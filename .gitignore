@@ -6,7 +6,7 @@
 /.codex/
 /.novelty/
 /artifacts/
-/docs/design/
+/docs/
 /Novelty.desktop
 __pycache__/
 *.pyc
