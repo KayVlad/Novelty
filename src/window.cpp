@@ -1312,14 +1312,18 @@ void Window::installFromPeer() {
         saveMetadataCover(metadataCoverPath(library_->dataRoot(), installedId), bytes);
     }
     refresh();
-    for (int row = 0; row < model_->games.size(); ++row) if (model_->games[row].id == installedId) {
-        table_->setCurrentIndex(proxy_->mapFromSource(model_->index(row, 0))); break;
-    }
     try {
         const auto result = refreshLinkedPeerSaves(*library_, installedId);
-        message(result.issues.isEmpty() ? "Game installed. Save history checked; ready for setup on Play." :
+        message(result.issues.isEmpty() ? "Game installed. Save history checked; preparing local setup…" :
             "Game installed. Peer saves will be checked again before Play: " + result.issues.join(" "));
     } catch (const std::exception &e) { message("Game installed. " + QString::fromUtf8(e.what())); }
+    for (int row = 0; row < model_->games.size(); ++row) if (model_->games[row].id == installedId) {
+        table_->setCurrentIndex(proxy_->mapFromSource(model_->index(row, 0)));
+        // Runner paths and prefixes belong to this device; finish its normal setup
+        // after the transfer. Cancellation keeps the installation for a later Play.
+        if (model_->games[row].backend == "umu") launch(true);
+        break;
+    }
 }
 void Window::syncSavesFromPeer(const QString &gameId, QWidget *parent) {
     if (!library_ || !rootAvailable()) throw std::runtime_error("Reconnect the Games folder before syncing saves.");

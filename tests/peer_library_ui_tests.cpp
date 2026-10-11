@@ -2,6 +2,7 @@
 #include "lan_connection.h"
 #include "metadata.h"
 #include "saves.h"
+#include "setup.h"
 #include <QtWidgets/qapplication.h>
 #include <QtWidgets/qtableview.h>
 #include <QtWidgets/qmenu.h>
@@ -34,6 +35,7 @@ static bool waitFor(const std::function<bool()> &test, int limit = 10000) {
 }
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
+    if (argc < 2) return 1;
     QTemporaryDir temp;
     if (!temp.isValid()) return 1;
     QSettings::setDefaultFormat(QSettings::IniFormat);
@@ -50,6 +52,21 @@ int main(int argc, char **argv) {
         const auto sourceRoot = temp.path() + "/source", targetRoot = temp.path() + "/target";
         QDir().mkpath(sourceRoot); QDir().mkpath(targetRoot);
         Library source(sourceRoot), target(targetRoot);
+        // Receiver starts without a default runner. Use its locally installed profile
+        // runner, and prepare the prefix after transfer without starting the game.
+        const auto runner = target.dataRoot() + "/runners/GE-Proton11-7";
+        file(runner + "/proton");
+        file(runner + "/toolmanifest.vdf", "\"require_tool_appid\" \"4183110\"");
+        const auto umu = temp.path() + "/umu";
+        file(umu, "#!/bin/sh\n"
+             "case \"$WINEPREFIX\" in *runtime-probe-*)\n"
+             "  [ -z \"$UMU_ZENITY\" ] || exit 1\n"
+             "  mkdir -p \"$UMU_FOLDERS_PATH/umu/steamrt4\"\n"
+             "  touch \"$UMU_FOLDERS_PATH/umu/steamrt4/.installed.ok\" \"$UMU_FOLDERS_PATH/umu/steamrt4/_v2-entry-point\";;\n"
+             "esac\nmkdir -p \"$WINEPREFIX\"\ntouch \"$WINEPREFIX/system.reg\"\n"
+             "if [ -n \"$1\" ]; then touch \"$WINEPREFIX/played\"; fi\n");
+        QFile::setPermissions(umu, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        target.setSettings({{"umu", umu}});
         for (const auto &name : {"First", "Second"}) {
             const auto folder = sourceRoot + '/' + name;
             file(folder + "/game.exe", "game asset"); file(folder + "/save/slot.dat", "private progress");
@@ -72,7 +89,14 @@ int main(int argc, char **argv) {
         rememberPeerEndpoint(target, sourceIdentity.fingerprint, "127.0.0.1", deadPort);
         Window sender(sourceRoot); sender.show();
         auto service = sender.findChild<QTcpServer *>(); require(service && service->serverPort() != deadPort, "source listener");
-        Window receiver(targetRoot); receiver.show();
+        Window receiver(targetRoot, argv[1]); receiver.show();
+        const auto prepared = [&] {
+            for (const auto &game : target.games())
+                if (game.runner != runner || !setupComplete(target, game) || target.busy(game.id) ||
+                    QFileInfo::exists(target.prefix(game.id) + "/played")) return false;
+            auto play = receiver.findChild<QAction *>("listPlayAction");
+            return play && play->isEnabled(); // The UI has observed the supervisor finishing.
+        };
         auto table = receiver.findChild<QTableView *>("gameList");
         auto grid = dynamic_cast<GameGrid *>(receiver.findChild<QListView *>("gameGrid"));
         require(table && grid, "library views");
@@ -102,6 +126,7 @@ int main(int argc, char **argv) {
         require(QFileInfo::exists(metadataCoverPath(target.dataRoot(), target.games().first().id)), "installed cover persists");
         require(!QFileInfo::exists(target.games().first().folder + "/save/slot.dat"), "installation must not copy progress as assets");
         require(!listSaveSnapshots(target, target.games().first().id).isEmpty(), "progress arrives through the save mechanism");
+        require(waitFor(prepared), "context Install must select a local runner and complete setup without playing");
         QModelIndex second;
         for (int row = 0; row < table->model()->rowCount(); ++row) {
             const auto index = table->model()->index(row, 0);
@@ -111,6 +136,7 @@ int main(int argc, char **argv) {
         // QListView emits activated for both double-click and keyboard activation.
         require(QMetaObject::invokeMethod(grid, "activated", Qt::DirectConnection, Q_ARG(QModelIndex, second)), "activate remote card");
         require(target.games().size() == 2 && table->model()->rowCount() == 2, "activation must install once and replace the card");
+        require(waitFor(prepared), "activation must also prepare the installed game without playing");
         for (int row = 0; row < 2; ++row) require(!table->model()->index(row, 0).data(RemoteRole).toBool(), "installed cards are local");
         // Closing windows during a new background lookup must release connections before libraries.
         receiver.refreshPeerGames();

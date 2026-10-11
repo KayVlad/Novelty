@@ -362,7 +362,7 @@ int main(int argc, char **argv) {
         touch(runtimeRunner + "/toolmanifest.vdf", "\"manifest\"\n{\n\"require_tool_appid\" \"4183110\"\n}\n");
         require(requiredSteamRuntime(runtimeRunner) == "steamrt4", "Selected Proton runtime was not identified");
         const auto fakeRuntimeUmu = temporary.path() + "/fake-runtime-umu";
-        touch(fakeRuntimeUmu, "#!/bin/sh\nmkdir -p \"$UMU_FOLDERS_PATH/umu/steamrt4\"\ntouch \"$UMU_FOLDERS_PATH/invoked\"\nif [ -e \"$UMU_FOLDERS_PATH/fail\" ]; then echo 'Fixture runtime download failed' >&2; exit 1; fi\nif [ -e \"$UMU_FOLDERS_PATH/cancel\" ]; then touch \"$UMU_FOLDERS_PATH/waiting\"; exec sleep 20; fi\ntouch \"$UMU_FOLDERS_PATH/umu/steamrt4/.installed.ok\" \"$UMU_FOLDERS_PATH/umu/steamrt4/_v2-entry-point\"\nexit 0\n");
+        touch(fakeRuntimeUmu, "#!/bin/sh\n[ -z \"$UMU_ZENITY\" ] || { echo 'UMU_ZENITY must be unset for the Python downloader' >&2; exit 1; }\nmkdir -p \"$UMU_FOLDERS_PATH/umu/steamrt4\"\ntouch \"$UMU_FOLDERS_PATH/invoked\"\nif [ -e \"$UMU_FOLDERS_PATH/fail\" ]; then echo 'Fixture runtime download failed' >&2; exit 1; fi\nif [ -e \"$UMU_FOLDERS_PATH/cancel\" ]; then touch \"$UMU_FOLDERS_PATH/waiting\"; exec sleep 20; fi\ntouch \"$UMU_FOLDERS_PATH/umu/steamrt4/.installed.ok\" \"$UMU_FOLDERS_PATH/umu/steamrt4/_v2-entry-point\"\nexit 0\n");
         QFile::setPermissions(fakeRuntimeUmu, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
         Library runtimeLibrary(runtimeRoot); runtimeLibrary.setSettings({{"umu", fakeRuntimeUmu}});
         runtimeLibrary.import({inspect(runtimeRoot + "/Game")}, runtimeRunner);
@@ -381,6 +381,10 @@ int main(int argc, char **argv) {
         QObject::connect(&runtimeWatchdog, &QTimer::timeout, &firstPlay, [&] {
             if (auto dialog = firstPlay.findChild<QDialog *>("steamRuntimeDialog")) dialog->reject();
         });
+        // A parent process may also export this; provisioning must remove it.
+        const auto inheritedZenity = qgetenv("UMU_ZENITY");
+        const bool hadZenity = qEnvironmentVariableIsSet("UMU_ZENITY");
+        qputenv("UMU_ZENITY", "0");
         runtimeRetry.start(); runtimeWatchdog.start(5000);
         const bool runtimeInstalled = provisionSteamRuntime(&firstPlay, runtimeLibrary, runtimeGame);
         runtimeRetry.stop(); runtimeWatchdog.stop();
@@ -415,7 +419,7 @@ int main(int argc, char **argv) {
         const auto combinedGeHelper = temporary.path() + "/combined-ge.py";
         touch(combinedGeHelper, "import os,sys\nr=sys.argv[1]\nopen(r+'/.novelty/ge-invoked','w').close()\nif os.path.exists(r+'/.novelty/ge-fail'): sys.exit(1)\np=r+'/.novelty/runners/GE-Proton11-7'\nos.makedirs(p,exist_ok=True)\nopen(p+'/proton','w').close()\nopen(p+'/toolmanifest.vdf','w').write('\\\"require_tool_appid\\\" \\\"4183110\\\"')\nprint(p)\n");
         const auto combinedUmuHelper = temporary.path() + "/combined-umu.py";
-        touch(combinedUmuHelper, "import os,sys,time\nr=sys.argv[1]\np=r+'/.novelty/tools/umu-1.4.4/umu-run'\nos.makedirs(os.path.dirname(p),exist_ok=True)\nopen(r+'/.novelty/umu-invoked','w').close()\nif os.path.exists(r+'/.novelty/umu-wait'): open(r+'/.novelty/waiting','w').close(); time.sleep(20)\nopen(p,'w').write('#!/bin/sh\\nmkdir -p \\\"$UMU_FOLDERS_PATH/umu/steamrt4\\\"\\ntouch \\\"$UMU_FOLDERS_PATH/umu/steamrt4/.installed.ok\\\" \\\"$UMU_FOLDERS_PATH/umu/steamrt4/_v2-entry-point\\\"\\n')\nos.chmod(p,0o700)\nprint(p)\n");
+        touch(combinedUmuHelper, "import os,sys,time\nr=sys.argv[1]\np=r+'/.novelty/tools/umu-1.4.4/umu-run'\nos.makedirs(os.path.dirname(p),exist_ok=True)\nopen(r+'/.novelty/umu-invoked','w').close()\nif os.path.exists(r+'/.novelty/umu-wait'): open(r+'/.novelty/waiting','w').close(); time.sleep(20)\nopen(p,'w').write('#!/bin/sh\\n[ -z \\\"$UMU_ZENITY\\\" ] || exit 1\\nmkdir -p \\\"$UMU_FOLDERS_PATH/umu/steamrt4\\\"\\ntouch \\\"$UMU_FOLDERS_PATH/umu/steamrt4/.installed.ok\\\" \\\"$UMU_FOLDERS_PATH/umu/steamrt4/_v2-entry-point\\\"\\n')\nos.chmod(p,0o700)\nprint(p)\n");
         touch(combinedLibrary.dataRoot() + "/ge-fail");
         writeJson(combinedLibrary.dataRoot() + "/ge-proton.json", {{"version", "GE-Proton11-7"}, {"auto_download", false}});
         bool combinedStarted = false, combinedRetried = false, oneDialog = false, policyRespected = false;
@@ -469,6 +473,7 @@ int main(int argc, char **argv) {
         require(!cancelledCombined && cancelLibrary.game(cancelGame.id).runner.isEmpty() &&
                 !QFileInfo::exists(cancelLibrary.dataRoot() + "/runtime/umu/steamrt4/.installed.ok"),
                 "Cancelling combined first-Play setup saved an incomplete runner or runtime");
+        if (hadZenity) qputenv("UMU_ZENITY", inheritedZenity); else qunsetenv("UMU_ZENITY");
         const auto provisionRoot = temporary.path() + "/Provision";
         QDir().mkpath(provisionRoot);
         const auto umuHelper = temporary.path() + "/fake-umu-helper.py";

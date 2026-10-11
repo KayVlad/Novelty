@@ -284,7 +284,9 @@ bool provisionSteamRuntime(QWidget *parent, const Library &library, const Game &
             auto environment = command.environment;
             environment.insert("WINEPREFIX", probe->path() + "/prefix");
             environment.insert("UMU_NO_PROTON", "0");
-            environment.insert("UMU_ZENITY", "0");
+            // umu 1.4.4 only uses its Python downloader when this is empty/unset.
+            // "0" skips both download paths and then tries to move a nonexistent archive.
+            environment.remove("UMU_ZENITY");
             environment.insert("UMU_LOG", "1");
             dialog.process.setProcessEnvironment(environment);
             dialog.process.setProgram(command.program); dialog.process.setArguments({""});
@@ -453,7 +455,9 @@ bool provisionFirstPlay(QWidget *parent, Library &library, Game &game, const QSt
                     auto command = launchCommand(library, game, true);
                     program = command.program; arguments = {""}; environment = command.environment;
                     environment.insert("WINEPREFIX", probe->path() + "/prefix");
-                    environment.insert("UMU_NO_PROTON", "0"); environment.insert("UMU_ZENITY", "0"); environment.insert("UMU_LOG", "1");
+                    environment.insert("UMU_NO_PROTON", "0");
+                    environment.remove("UMU_ZENITY"); // Nonempty "0" disables both umu 1.4.4 download paths.
+                    environment.insert("UMU_LOG", "1");
                 }
                 if (program.isEmpty()) throw std::runtime_error("Required launcher or Python 3 was not found.");
                 dialog.process.setProcessEnvironment(environment); dialog.process.setWorkingDirectory(data);
