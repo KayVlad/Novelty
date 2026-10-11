@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -131,6 +132,22 @@ with tempfile.TemporaryDirectory(prefix='novelty-process-tests-') as temporary:
         save_manifest = read(save_state / 'snapshots' / save_head / 'manifest.json')
         assert save_manifest['files'] == 1 and save_manifest['items'][0]['path'] == 'UserData', 'headless Play did not capture its save'
         assert (save_state / 'snapshots' / save_head / 'items' / '0' / 'slot.sav').read_bytes() == b'headless saved progress'
+
+        # The UI already asked whether to keep local saves when it passes --peer-checked.
+        conflict_id = str(uuid.uuid4())
+        conflict_folder = save_state / 'snapshots' / conflict_id
+        shutil.copytree(save_state / 'snapshots' / save_head, conflict_folder)
+        conflict_manifest = dict(save_manifest, id=conflict_id, profile_id=str(uuid.uuid4()), parent_ids=[])
+        (conflict_folder / 'manifest.json').write_text(json.dumps(conflict_manifest))
+        assert command(save_root, '--run', save_id).returncode == 1, 'headless conflict should require a choice'
+        # Changes made outside the launcher must become a local branch before automatic restore.
+        conflict_manifest['parent_ids'] = [save_head]
+        (conflict_folder / 'manifest.json').write_text(json.dumps(conflict_manifest))
+        live_save = save_root / 'Game' / 'UserData' / 'slot.sav'
+        live_save.write_bytes(b'progress made outside Novelty')
+        assert command(save_root, '--run', save_id).returncode == 1, 'unrecorded local progress was silently replaced by an ahead peer'
+        assert live_save.read_bytes() == b'progress made outside Novelty'
+        assert command(save_root, '--run', save_id, '--peer-checked').returncode == 0, 'supervisor ignored the UI choice to play local saves'
 
         # Kill the supervisor during a real game invocation, leaving its descendant alive.
         (prefix / 'release').unlink()

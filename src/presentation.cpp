@@ -14,7 +14,7 @@ constexpr int cardWidth = 220;
 constexpr int cardInset = 10;
 int cardHeight(int width) { return qRound((width - cardInset) * 4.0 / 3.0) + cardInset; }
 QCache<QString, QImage> &coverCache() { static QCache<QString, QImage> cache(32 * 1024); return cache; }
-void drawCover(QPainter &p, const QRectF &r, const QString &name, const QImage &image = {}) {
+void drawCover(QPainter &p, const QRectF &r, const QString &name, const QImage &image = {}, bool remote = false) {
     p.save(); p.setClipRect(r, Qt::IntersectClip);
     if (!image.isNull()) {
         const double targetRatio = r.width() / r.height();
@@ -32,8 +32,8 @@ void drawCover(QPainter &p, const QRectF &r, const QString &name, const QImage &
     } else {
         QLinearGradient gradient(r.topLeft(), r.bottomRight());
         const auto hue = 195 + qHash(name) % 45;
-        gradient.setColorAt(0, QColor::fromHsl(hue, 100, 48));
-        gradient.setColorAt(1, QColor::fromHsl(hue, 80, 25));
+        gradient.setColorAt(0, QColor::fromHsl(hue, remote ? 0 : 100, 48));
+        gradient.setColorAt(1, QColor::fromHsl(hue, remote ? 0 : 80, 25));
         p.fillRect(r, gradient);
         p.setPen(QPen(QColor(150, 205, 230, 24), 1));
         for (int i = -2; i < 7; ++i) p.drawLine(QPointF(r.left() + i * 65, r.bottom()), QPointF(r.left() + i * 65 + r.height(), r.top()));
@@ -95,7 +95,7 @@ void Cover::resizeEvent(QResizeEvent *event) { QWidget::resizeEvent(event); upda
 void Cover::paintEvent(QPaintEvent *) {
     QPainter p(this); p.setRenderHint(QPainter::Antialiasing); p.setRenderHint(QPainter::SmoothPixmapTransform);
     QPainterPath clip; clip.addRoundedRect(rect(), 8, 8); p.setClipPath(clip);
-    if (metadata_.cover.isNull()) drawCover(p, rect(), name_);
+    if (metadata_.cover.isNull()) drawCover(p, rect(), name_, {}, metadata_.remote);
     else p.drawImage(rect(), metadata_.cover);
 }
 QSize CardDelegate::sizeHint(const QStyleOptionViewItem &option, const QModelIndex &) const {
@@ -109,12 +109,16 @@ void CardDelegate::paint(QPainter *painter, const QStyleOptionViewItem &o, const
     p.setBrush(QColor("#15263b")); p.setPen(QPen(selected ? QColor("#62a4dc") : QColor("#2a3d55"), selected ? 2 : 1));
     p.drawRoundedRect(r, 8, 8);
     p.save(); QPainterPath clip; clip.addRoundedRect(r.adjusted(1, 1, -1, -1), 7, 7); p.setClipPath(clip);
-    drawCover(p, r, i.data().toString(), cachedCover(i.data(CoverRole).toString()));
+    const auto cover = i.data(CoverRole);
+    const bool remote = i.data(RemoteRole).toBool();
+    auto image = cover.canConvert<QImage>() ? cover.value<QImage>() : cachedCover(cover.toString());
+    if (remote && !image.isNull()) image = image.convertToFormat(QImage::Format_Grayscale8);
+    drawCover(p, r, i.data().toString(), image, remote);
     QLinearGradient fade(r.topLeft(), r.bottomLeft());
     fade.setColorAt(0, QColor(5, 15, 29, 0)); fade.setColorAt(0.4, QColor(5, 15, 29, 0));
     fade.setColorAt(0.7, QColor(5, 15, 29, 205)); fade.setColorAt(1, QColor(5, 15, 29, 250)); p.fillRect(r, fade); p.restore();
     textLine(p, QRect(r.left() + 12, r.bottom() - 65, r.width() - 24, 28), i.data().toString(), QColor("#f0f4fa"), true, 17);
-    textLine(p, QRect(r.left() + 12, r.bottom() - 38, r.width() - 48, 22), i.data(EngineRole).toString(), QColor("#a7b9cf"), false, 12);
+    textLine(p, QRect(r.left() + 12, r.bottom() - 38, r.width() - 48, 22), remote ? i.data(StatusRole).toString() : i.data(EngineRole).toString(), QColor("#a7b9cf"), false, 12);
     p.setPen(Qt::NoPen); p.setBrush(statusColor(i.data(StatusRole).toString(), i.data(SetupPendingRole).toBool()));
     p.drawEllipse(QPointF(r.right() - 18, r.bottom() - 27), 4, 4);
     p.restore();
@@ -140,7 +144,7 @@ void GameGrid::resizeEvent(QResizeEvent *event) {
 }
 void GameGrid::contextMenuEvent(QContextMenuEvent *event) {
     const auto index = indexAt(event->pos());
-    if (!index.isValid() || !index.data(ManageableRole).toBool() || !contextAction) return;
+    if (!index.isValid() || (!index.data(ManageableRole).toBool() && !index.data(RemoteRole).toBool()) || !contextAction) return;
     contextAction(index, event->globalPos());
     event->accept();
 }

@@ -1,6 +1,7 @@
 #pragma once
 #include "core.h"
 #include "presentation.h"
+#include "devices.h"
 #include <QtWidgets/qmainwindow.h>
 #include <QtCore/qabstractitemmodel.h>
 #include <QtCore/qsortfilterproxymodel.h>
@@ -24,6 +25,14 @@ namespace novelty {
 class VndbClient;
 class LanListener;
 class LanConnection;
+class LanDiscovery;
+struct PeerGame {
+    TrustedPeer peer;
+    QJsonObject descriptor;
+    QImage cover;
+    bool online = true;
+    QString id() const { return "peer:" + peer.fingerprint + ':' + descriptor["profile_game_id"].toString(); }
+};
 class GameModel : public QAbstractTableModel {
 public:
     explicit GameModel(QObject *parent) : QAbstractTableModel(parent) {}
@@ -31,7 +40,7 @@ public:
     int columnCount(const QModelIndex &p = {}) const override { return p.isValid() ? 0 : 3; }
     QVariant data(const QModelIndex &, int role) const override;
     QVariant headerData(int, Qt::Orientation, int role) const override;
-    void load(const Library &);
+    void load(const Library &, const QList<PeerGame> &peers = {});
     bool updateState(const Library &, const QString &id);
     void unavailable();
     QList<Game> games;
@@ -39,6 +48,7 @@ public:
     QList<bool> launchable, manageable, setupPending;
     QString coverDataRoot;
     bool actionsAllowed = true;
+    QHash<QString, PeerGame> remoteGames;
 };
 
 class Window : public QMainWindow {
@@ -54,6 +64,7 @@ public:
     void devices();
     void syncSavesFromPeer(const QString &gameId, QWidget *parent);
     void installFromPeer();
+    void refreshPeerGames();
     void syncPendingPeers();
     bool applyIncomingSavesBeforePlay(const QString &gameId);
     void addGame();
@@ -72,8 +83,14 @@ private:
     void queueAutomaticMetadata(const QString &id);
     void startNextAutomaticMetadata();
     Game selected() const;
+    void queryPeerGames(const TrustedPeer &);
     std::unique_ptr<Library> library_;
     std::unique_ptr<LanListener> saveListener_;
+    std::unique_ptr<LanDiscovery> peerDiscovery_;
+    QSet<LanConnection *> catalogueConnections_;
+    QSet<QString> cataloguePeers_;
+    QHash<QString, QList<PeerGame>> peerGames_;
+    QHash<QString, qint64> peerLastAttempt_;
     QSet<LanConnection *> autoConnections_;
     QSet<QString> activePeerIds_;
     QString lanListenIssue_;
@@ -87,7 +104,7 @@ private:
     QLabel *status_, *setupState_, *syncState_, *description_, *playtimeValue_, *tags_;
     QLabel *rootLabel_, *title_, *originalTitle_, *detail_, *notice_;
     QPushButton *scanButton_;
-    QAction *listPlay_, *listManage_;
+    QAction *listPlay_, *listManage_, *listInstall_;
     QLineEdit *search_;
     QFileSystemWatcher watcher_;
     QTimer scanDelay_, scanPoll_, launchPoll_, syncTimer_;

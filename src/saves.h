@@ -43,6 +43,8 @@ SaveConfig loadSaveConfig(const Library &, const QString &gameId);
 QList<SaveMapping> saveDiscoveryCandidates(const Library &, const QString &gameId);
 QList<SaveMapping> suggestedSaveMappings(const Library &, const QString &gameId);
 void saveSaveConfig(Library &, const QString &gameId, const SaveConfig &);
+// Validate and normalize without writing. The caller holds the library and game locks when committing.
+QJsonObject validatedSaveConfig(const Library &, const Game &, const SaveConfig &);
 void setSaveDiscoveryState(Library &, const QString &gameId, const QString &state);
 SaveSnapshot createSaveSnapshot(Library &, const QString &gameId, const QString &reason = "manual");
 // Capture populated mapped roots before a peer game transfer. Empty roots are valid.
@@ -59,7 +61,6 @@ SaveImportResult importSaveSnapshot(Library &, const QString &gameId, const QStr
                                     const QString &authenticatedPeer = {});
 void linkPeerSaveGame(Library &, const QString &gameId, const QString &peerFingerprint,
                       const QString &peerProfileGameId);
-void recordSaveFolderRename(Library &, const QString &gameId, const QString &previousName);
 QString normalizedSaveGameName(const QString &name);
 QStringList recoverSaveRestores(Library &);
 QString saveRestoreIssue(const Library &, const QString &gameId);

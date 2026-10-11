@@ -5,14 +5,17 @@
 #include <QtCore/qcryptographichash.h>
 #include <QtCore/qdatetime.h>
 #include <QtCore/qdir.h>
+#include <QtCore/qdiriterator.h>
 #include <QtCore/qfile.h>
 #include <QtCore/qfileinfo.h>
 #include <QtCore/qjsonobject.h>
+#include <QtCore/qjsondocument.h>
 #include <QtCore/qlockfile.h>
 #include <QtCore/qregularexpression.h>
 #include <QtCore/quuid.h>
 #include <QtCore/qsysinfo.h>
 #include <QtCore/qset.h>
+#include <sys/statvfs.h>
 #include <algorithm>
 #include <filesystem>
 #include <stdexcept>
@@ -47,6 +50,14 @@ bool labelsCompatible(const SaveConfig &config, const QJsonObject &manifest) {
            labelCompatible(config.releaseIdentity, manifest["release_identity"].toString()) &&
            labelCompatible(config.saveCompatibility, manifest["save_compatibility"].toString());
 }
+bool mappingsMatch(const SaveConfig &config, const QJsonObject &manifest) {
+    const auto items = manifest["items"].toArray();
+    if (items.size() != config.mappings.size()) return false;
+    for (int i = 0; i < items.size(); ++i)
+        if (items[i].toObject()["scope"].toString() != config.mappings[i].scope ||
+            items[i].toObject()["path"].toString() != config.mappings[i].path) return false;
+    return true;
+}
 QString configPath(const Library &lib, const QString &id) { return lib.gamePath(id, "saves.json"); }
 QString journalPath(const Library &lib, const QString &id) { return lib.gamePath(id, "save-restore.json"); }
 QString pendingPath(const Library &lib, const QString &id) { return lib.gamePath(id, "save-pending.json"); }
@@ -64,7 +75,10 @@ QString currentHead(const Library &lib, const QString &id) {
 }
 void setHead(const Library &lib, const QString &id, const QString &snapshotId) {
     if (!snapshotId.isEmpty() && !validToken(snapshotId)) fail("Invalid current save snapshot ID.");
-    if (snapshotId.isEmpty()) { QFile::remove(headPath(lib, id)); return; }
+    if (snapshotId.isEmpty()) {
+        if (exists(headPath(lib, id)) && !QFile::remove(headPath(lib, id))) fail("Cannot clear the current save snapshot pointer.");
+        return;
+    }
     writeJson(headPath(lib, id), {{"schema", 1}, {"snapshot_id", snapshotId}});
 }
 void noLinks(const QString &path) {
@@ -359,22 +373,47 @@ QByteArray digest(const QString &path) {
     }
     return hash.result().toHex();
 }
-void inspectNode(const QString &path, const QString &relative, QJsonArray &entries) {
+constexpr qint64 maxSnapshotBytes = 4LL * 1024 * 1024 * 1024;
+struct SnapshotBudget { qint64 bytes = 0; int entries = 0; };
+void inspectNode(const QString &path, const QString &relative, QJsonArray &entries,
+                 SnapshotBudget *budget, int depth = 0) {
     const QFileInfo info(path);
+    if (budget && (++budget->entries > 20000 || depth > 64))
+        fail("Save folder has too many entries or nesting levels. Choose a more specific save location.");
     if (info.isSymbolicLink()) fail("Save mapping contains a symbolic link: " + path);
     if (info.isDir()) {
+        if (!info.isReadable() || !info.isExecutable()) fail("Cannot read save directory: " + path);
         entries.append(QJsonObject{{"path", relative}, {"type", "directory"}});
-        const QDir dir(path);
-        for (const auto &child : dir.entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot, QDir::Name))
-            inspectNode(child.absoluteFilePath(), relative.isEmpty() ? child.fileName() : relative + '/' + child.fileName(), entries);
+        QFileInfoList children;
+        QDirIterator it(path, QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot);
+        while (it.hasNext()) {
+            children.append(it.nextFileInfo());
+            if (budget && children.size() + budget->entries > 20000)
+                fail("Save folder has too many entries. Choose a more specific save location.");
+        }
+        std::sort(children.begin(), children.end(), [](const auto &a, const auto &b) { return a.fileName() < b.fileName(); });
+        for (const auto &child : children)
+            inspectNode(child.absoluteFilePath(), relative.isEmpty() ? child.fileName() : relative + '/' + child.fileName(), entries, budget, depth + 1);
     } else if (info.isFile()) {
+        if (budget) {
+            if (info.size() < 0 || info.size() > maxSnapshotBytes - budget->bytes)
+                fail("Save locations exceed the 4 GiB backup limit. Choose a more specific save folder or file.");
+            budget->bytes += info.size();
+        }
         entries.append(QJsonObject{{"path", relative}, {"type", "file"},
-                                    {"size", static_cast<double>(info.size())}, {"sha256", QString::fromLatin1(digest(path))}});
+                                    {"size", static_cast<double>(info.size())}});
     } else fail("Save mapping is neither a regular file nor a directory: " + path);
 }
-QJsonArray inventory(const QString &path) {
+QJsonArray inventory(const QString &path, SnapshotBudget *budget = nullptr, bool hashes = true) {
     QJsonArray entries;
-    if (exists(path)) inspectNode(path, QString(), entries);
+    if (exists(path)) inspectNode(path, QString(), entries, budget);
+    if (hashes) for (int i = 0; i < entries.size(); ++i) {
+        auto entry = entries[i].toObject();
+        if (entry["type"] != "file") continue;
+        const auto relative = entry["path"].toString();
+        entry["sha256"] = QString::fromLatin1(digest(relative.isEmpty() ? path : path + '/' + relative));
+        entries[i] = entry;
+    }
     return entries;
 }
 void copyNode(const QString &source, const QString &destination) {
@@ -442,6 +481,16 @@ SaveSnapshot snapshotLocked(Library &lib, const Game &game, const SaveConfig &co
     const auto root = snapshotsRoot(lib, game.id);
     noLinks(root);
     if (!QDir().mkpath(root)) fail("Cannot create save snapshot storage.");
+    // Count bytes and entries before hashing or copying. A mistaken UserData/assets mapping
+    // must not fill the disk; previously created snapshots remain readable without this limit.
+    SnapshotBudget budget;
+    for (const auto &mapping : config.mappings)
+        if (inventory(targetPath(lib, game, mapping), &budget, false).size() > 10000)
+            fail("Save location has too many entries for a portable backup. Choose a more specific location.");
+    struct statvfs storage{};
+    if (statvfs(QFile::encodeName(root).constData(), &storage) == 0 && storage.f_frsize &&
+        storage.f_bavail < (budget.bytes + 16LL * 1024 * 1024 + storage.f_frsize - 1) / storage.f_frsize)
+        fail("Not enough free space to back up saves. Free some space and use Rescan to retry.");
     SaveSnapshot result; result.id = token(); result.created = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
     result.reason = reason;
     const auto stage = root + "/.pending-" + result.id, final = root + '/' + result.id;
@@ -463,15 +512,13 @@ SaveSnapshot snapshotLocked(Library &lib, const Game &game, const SaveConfig &co
         if (result.files == 0) throw NoSaveData();
         QString parent;
         QString head = currentHead(lib, game.id);
-        if (head.isEmpty()) {
-            const auto prior = listSaveSnapshots(lib, game.id);
-            if (!prior.isEmpty()) head = prior.first().id; // Legacy libraries had no explicit applied head.
-        }
+        // Only an explicitly applied head proves ancestry. Imported history may never have been played.
         if (!head.isEmpty()) {
             const auto older = readJson(root + '/' + head + "/manifest.json");
             if (older["id"].toString() != head) fail("Current save snapshot is missing or invalid.");
             verifySnapshot(root + '/' + head, older);
             if (older["schema"].toInt() != 2 ||
+                !mappingsMatch(config, older) ||
                 !profileGameMatches(config, older["profile_game_id"].toString()) ||
                 (!config.gameIdentity.isEmpty() && older["game_identity"].toString() != config.gameIdentity) ||
                 (!config.releaseIdentity.isEmpty() && older["release_identity"].toString() != config.releaseIdentity) ||
@@ -497,6 +544,8 @@ SaveSnapshot snapshotLocked(Library &lib, const Game &game, const SaveConfig &co
                                    {"save_compatibility", config.saveCompatibility}, {"parent_ids", parent.isEmpty() ? QJsonArray{} : QJsonArray{parent}},
                                    {"author_device", author},
                                    {"items", items}, {"files", result.files}, {"bytes", static_cast<double>(result.bytes)}};
+        if (QJsonDocument(manifest).toJson().size() > 1024 * 1024)
+            fail("Save backup metadata exceeds the portable snapshot limit. Choose a more specific save location.");
         writeJson(stage + "/manifest.json", manifest);
         verifySnapshot(stage, manifest);
         if (!QDir().rename(stage, final)) fail("Cannot publish save snapshot.");
@@ -524,6 +573,8 @@ void finishPendingLocked(Library &lib, const Game &game) {
     }
     catch (const NoSaveData &) { /* A confirmed, empty root is not a failed Play. */ }
     if (!QFile::remove(pendingPath(lib, game.id))) fail("Cannot clear pending save snapshot record.");
+    if (readJson(lib.gamePath(game.id, "status.json"))["state"] == "Save needs attention")
+        lib.recordStatus(game.id, "Ready", "Pending save backup completed.");
 }
 struct SaveLocks {
     QLockFile mutation, launch;
@@ -532,17 +583,17 @@ struct SaveLocks {
         mutation.setStaleLockTime(0); launch.setStaleLockTime(0);
         if (!mutation.tryLock(mutationWaitMs)) fail("Library maintenance is in progress. Retry shortly.");
         if (!QDir().mkpath(QFileInfo(launch.fileName()).absolutePath()) || !launch.tryLock())
-            fail("This game is running or being prepared. Close it before changing saves.");
+            fail("This game is busy. Wait for its current operation before changing saves.");
         if (!runtimeRecoveryIssue(lib, id).isEmpty()) fail("Resolve the game's interrupted launch before changing saves.");
     }
 };
-QJsonObject snapshotManifest(const Library &lib, const QString &id, const QString &snapshotId) {
+QJsonObject snapshotManifest(const Library &lib, const QString &id, const QString &snapshotId, bool verifyContents = true) {
     if (!validToken(snapshotId)) fail("Invalid save snapshot ID.");
     const auto root = snapshotsRoot(lib, id) + '/' + snapshotId;
     noLinks(root);
     const auto manifest = readJson(root + "/manifest.json");
     if (manifest["id"].toString() != snapshotId) fail("Save snapshot ID does not match its manifest.");
-    verifySnapshot(root, manifest);
+    if (verifyContents) verifySnapshot(root, manifest);
     return manifest;
 }
 bool hasAncestor(const Library &lib, const QString &gameId, const QString &descendant, const QString &ancestor) {
@@ -568,6 +619,9 @@ QString stageSuffix(const QString &nonce, const QString &type) { return ".novelt
 void rollback(const Library &lib, const Game &game, const QJsonObject &journal) {
     const auto nonce = journal["nonce"].toString();
     if (journal["schema"].toInt() != 1 || !validToken(nonce) || !journal["items"].isArray()) fail("Invalid restore journal; inspect saves before playing.");
+    const auto phase = journal["phase"].toString();
+    if (!phase.isEmpty() && phase != "committed") fail("Unknown restore recovery phase; inspect saves before playing.");
+    const bool committed = phase == "committed";
     const auto snapshot = snapshotManifest(lib, game.id, journal["snapshot"].toString());
     const auto backupId = journal["backup"].toString();
     const auto backup = backupId.isEmpty() ? QJsonObject{} : snapshotManifest(lib, game.id, backupId);
@@ -576,7 +630,8 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
         const SaveMapping mapping{item["scope"].toString(), item["path"].toString()};
         const auto target = targetPath(lib, game, mapping);
         const auto held = target + stageSuffix(nonce, "held"), staged = target + stageSuffix(nonce, "incoming");
-        noLinks(held); noLinks(staged);
+        const auto recoveryStage = target + stageSuffix(nonce, "rollback");
+        noLinks(held); noLinks(staged); noLinks(recoveryStage);
         const auto index = item["index"].toInt(-1);
         if (index < 0 || index >= snapshot["items"].toArray().size() ||
             (!backupId.isEmpty() && index >= backup["items"].toArray().size()) ||
@@ -593,10 +648,26 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
             for (const auto &entry : originalEntries) if (entry.toObject()["type"] == "file")
                 fail("Restore journal has unsnapshotted original save files.");
         }
+        if (committed) {
+            if (inventory(target) != incomingEntries) fail("Restored saves changed before cleanup. Inspect " + target + " before retrying.");
+            // Held directories may be partially deleted after the commit point. They are
+            // cleanup work now, never a replacement for the verified installed saves.
+            if (exists(held)) removeNode(held);
+            if (exists(staged)) removeNode(staged);
+            continue;
+        }
+        if (exists(recoveryStage)) {
+            if (exists(staged) && !exists(target)) {
+                if (inventory(recoveryStage) != originalEntries || !QDir().rename(recoveryStage, target))
+                    fail("Cannot finish restoring the original save at " + target);
+            } else removeNode(recoveryStage); // A copy interrupted before the original target was moved.
+        }
         if (exists(held)) {
+            if (inventory(held) != originalEntries) fail("The held original save changed. Inspect " + held + " before retrying.");
             if (exists(target) && inventory(target) != incomingEntries)
                 fail("A save changed during restore recovery. Inspect " + target + " before retrying.");
-            if (exists(target)) removeNode(target);
+            if (exists(target) && (exists(staged) || !QDir().rename(target, staged)))
+                fail("Cannot hold the incoming save during recovery: " + target);
             if (!QDir().rename(held, target)) fail("Cannot restore the original save at " + target);
         } else if (!exists(staged)) {
             // The incoming item was installed, and the held copy may already have been cleaned.
@@ -605,26 +676,30 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
             if (currentEntries == originalEntries) continue; // This item was not changed yet.
             if (currentEntries != incomingEntries)
                 fail("A save changed during restore recovery. Inspect " + target + " before retrying.");
-            if (exists(target)) removeNode(target);
             if (!backupId.isEmpty()) {
                 const auto original = snapshotsRoot(lib, game.id) + '/' + backupId + "/items/" + QString::number(index);
-                if (exists(original)) copyNode(original, target);
+                if (exists(original)) copyNode(original, recoveryStage);
             } else if (!originalEntries.isEmpty()) {
                 for (const auto &entry : originalEntries) {
                     const auto path = entry.toObject()["path"].toString();
                     if (entry.toObject()["type"] != "directory" ||
                         (!path.isEmpty() && cleanMappingPath(path) != path) ||
-                        !QDir().mkpath(path.isEmpty() ? target : target + '/' + path))
+                        !QDir().mkpath(path.isEmpty() ? recoveryStage : recoveryStage + '/' + path))
                         fail("Cannot recreate the original empty save folder.");
                 }
             }
+            if (inventory(recoveryStage) != originalEntries) fail("Cannot verify the original save during recovery.");
+            // Keep the installed copy until the backup is fully staged, so another I/O failure
+            // or kill can retry recovery without mistaking a partial copy for player edits.
+            if (exists(target) && !QDir().rename(target, staged)) fail("Cannot hold the restored save during recovery.");
+            if (exists(recoveryStage) && !QDir().rename(recoveryStage, target)) fail("Cannot install the original save during recovery.");
         } else if (inventory(target) != originalEntries) {
             fail("A save changed during restore recovery. Inspect " + target + " before retrying.");
         }
         if (exists(staged)) removeNode(staged);
     }
     const auto previousHead = journal["previous_head"].toString();
-    setHead(lib, game.id, previousHead.isEmpty() ? backupId : previousHead);
+    setHead(lib, game.id, committed ? journal["snapshot"].toString() : previousHead.isEmpty() ? backupId : previousHead);
     if (!QFile::remove(journalPath(lib, game.id))) fail("Cannot clear save restore journal.");
 }
 } // namespace
@@ -632,6 +707,8 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
 QString normalizedSaveGameName(const QString &name) { return saveNameKey(name); }
 
 SaveConfig loadSaveConfig(const Library &lib, const QString &gameId) {
+    if (exists(lib.gamePath(gameId, "settings-change.json")))
+        fail("An interrupted settings change needs recovery. Use Rescan before changing saves.");
     const auto game = lib.game(gameId);
     auto config = parseConfig(readJson(configPath(lib, gameId)), gameId);
     if (config.profileId.isEmpty()) config.profileId = lib.profileId();
@@ -735,7 +812,11 @@ void saveSaveConfig(Library &lib, const QString &gameId, const SaveConfig &confi
     SaveLocks locks(lib, gameId, 2000);
     if (!saveRestoreIssue(lib, gameId).isEmpty()) fail("Recover the interrupted save restore before editing mappings.");
     if (!pendingSaveSnapshotIssue(lib, gameId).isEmpty()) fail("Finish the pending post-play snapshot before editing save mappings.");
-    const auto game = lib.game(gameId);
+    if (exists(lib.gamePath(gameId, "settings-change.json"))) fail("Use Rescan to recover the interrupted settings change.");
+    writeJson(configPath(lib, gameId), validatedSaveConfig(lib, lib.game(gameId), config));
+}
+QJsonObject validatedSaveConfig(const Library &lib, const Game &game, const SaveConfig &config) {
+    const auto gameId = game.id;
     auto updated = config;
     if (updated.profileId.isEmpty()) updated.profileId = lib.profileId();
     if (updated.profileGameId.isEmpty()) updated.profileGameId = loadSaveConfig(lib, gameId).profileGameId;
@@ -744,7 +825,7 @@ void saveSaveConfig(Library &lib, const QString &gameId, const SaveConfig &confi
     }
     if (updated.discoveryState == "identified") updated.candidates = {};
     validate(lib, game, updated);
-    writeJson(configPath(lib, gameId), configJson(updated));
+    return configJson(updated);
 }
 void linkPeerSaveGame(Library &lib, const QString &gameId, const QString &peerFingerprint,
                       const QString &peerProfileGameId) {
@@ -766,16 +847,6 @@ void linkPeerSaveGame(Library &lib, const QString &gameId, const QString &peerFi
     }
     if (!found) config.peerLinks.append({peerFingerprint, peerProfileGameId});
     saveSaveConfig(lib, gameId, config);
-}
-void recordSaveFolderRename(Library &lib, const QString &gameId, const QString &previousName) {
-    const auto current = QFileInfo(lib.game(gameId).folder).fileName();
-    if (previousName.isEmpty() || normalizedSaveGameName(previousName) == normalizedSaveGameName(current)) return;
-    auto config = loadSaveConfig(lib, gameId);
-    config.folderAliases.removeAll(previousName);
-    config.folderAliases.prepend(previousName);
-    while (config.folderAliases.size() > 8) config.folderAliases.removeLast();
-    validate(lib, lib.game(gameId), config);
-    writeJson(configPath(lib, gameId), configJson(config));
 }
 void setSaveDiscoveryState(Library &lib, const QString &gameId, const QString &state) {
     if (state != "searching" && state != "unidentified") fail("Choose Rescan or Stop searching.");
@@ -835,19 +906,22 @@ QString verifiedSaveSnapshotBundle(const Library &lib, const QString &gameId, co
     const auto manifest = snapshotManifest(lib, gameId, snapshotId);
     const auto folder = snapshotsRoot(lib, gameId) + '/' + snapshotId;
     if (manifest["schema"].toInt() != 2) fail("Only portable save snapshots can be sent to a peer.");
-    verifySnapshot(folder, manifest);
     return folder;
 }
 QStringList saveSnapshotLineage(const Library &lib, const QString &gameId, int maxSnapshots) {
     if (maxSnapshots < 1 || maxSnapshots > 256) fail("Invalid save history limit.");
+    const auto config = loadSaveConfig(lib, gameId);
     QStringList newestFirst;
     QSet<QString> seen;
     auto id = appliedSaveSnapshotId(lib, gameId);
     while (!id.isEmpty() && newestFirst.size() < maxSnapshots) {
         if (!validToken(id) || seen.contains(id)) fail("Save history contains an invalid parent.");
         seen.insert(id);
-        const auto manifest = snapshotManifest(lib, gameId, id);
-        if (manifest["schema"].toInt() != 2) break;
+        const auto manifest = snapshotManifest(lib, gameId, id, false);
+        // Older builds could link across a mapping change. Keep those snapshots, but do not
+        // send incompatible ancestors as part of the current installation's save chain.
+        if (manifest["schema"].toInt() != 2 || !mappingsMatch(config, manifest) ||
+            !labelsCompatible(config, manifest)) break;
         newestFirst.append(id);
         const auto parents = manifest["parent_ids"].toArray();
         if (parents.size() > 1) break; // A branch merge needs explicit reconciliation.
@@ -862,10 +936,12 @@ QList<ImportedSaveCandidate> importedSaveCandidates(const Library &lib, const QS
     const auto head = currentHead(lib, gameId);
     QList<ImportedSaveCandidate> result;
     for (const auto &snapshot : listSaveSnapshots(lib, gameId)) {
-        const auto manifest = snapshotManifest(lib, gameId, snapshot.id);
+        // Status/list queries need metadata only. Payloads are verified before import,
+        // restore or transmission; hashing the entire history here stalls the GUI.
+        const auto manifest = snapshotManifest(lib, gameId, snapshot.id, false);
         if (manifest["schema"].toInt() != 2 || manifest["profile_id"].toString() == config.profileId ||
             !profileGameMatches(config, manifest["profile_game_id"].toString()) ||
-            !labelsCompatible(config, manifest) || snapshot.id == head)
+            !labelsCompatible(config, manifest) || !mappingsMatch(config, manifest) || snapshot.id == head)
             continue;
         const QString relation = head.isEmpty() ? "available" :
             hasAncestor(lib, gameId, snapshot.id, head) ? "ahead" :
@@ -932,12 +1008,14 @@ void restoreSaveSnapshot(Library &lib, const QString &gameId, const QString &sna
             if (exists(target) && !QDir().rename(target, held)) fail("Cannot hold original save: " + target);
             if (exists(staged) && !QDir().rename(staged, target)) fail("Cannot install restored save: " + target);
         }
+        auto committed = journal; committed["phase"] = "committed";
+        writeJson(journalPath(lib, gameId), committed);
+        setHead(lib, gameId, snapshotId);
         for (int i = 0; i < items.size(); ++i) {
             const auto target = targetPath(lib, game, config.mappings[i]);
             const auto held = target + stageSuffix(nonce, "held");
             if (exists(held)) removeNode(held);
         }
-        setHead(lib, gameId, snapshotId);
         if (!QFile::remove(journalPath(lib, gameId))) fail("Cannot clear completed save restore journal.");
     } catch (...) {
         if (exists(journalPath(lib, gameId))) {
@@ -1005,7 +1083,7 @@ QString saveRestoreIssue(const Library &lib, const QString &gameId) {
     return exists(journalPath(lib, gameId)) ? "An interrupted save restore needs recovery before Play." : QString();
 }
 QString pendingSaveSnapshotIssue(const Library &lib, const QString &gameId) {
-    return exists(pendingPath(lib, gameId)) ? "A post-play save snapshot is pending. Use Rescan to retry it before Play." : QString();
+    return exists(pendingPath(lib, gameId)) ? "A post-play backup is pending. Use Rescan to retry; local Play remains available." : QString();
 }
 void queuePostExitSaveSnapshot(const Library &lib, const Game &game) {
     const auto config = loadSaveConfig(lib, game.id);
@@ -1043,8 +1121,10 @@ QStringList recoverSaveRestores(Library &lib) {
         if (lib.supervisorActive(game.id)) continue;
         try {
             SaveLocks locks(lib, game.id);
-            rollback(lib, game, readJson(journalPath(lib, game.id)));
-            messages.append("Recovered the original saves for " + game.name + " after an interrupted restore.");
+            const auto journal = readJson(journalPath(lib, game.id));
+            rollback(lib, game, journal);
+            messages.append(journal["phase"] == "committed" ? "Completed save restore cleanup for " + game.name + "." :
+                            "Recovered the original saves for " + game.name + " after an interrupted restore.");
         } catch (const std::exception &e) {
             messages.append("Save restore recovery for " + game.name + " needs attention: " + QString::fromUtf8(e.what()));
         }

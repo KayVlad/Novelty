@@ -1,5 +1,6 @@
 #include "lan_games.h"
 #include "saves.h"
+#include "devices.h"
 #include <QtCore/qdir.h>
 #include <QtCore/qdatetime.h>
 #include <QtCore/qdiriterator.h>
@@ -8,6 +9,7 @@
 #include <QtCore/qpointer.h>
 #include <QtCore/qset.h>
 #include <QtCore/quuid.h>
+#include <QtCore/qsysinfo.h>
 #include <algorithm>
 #include <stdexcept>
 
@@ -96,7 +98,6 @@ void collect(const QString &folder, const QSet<QString> &excluded,
 }
 QSet<QString> transferExclusions(const SaveConfig &config) {
     QSet<QString> excluded;
-    if (config.discoveryState != "identified") return excluded;
     for (const auto &mapping : config.mappings)
         if (mapping.scope == "game") excluded.insert(mapping.path);
     return excluded;
@@ -186,6 +187,12 @@ void validateLanGameManifest(const QJsonObject &item,
             (entry.directory && (entry.size != 0 || !entry.sha256.isEmpty())) ||
             (!entry.directory && (!digest(entry.sha256) || entry.size > maxGameBytes - bytes)))
             throw std::runtime_error("Invalid game manifest entry.");
+        for (const auto &value : item["mappings"].toArray()) {
+            const auto mapping = value.toObject();
+            const auto path = mapping["path"].toString();
+            if (mapping["scope"] == "game" && (entry.path == path || entry.path.startsWith(path + '/')))
+                throw std::runtime_error("Game transfer includes a mapped save location. Transfer saves separately.");
+        }
         paths.insert(entry.path, entry.directory);
         if (!entry.directory) bytes += entry.size;
     }
@@ -268,19 +275,29 @@ void LanGameExchange::catalogue() {
     timeout_.start(30000);
 }
 
+void LanGameExchange::preview(const QString &id) {
+    if (!connection_.ready() || !requestId_.isEmpty() || !uuid(id))
+        throw std::runtime_error("Cannot fetch this game preview.");
+    previewId_ = id;
+    requestId_ = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    connection_.send({{"type", "game-list"}, {"request_id", requestId_}, {"preview_id", id}});
+    timeout_.start(30000);
+}
+
 void LanGameExchange::install(const QJsonObject &selected) {
     if (!connection_.ready() || !requestId_.isEmpty() || !validSummary(selected))
         throw std::runtime_error("Choose a valid paired-device game to install.");
     for (const auto &local : library_.games()) {
         const auto config = loadSaveConfig(library_, local.id);
-        if (config.profileGameId == selected["profile_game_id"].toString())
+        if (config.profileGameId == selected["profile_game_id"].toString() &&
+            !QFileInfo::exists(local.folder + "/.novelty-transfer.json"))
             throw std::runtime_error("This paired-device game is already installed locally.");
         if (!config.gameIdentity.isEmpty() &&
             config.gameIdentity == selected["game_identity"].toString() &&
             config.releaseIdentity != selected["release_identity"].toString())
             throw std::runtime_error("This title has a different local build. Review save compatibility before installing another copy.");
     }
-    descriptor_ = selected;
+    descriptor_ = summary(selected); // Preview fields are presentation data, not install identity.
     remoteGameId_ = selected["profile_game_id"].toString();
     requestId_ = QUuid::createUuid().toString(QUuid::WithoutBraces);
     connection_.send({{"type", "game-manifest"}, {"request_id", requestId_},
@@ -291,6 +308,8 @@ void LanGameExchange::install(const QJsonObject &selected) {
 void LanGameExchange::sendCatalogue(const QJsonObject &request) {
     const auto id = request["request_id"].toString();
     if (!uuid(id)) throw std::runtime_error("Invalid LAN game catalogue request.");
+    const auto preview = request["preview_id"].toString();
+    if (!preview.isEmpty() && !uuid(preview)) throw std::runtime_error("Invalid game preview request.");
     QJsonArray games;
     for (const auto &game : library_.games()) {
         if (game.backend != "umu" || game.installPending || library_.busy(game.id) ||
@@ -300,7 +319,16 @@ void LanGameExchange::sendCatalogue(const QJsonObject &request) {
         try {
             const auto full = descriptor(library_, game);
             if (validDescriptor(full)) {
-                const auto item = summary(full);
+                if (!preview.isEmpty() && full["profile_game_id"] != preview) continue;
+                auto item = summary(full);
+                // Optional fields on the existing catalogue message. Old clients ignore
+                // them; new clients still show titles from servers without previews.
+                if (previewData) item["preview_available"] = true;
+                if (!preview.isEmpty() && previewData) {
+                    item["metadata"] = full["metadata"];
+                    const auto data = previewData(game.id);
+                    if (data["cover"].toString().size() <= 40 * 1024) item["cover"] = data["cover"];
+                }
                 auto next = games; next.append(item);
                 if (QJsonDocument(QJsonObject{{"type", "game-found"}, {"request_id", id},
                                               {"games", next}}).toJson(QJsonDocument::Compact).size() > 60 * 1024)
@@ -310,7 +338,10 @@ void LanGameExchange::sendCatalogue(const QJsonObject &request) {
         } catch (const std::exception &) { /* One damaged game does not hide healthy games. */ }
         if (games.size() >= 64) break;
     }
-    connection_.send({{"type", "game-found"}, {"request_id", id}, {"games", games}});
+    QJsonObject response{{"type", "game-found"}, {"request_id", id}, {"games", games}};
+    response["device_name"] = QSysInfo::machineHostName().left(80);
+    if (!preview.isEmpty()) response["preview_id"] = preview;
+    connection_.send(response);
 }
 
 void LanGameExchange::sendManifest(const QJsonObject &request) {
@@ -329,6 +360,9 @@ void LanGameExchange::sendManifest(const QJsonObject &request) {
         library_.busy(chosen.id) || QFileInfo(chosen.folder).absolutePath() != library_.root() ||
         folderIdentity(chosen.folder) != chosen.folderIdentity)
         throw std::runtime_error("That game is unavailable for LAN installation.");
+    QLockFile discoveryLock(library_.gamePath(chosen.id, "launch.lock")); discoveryLock.setStaleLockTime(0);
+    if (!QDir().mkpath(QFileInfo(discoveryLock.fileName()).absolutePath()) || !discoveryLock.tryLock())
+        throw std::runtime_error("This game is busy. Retry the transfer after it exits.");
     beginSaveObservation(library_, chosen);
     const auto undecided = unresolvedGameSaveLocations(library_, chosen.id);
     if (!undecided.isEmpty()) {
@@ -344,15 +378,21 @@ void LanGameExchange::sendManifest(const QJsonObject &request) {
     if (!validDescriptor(sendingDescriptor_))
         throw std::runtime_error("This game's portable settings exceed the LAN transfer limit.");
     lastManifestHeartbeat_ = QDateTime::currentMSecsSinceEpoch();
+    sendingGameLock_ = std::make_shared<QLockFile>(library_.gamePath(chosen.id, "launch.lock"));
+    sendingGameLock_->setStaleLockTime(0);
+    discoveryLock.unlock();
     std::promise<QPair<QList<Entry>, qint64>> promise;
     manifestFuture_ = promise.get_future();
     manifestWorker_ = std::jthread([folder = chosen.folder, excluded, root = library_.root(),
-                                    gameId = chosen.id, promise = std::move(promise)]
+                                    gameId = chosen.id, expected = sendingDescriptor_, lock = sendingGameLock_, promise = std::move(promise)]
                                    (std::stop_token stop) mutable {
         try {
             if (stop.stop_requested()) throw std::runtime_error("Game manifest scan was cancelled.");
             Library worker(root);
             captureAvailableSaveSnapshot(worker, gameId, "before game transfer");
+            if (!lock->tryLock() || !worker.recoveryIssue(gameId).isEmpty() ||
+                worker.game(gameId).folder != folder || descriptor(worker, worker.game(gameId)) != expected)
+                throw std::runtime_error("Game settings changed or Play started. Retry the transfer.");
             if (stop.stop_requested()) throw std::runtime_error("Game manifest scan was cancelled.");
             QList<Entry> entries; qint64 bytes = 0;
             collect(folder, excluded, entries, bytes, stop);
@@ -437,8 +477,18 @@ void LanGameExchange::receiveBegin(const QJsonObject &message) {
         {"game_identity", descriptor_["game_identity"]},
         {"release_identity", descriptor_["release_identity"]},
         {"save_compatibility", descriptor_["save_compatibility"]}};
+    // A prior attempt may have placed the verified folder but failed while registering
+    // its settings. The same ownership marker makes that step retryable too.
+    const auto published = library_.root() + '/' + descriptor_["name"].toString();
+    if (!QFileInfo::exists(stage_) && QFileInfo::exists(published + "/.novelty-transfer.json")) {
+        if (QFileInfo(published).isSymbolicLink() || QFileInfo(published + "/.novelty-transfer.json").isSymbolicLink() ||
+            readJson(published + "/.novelty-transfer.json") != identity)
+            throw std::runtime_error("An existing game folder belongs to a different transfer.");
+        stage_ = published;
+    }
+    const auto activeMarker = stage_ + "/.novelty-transfer.json";
     if (QFileInfo(stage_).exists()) {
-        if (!QFileInfo(stage_).isDir() || QFileInfo(marker).isSymbolicLink() || readJson(marker) != identity)
+        if (!QFileInfo(stage_).isDir() || QFileInfo(activeMarker).isSymbolicLink() || readJson(activeMarker) != identity)
             throw std::runtime_error("An incomplete game folder needs review before retrying this transfer.");
     } else {
         if (!QDir().mkdir(stage_)) throw std::runtime_error("Cannot stage the incoming game inside Games.");
@@ -603,23 +653,26 @@ void LanGameExchange::finalize() {
     }
     const auto destination = library_.root() + '/' + descriptor_["name"].toString();
     for (const auto &local : library_.games())
-        if (loadSaveConfig(library_, local.id).profileGameId == remoteGameId_)
+        if (loadSaveConfig(library_, local.id).profileGameId == remoteGameId_ && local.folder != destination)
             throw std::runtime_error("This paired-device game was installed during the transfer.");
-    if (QFileInfo(destination).exists() || QFileInfo(destination).isSymbolicLink())
-        throw std::runtime_error("A game folder with this name already exists in Games. The verified transfer is kept.");
-    if (!QFile::remove(stage_ + "/.novelty-transfer.json") || !QDir().rename(stage_, destination))
-        throw std::runtime_error("Cannot place verified game in Games.");
-    const auto before = library_.games().size();
-    const auto candidate = inspect(destination);
-    if (library_.import({candidate}, library_.settings()["runner"].toString()) != 1 ||
-        library_.games().size() != before + 1)
-        throw std::runtime_error("Game files arrived, but Novelty could not register them. Use Add → Select folder.");
+    if (stage_ != destination) {
+        if (QFileInfo(destination).exists() || QFileInfo(destination).isSymbolicLink())
+            throw std::runtime_error("A game folder with this name already exists in Games. The verified transfer is kept.");
+        if (!QDir().rename(stage_, destination)) throw std::runtime_error("Cannot place verified game in Games.");
+        stage_ = destination;
+    }
     Game local;
     for (const auto &game : library_.games()) if (game.folder == destination) local = game;
+    if (local.id.isEmpty()) {
+        if (library_.import({inspect(destination)}, library_.settings()["runner"].toString()) != 1)
+            throw std::runtime_error("Game files arrived, but registration failed. Retry the LAN installation.");
+        for (const auto &game : library_.games()) if (game.folder == destination) local = game;
+    }
     if (local.id.isEmpty()) throw std::runtime_error("Transferred game was not registered.");
     local.name = descriptor_["name"].toString(); local.backend = "umu";
     local.locale = descriptor_["locale"].toString();
     local.metadata = descriptor_["metadata"].toObject();
+    local.arguments.clear();
     for (const auto &argument : descriptor_["arguments"].toArray()) local.arguments.append(argument.toString());
     const auto executable = descriptor_["executable"].toString();
     if (!executable.isEmpty()) {
@@ -632,17 +685,20 @@ void LanGameExchange::finalize() {
     local.workingDirectory = cwd.isEmpty() ? destination : destination + '/' + cwd;
     if (!QFileInfo(local.workingDirectory).isDir())
         throw std::runtime_error("Transferred game working directory is missing.");
-    library_.save(local);
     auto config = loadSaveConfig(library_, local.id);
     config.profileGameId = remoteGameId_;
     config.gameIdentity = descriptor_["game_identity"].toString();
     config.releaseIdentity = descriptor_["release_identity"].toString();
     config.saveCompatibility = descriptor_["save_compatibility"].toString();
+    config.mappings.clear();
     for (const auto &value : descriptor_["mappings"].toArray()) {
         const auto item = value.toObject();
         config.mappings.append({item["scope"].toString(), item["path"].toString()});
     }
-    saveSaveConfig(library_, local.id, config);
+    if (config.mappings.isEmpty()) { config.discoveryState = "searching"; config.discoverySource.clear(); }
+    library_.save(local, &config);
+    if (!QFile::remove(destination + "/.novelty-transfer.json"))
+        throw std::runtime_error("Game settings were saved, but transfer cleanup is pending. Retry the LAN installation.");
     timeout_.stop(); requestId_.clear();
     if (onInstalled) onInstalled(local.id);
 }
@@ -652,6 +708,7 @@ void LanGameExchange::fail(const QString &reason) {
     timeout_.stop(); manifestPoll_.stop(); resumePoll_.stop();
     if (manifestWorker_.joinable()) manifestWorker_.request_stop();
     if (resumeWorker_.joinable()) resumeWorker_.request_stop();
+    sendingGameLock_.reset();
     currentFile_.close(); sendingFile_.close();
     if (onError) onError(reason);
     connection_.close();
@@ -676,7 +733,22 @@ void LanGameExchange::handle(const QJsonObject &message) {
             const auto games = message["games"].toArray();
             for (const auto &game : games) if (!validSummary(game.toObject()))
                 throw std::runtime_error("Peer game catalogue is invalid.");
+            const auto name = message["device_name"].toString().trimmed();
+            if (!name.isEmpty() && name.size() <= 80 && !std::any_of(name.begin(), name.end(),
+                    [](QChar c) { return c.unicode() < 32 || c.unicode() == 127; })) {
+                for (const auto &peer : trustedPeers(library_)) if (peer.fingerprint == connection_.peerFingerprint() &&
+                    (peer.name == "Other device" || peer.name == "Paired device"))
+                    approvePairedPeer(library_, peer.fingerprint, name);
+            }
             timeout_.stop(); requestId_.clear();
+            if (!previewId_.isEmpty()) {
+                const auto id = previewId_; previewId_.clear();
+                QJsonObject preview;
+                if (message["preview_id"] == id && games.size() == 1 &&
+                    games.first().toObject()["profile_game_id"] == id) preview = games.first().toObject();
+                if (onPreview) onPreview(id, preview);
+                return;
+            }
             if (onCatalogue) onCatalogue(games);
             return;
         }

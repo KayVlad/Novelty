@@ -67,6 +67,7 @@ private:
 };
 
 class Library;
+struct SaveConfig;
 QString canonicalPath(const QString &path);
 QString folderIdentity(const QString &path);
 QString launchPathIssue(const Game &);
@@ -95,7 +96,8 @@ public:
     QString prefix(const QString &id) const;
     QList<Game> games() const;
     Game game(const QString &id) const;
-    void save(Game game);
+    void save(Game game, const SaveConfig *saveConfig = nullptr);
+    QStringList recoverSettingsChanges();
     void setMetadata(const QString &id, const QJsonObject &metadata);
     RelinkPlan planRelink(const QString &id, const QString &folder, const QString &executable = {}, const QString &cwd = {}) const;
     void relink(const RelinkPlan &);
@@ -125,6 +127,8 @@ public:
     void setSettings(const QJsonObject &settings);
 private:
     void store(const Game &);
+    void stageSaveConfig(const Game &before, const Game &after, const QJsonObject &config);
+    void recoverSettingsChange(const QString &id);
     QString root_, connection_;
     QSqlDatabase db_;
 };

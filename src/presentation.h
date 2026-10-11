@@ -18,8 +18,9 @@ struct GameMetadata {
     std::optional<QString> language;
     std::optional<QString> playtime;
     std::optional<QString> lastPlayed;
+    bool remote = false;
 };
-enum GameRole { EngineRole = Qt::UserRole + 1, StatusRole, LaunchableRole, ManageableRole, CoverRole, SetupPendingRole };
+enum GameRole { EngineRole = Qt::UserRole + 1, StatusRole, LaunchableRole, ManageableRole, CoverRole, SetupPendingRole, RemoteRole };
 QImage cachedCover(const QString &path);
 void invalidateCover(const QString &path);
 QIcon uiIcon(const QString &name);

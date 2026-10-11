@@ -179,7 +179,7 @@ void LanSaveExchange::answerLocate(const QJsonObject &request) {
         QJsonArray history;
         for (const auto &snapshotId : saveSnapshotLineage(library_, game.id)) history.append(snapshotId);
         matches.append(QJsonObject{{"profile_game_id", config.profileGameId},
-                                   {"snapshot_id", appliedSaveSnapshotId(library_, game.id)},
+                                   {"snapshot_id", history.isEmpty() ? QString() : history.last().toString()},
                                    {"snapshot_ids", history}, {"name", game.name.left(100)},
                                    {"compatibility_issue", !labelsMatch}});
         if (matches.size() >= 8) break;

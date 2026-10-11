@@ -9,6 +9,7 @@
 #include "lan_saves.h"
 #include "lan_sync.h"
 #include "lan_games.h"
+#include "lan_discovery.h"
 #include "sync_queue.h"
 #include "runtime_migration.h"
 #include "pairing.h"
@@ -19,12 +20,15 @@
 #include <QtCore/qfile.h>
 #include <QtCore/qfileinfo.h>
 #include <QtCore/qjsondocument.h>
+#include <QtCore/qbuffer.h>
 #include <QtCore/qsettings.h>
 #include <QtCore/qsavefile.h>
 #include <QtCore/quuid.h>
+#include <QtCore/qsysinfo.h>
 #include <QtGui/qdesktopservices.h>
 #include <QtGui/qfontmetrics.h>
 #include <QtGui/qaction.h>
+#include <QtGui/qimagereader.h>
 #include <QtWidgets/qboxlayout.h>
 #include <QtWidgets/qcombobox.h>
 #include <QtWidgets/qdialogbuttonbox.h>
@@ -107,7 +111,7 @@ struct SetupHint { bool pending = false; QString message; };
 SetupHint setupHint(const Library &lib, const Game &game, const QString &status) {
     // Active and failure states should retain their more urgent status colour.
     if (QStringList{"Unavailable", "Folder changed", "Path needs rename", "Recovery required",
-                    "Needs attention", "Interrupted", "Starting", "Preparing", "Configuring", "Running"}.contains(status)) return {};
+                    "Needs attention", "Save needs attention", "Interrupted", "Starting", "Preparing", "Configuring", "Running"}.contains(status)) return {};
     QStringList messages;
     if (game.executable.isEmpty())
         messages.append(game.installPending ? "Choose a game executable after installation finishes." :
@@ -135,6 +139,8 @@ QVariant GameModel::data(const QModelIndex &i, int role) const {
     if (role == SetupPendingRole) return setupPending.value(i.row());
     if (role == LaunchableRole) return actionsAllowed && launchable.value(i.row());
     if (role == ManageableRole) return actionsAllowed && manageable.value(i.row());
+    if (role == RemoteRole) return remoteGames.contains(g.id);
+    if (role == CoverRole && remoteGames.contains(g.id)) return remoteGames.value(g.id).cover;
     if (role == CoverRole) return games[i.row()].metadata.isEmpty() ? QString() :
         metadataCoverPath(coverDataRoot, games[i.row()].id);
     if (role == Qt::ToolTipRole) return i.column() == 1 ? g.evidence : g.folder;
@@ -144,15 +150,31 @@ QVariant GameModel::headerData(int section, Qt::Orientation o, int role) const {
     if (o == Qt::Horizontal && role == Qt::DisplayRole) return QStringList{"Game", "Engine", "Status"}.value(section);
     return {};
 }
-void GameModel::load(const Library &lib) {
-    beginResetModel(); games = lib.games(); coverDataRoot = lib.dataRoot(); states.clear(); launchable.clear(); manageable.clear(); setupPending.clear();
+void GameModel::load(const Library &lib, const QList<PeerGame> &peers) {
+    beginResetModel(); games = lib.games(); coverDataRoot = lib.dataRoot(); states.clear(); launchable.clear(); manageable.clear(); setupPending.clear(); remoteGames.clear();
+    QSet<QString> installed, linked;
     for (const auto &g : games) {
+        try {
+            const auto config = loadSaveConfig(lib, g.id);
+            installed.insert(config.profileGameId);
+            for (const auto &link : config.peerLinks) linked.insert(link.fingerprint + ':' + link.profileGameId);
+        } catch (const std::exception &) { /* The local status already indicates settings recovery. */ }
         const auto state = lib.status(g);
         states.append(state); setupPending.append(setupHint(lib, g, state).pending);
         const bool available = !lib.busy(g.id);
         manageable.append(available);
         launchable.append(available && !g.installPending && QFileInfo(g.folder).isDir() &&
                           (g.executable.isEmpty() || QFileInfo(g.executable).isFile()));
+    }
+    for (const auto &peer : peers) {
+        const auto remoteId = peer.descriptor["profile_game_id"].toString();
+        if (installed.contains(remoteId) || linked.contains(peer.peer.fingerprint + ':' + remoteId)) continue;
+        Game game; game.id = peer.id(); game.name = peer.descriptor["name"].toString();
+        game.engine = peer.descriptor["engine"].toString(); game.metadata = peer.descriptor["metadata"].toObject();
+        game.folder = "On " + peer.peer.name;
+        remoteGames.insert(game.id, peer); games.append(game);
+        states.append(peer.online ? "Not installed" : "Device offline");
+        launchable.append(peer.online); manageable.append(false); setupPending.append(false);
     }
     endResetModel();
 }
@@ -216,6 +238,9 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
     table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     listPlay_ = new QAction(uiIcon("play"), "Play", table_); listPlay_->setObjectName("listPlayAction");
     listManage_ = new QAction(uiIcon("manage"), "Manage…", table_); listManage_->setObjectName("listManageAction");
+    listInstall_ = new QAction(uiIcon("plus"), "Install", table_); listInstall_->setObjectName("listInstallAction");
+    listInstall_->setVisible(false); table_->addAction(listInstall_);
+    connect(listInstall_, &QAction::triggered, this, [this] { installFromPeer(); });
     listManage_->setShortcut(QKeySequence("Ctrl+M")); listManage_->setShortcutContext(Qt::WidgetWithChildrenShortcut);
     table_->addAction(listPlay_); table_->addAction(listManage_); table_->setContextMenuPolicy(Qt::ActionsContextMenu);
     table_->setToolTip("Double-click to play. Right-click for Play and Manage, or press Ctrl+M to manage the selected game.");
@@ -225,6 +250,12 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
         table_->setCurrentIndex(index);
         const auto id = selected().id;
         auto menu = new QMenu(this); menu->setObjectName("cardMenu"); menu->setAttribute(Qt::WA_DeleteOnClose);
+        if (index.data(RemoteRole).toBool()) {
+            auto install = menu->addAction(uiIcon("plus"), "Install"); install->setObjectName("cardInstallAction");
+            install->setEnabled(index.data(LaunchableRole).toBool());
+            connect(install, &QAction::triggered, this, [this] { installFromPeer(); });
+            menu->popup(position); return;
+        }
         auto manageAction = menu->addAction(uiIcon("manage"), "Manage…"); manageAction->setObjectName("cardManageAction");
         auto removeAction = menu->addAction(uiIcon("trash"), "Delete…"); removeAction->setObjectName("cardDeleteAction");
         connect(manageAction, &QAction::triggered, this, [this] { manage(); });
@@ -244,6 +275,9 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
     auto panel = new QWidget(this); panel->setObjectName("detailPanel"); panel->setFixedWidth(340);
     auto p = new QVBoxLayout(panel); p->setContentsMargins(16, 16, 16, 16); p->setSpacing(12);
     auto scroll = new QScrollArea(panel); scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame); scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    // Reserve scrollbar width: aspect-ratio cover height otherwise toggles the bar,
+    // recursively alternating the content width when a peer cover arrives.
+    scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
     scroll->viewport()->setObjectName("detailViewport");
     auto content = new QWidget(scroll); content->setObjectName("detailContent"); auto info = new QVBoxLayout(content); info->setContentsMargins(0, 0, 4, 0); info->setSpacing(10);
     cover_ = new Cover(content); info->addWidget(cover_);
@@ -311,7 +345,7 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
     });
     connect(table_->selectionModel(), &QItemSelectionModel::currentChanged, this, [this] { selectGame(); });
     connect(table_, &QTableView::doubleClicked, this, [this] { launch(); });
-    connect(grid_, &QListView::doubleClicked, this, [this] { launch(); });
+    // activated covers double-click and keyboard activation without launching twice.
     connect(grid_, &QListView::activated, this, [this] { launch(); });
     scanDelay_.setSingleShot(true); scanDelay_.setInterval(1500);
     connect(&watcher_, &QFileSystemWatcher::directoryChanged, this, [this] { scanDelay_.start(); });
@@ -374,7 +408,7 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
         } catch (const std::exception &e) { launchPoll_.stop(); pendingLaunch_.clear(); pendingInstaller_ = false; message(QString::fromUtf8(e.what())); }
     });
     syncTimer_.setInterval(30000);
-    connect(&syncTimer_, &QTimer::timeout, this, [this] { syncPendingPeers(); selectGame(); });
+    connect(&syncTimer_, &QTimer::timeout, this, [this] { syncPendingPeers(); refreshPeerGames(); selectGame(); });
     selectGame();
     const auto initial = root.isEmpty() ? QSettings().value("gamesRoot").toString() : root;
     if (!initial.isEmpty()) {
@@ -386,6 +420,9 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
 }
 Window::~Window() {
     syncTimer_.stop();
+    peerDiscovery_.reset();
+    for (auto connection : catalogueConnections_) { connection->close(); delete connection; }
+    catalogueConnections_.clear();
     for (auto connection : autoConnections_) { connection->close(); delete connection; }
     autoConnections_.clear();
     activePeerIds_.clear();
@@ -408,20 +445,30 @@ void Window::openRoot(const QString &root, bool allowCreation) {
     if (!allowCreation && !QFileInfo(QDir(root).filePath(".novelty/library.sqlite")).isFile())
         throw std::runtime_error("Your Games library is unavailable. Reconnect it and press Rescan, or choose another Games folder.");
     auto next = std::make_unique<Library>(root);
-    auto saveRecovery = recoverSaveRestores(*next);
+    auto saveRecovery = next->recoverSettingsChanges();
+    saveRecovery.append(recoverSaveRestores(*next));
     saveRecovery.append(recoverSaveObservations(*next));
     saveRecovery.append(recoverPendingSaveSnapshots(*next));
+    peerDiscovery_.reset();
+    for (auto connection : catalogueConnections_) { connection->close(); delete connection; }
+    catalogueConnections_.clear(); cataloguePeers_.clear(); peerGames_.clear(); peerLastAttempt_.clear();
     for (auto connection : autoConnections_) { connection->close(); delete connection; }
     autoConnections_.clear();
     activePeerIds_.clear();
     saveListener_.reset();
     library_ = std::move(next); rootPath_ = library_->root(); copyTracker_.clear(); scanDelay_.stop();
     lanListenIssue_.clear();
-    saveListener_ = std::make_unique<LanListener>(*library_, false);
+    saveListener_ = std::make_unique<LanListener>(*library_, false, this);
     saveListener_->onConnection = [this](LanConnection *connection) {
         connection->onReady = [this, connection](const QString &) {
             auto exchange = new LanSaveExchange(*library_, *connection, connection);
-            new LanGameExchange(*library_, *connection, *exchange, connection);
+            auto games = new LanGameExchange(*library_, *connection, *exchange, connection);
+            games->previewData = [this](const QString &id) {
+                const auto image = cachedCover(metadataCoverPath(library_->dataRoot(), id));
+                QByteArray bytes; QBuffer buffer(&bytes); buffer.open(QIODevice::WriteOnly);
+                if (!image.isNull()) image.scaled(240, 336, Qt::KeepAspectRatio, Qt::SmoothTransformation).save(&buffer, "JPEG", 65);
+                return QJsonObject{{"cover", bytes.size() <= 30 * 1024 ? QString::fromLatin1(bytes.toBase64()) : QString()}};
+            };
             exchange->onOffer = [this, connection, exchange](const QJsonObject &offer) {
                 const auto remoteId = offer["profile_game_id"].toString();
                 const auto offerId = offer["request_id"].toString();
@@ -484,7 +531,11 @@ void Window::openRoot(const QString &root, bool allowCreation) {
         saveListener_.reset();
     }
     syncTimer_.start();
-    QTimer::singleShot(1000, this, [this] { syncPendingPeers(); });
+    if (saveListener_) {
+        peerDiscovery_ = std::make_unique<LanDiscovery>(*library_, saveListener_->serverPort());
+        peerDiscovery_->onPeer = [this](const TrustedPeer &peer) { queryPeerGames(peer); };
+    }
+    QTimer::singleShot(1000, this, [this] { syncPendingPeers(); refreshPeerGames(); });
     ++autoMetadataGeneration_; autoMetadataQueue_.clear(); autoMetadataQueued_.clear(); autoMetadataActive_ = false;
     rootRequiresDatabase_ = true; ++scanGeneration_;
     QSettings().setValue("gamesRoot", library_->root());
@@ -502,10 +553,16 @@ void Window::syncPendingPeers() {
     try {
         const auto tasks = pendingPeerSync(*library_);
         const auto peers = trustedPeers(*library_);
+        QSet<QString> gameIds;
+        for (const auto &game : library_->games()) gameIds.insert(game.id);
         QSet<QString> attempted;
         syncQueueIssue_.clear();
         for (const auto &task : tasks) {
             if (autoConnections_.size() >= 2) break;
+            if (!gameIds.contains(task.gameId)) {
+                acknowledgePeerSync(*library_, task.fingerprint, task.gameId, task.snapshotId);
+                continue;
+            }
             if (activePeerIds_.contains(task.fingerprint) || attempted.contains(task.fingerprint)) continue;
             attempted.insert(task.fingerprint);
             TrustedPeer peer;
@@ -515,12 +572,12 @@ void Window::syncPendingPeers() {
             try {
                 if (appliedSaveSnapshotId(*library_, task.gameId) != task.snapshotId) {
                     const auto current = appliedSaveSnapshotId(*library_, task.gameId);
-                    if (current.isEmpty()) acknowledgePeerSync(*library_, task.fingerprint, task.gameId, task.snapshotId);
-                    else queuePeerSync(*library_, task.gameId, current);
+                    if (current.isEmpty()) throw std::runtime_error("The applied save pointer is missing; pending sync was retained.");
+                    queuePeerSync(*library_, task.gameId, current);
                     continue;
                 }
-            } catch (const std::exception &) {
-                acknowledgePeerSync(*library_, task.fingerprint, task.gameId, task.snapshotId);
+            } catch (const std::exception &e) {
+                message("Peer sync is pending: " + QString::fromUtf8(e.what()));
                 continue;
             }
             auto connection = new LanConnection(*library_, false, this);
@@ -563,7 +620,10 @@ void Window::chooseRoot() {
 }
 void Window::refresh() {
     const auto id = selected().id;
-    if (rootAvailable()) model_->load(*library_);
+    QList<PeerGame> peers;
+    for (const auto &catalogue : peerGames_) peers.append(catalogue);
+    std::sort(peers.begin(), peers.end(), [](const PeerGame &a, const PeerGame &b) { return a.id() < b.id(); });
+    if (rootAvailable()) model_->load(*library_, peers);
     else if (library_) model_->unavailable();
     for (int row = 0; row < model_->games.size(); ++row) if (model_->games[row].id == id) {
         table_->setCurrentIndex(proxy_->mapFromSource(model_->index(row, 0))); break;
@@ -574,21 +634,35 @@ void Window::refresh() {
 void Window::selectGame() {
     const auto g = selected(); const bool valid = library_ && !g.id.isEmpty();
     const bool accessible = rootAvailable();
-    model_->actionsAllowed = accessible && pendingLaunch_.isEmpty() && !removing_; grid_->viewport()->update();
+    model_->actionsAllowed = accessible && pendingLaunch_.isEmpty() && !removing_ && !importing_; grid_->viewport()->update();
     const auto index = table_->currentIndex();
+    const bool remote = index.data(RemoteRole).toBool();
+    listPlay_->setVisible(!remote); listManage_->setVisible(!remote); listInstall_->setVisible(remote);
+    listInstall_->setEnabled(index.data(LaunchableRole).toBool());
     listPlay_->setEnabled(index.data(LaunchableRole).toBool()); listManage_->setEnabled(index.data(ManageableRole).toBool());
     GameMetadata metadata;
     if (valid && !g.metadata.isEmpty()) {
-        metadata.cover = cachedCover(metadataCoverPath(library_->dataRoot(), g.id));
+        metadata.cover = remote ? model_->remoteGames.value(g.id).cover : cachedCover(metadataCoverPath(library_->dataRoot(), g.id));
         metadata.description = g.metadata["description"].toString();
         metadata.tags = metadataStrings(g.metadata["tags"]).mid(0, 12);
         metadata.playtime = g.metadata["expected_play_time"].toString();
     }
+    metadata.remote = remote;
+    if (remote && !metadata.cover.isNull()) metadata.cover = metadata.cover.convertToFormat(QImage::Format_Grayscale8);
     cover_->setGame(valid ? g.name : QString(), metadata);
     description_->setText(metadata.description.isEmpty() ? "No description yet." :
         (metadata.description.size() > 500 ? metadata.description.left(500).trimmed() + "…" : metadata.description));
     playtimeValue_->setText(metadata.playtime.value_or("—")); tags_->setText(metadata.tags.isEmpty() ? "No tags yet" : metadata.tags.join(" · "));
     if (valid) {
+        if (remote) {
+            const auto peer = model_->remoteGames.value(g.id);
+            title_->setText(g.name); originalTitle_->hide(); setupState_->hide(); syncState_->hide();
+            status_->setText(peer.online ? "●  Not installed" : "●  Device offline");
+            status_->setStyleSheet("color: #91a3b8; font-size: 13px;");
+            detail_->setText(peer.online ? "Available on " + peer.peer.name + ". Double-click or right-click → Install." :
+                "Open Novelty on " + peer.peer.name + " to install this game.");
+            detail_->show(); return;
+        }
         title_->setText(g.name); const auto state = accessible ? library_->status(g) : "Unavailable";
         originalTitle_->setText(g.metadata["original_title"].toString());
         originalTitle_->setVisible(!originalTitle_->text().isEmpty());
@@ -614,6 +688,10 @@ void Window::selectGame() {
         if (accessible && state == "Needs setup")
             detail_->setText("Play will verify setup in the existing prefix before starting the game. You can also use Prepare in Manage → Runtime.");
         if (accessible && state == "Recovery required") detail_->setText(library_->recoveryIssue(g.id));
+        if (accessible && (state == "Save needs attention" || state == "Needs attention")) {
+            const auto last = readJson(library_->gamePath(g.id, "status.json"));
+            detail_->setText(last["state"] == state ? last["message"].toString() : pendingSaveSnapshotIssue(*library_, g.id));
+        }
         detail_->setVisible(!detail_->text().isEmpty());
     } else {
         title_->setText("Your next story"); status_->setText("No game selected"); status_->setStyleSheet("color: #9eafc5; font-size: 13px;");
@@ -624,6 +702,7 @@ void Window::selectGame() {
     }
 }
 void Window::scan() {
+    refreshPeerGames();
     if (removing_ || importing_ || pendingScan_.valid() || !pendingLaunch_.isEmpty()) return;
     if (!library_) {
         if (!rootPath_.isEmpty()) try { openRoot(rootPath_, !rootRequiresDatabase_); } catch (const std::exception &e) { message(QString::fromUtf8(e.what())); }
@@ -631,9 +710,10 @@ void Window::scan() {
     }
     if (!rootAvailable()) { copyTracker_.clear(); refresh(); message("Games library unavailable. Reconnect it and press Rescan."); return; }
     scanRoot_ = library_->root(); pendingScanGeneration_ = scanGeneration_; auto root = scanRoot_;
-    QStringList known; for (const auto &g : model_->games) known.append(g.folder);
+    QStringList known; for (const auto &g : model_->games) if (!model_->remoteGames.contains(g.id)) known.append(g.folder);
     pendingScan_ = std::async(std::launch::async, [root, known] {
-        Library worker(root); auto recovered = worker.recoverRemovals(); recovered.append(worker.recoverFolderImports());
+        Library worker(root); auto recovered = worker.recoverSettingsChanges();
+        recovered.append(worker.recoverRemovals()); recovered.append(worker.recoverFolderImports());
         recovered.append(worker.recoverInstallations());
         recovered.append(recoverSaveRestores(worker)); recovered.append(recoverSaveObservations(worker));
         recovered.append(recoverPendingSaveSnapshots(worker));
@@ -673,11 +753,6 @@ void Window::addGame() {
         "\n\nThe installer runs with umu / Proton in this game's own prefix. After it closes, Novelty scans the folder. If it offers to launch the game, leave that unchecked."); };
     connect(name, &QLineEdit::textChanged, &dialog, updateDestination); updateDestination();
     tabs->addTab(installerTab, "Run installer");
-    auto fromPeer = new QPushButton("Install from paired device…", &dialog);
-    fromPeer->setObjectName("installFromPeer"); layout->addWidget(fromPeer, 0, Qt::AlignLeft);
-    connect(fromPeer, &QPushButton::clicked, &dialog, [this, &dialog] {
-        dialog.reject(); QTimer::singleShot(0, this, [this] { installFromPeer(); });
-    });
     auto error = new QLabel(&dialog); error->setObjectName("addGameError"); error->setTextFormat(Qt::PlainText); error->setWordWrap(true); layout->addWidget(error);
     auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog); layout->addWidget(buttons);
     auto submit = buttons->button(QDialogButtonBox::Ok); submit->setObjectName("addGameSubmit"); submit->setMinimumWidth(130); submit->setText("Move to Games");
@@ -908,10 +983,11 @@ void Window::devices() {
     catch (const std::exception &e) { message(QString::fromUtf8(e.what())); return; }
     QDialog dialog(this); dialog.setObjectName("devicesDialog"); dialog.setWindowTitle("Devices"); dialog.resize(560, 420);
     auto layout = new QVBoxLayout(&dialog);
-    auto own = new QLabel("This device: " + ensureDeviceIdentity(*library_).fingerprint, &dialog);
+    auto own = new QLabel("This device: " + QSysInfo::machineHostName(), &dialog);
+    own->setToolTip(ensureDeviceIdentity(*library_).fingerprint);
     own->setWordWrap(true); own->setTextInteractionFlags(Qt::TextSelectableByMouse); layout->addWidget(own);
     auto syncAddress = new QLabel(saveListener_ ?
-        "For save sync, use this device's LAN IP with port " + QString::number(saveListener_->serverPort()) :
+        "Game transfers and save sync use port " + QString::number(saveListener_->serverPort()) :
         lanListenIssue_, &dialog);
     syncAddress->setWordWrap(true); syncAddress->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(syncAddress);
@@ -934,7 +1010,7 @@ void Window::devices() {
             [=] { revokeButton->setEnabled(list->currentItem() != nullptr); });
     connect(revokeButton, &QPushButton::clicked, &dialog, [&, this] {
         if (!list->currentItem()) return;
-        try { revokePeer(*library_, list->currentItem()->data(Qt::UserRole).toString()); render(); }
+        try { revokePeer(*library_, list->currentItem()->data(Qt::UserRole).toString()); render(); refreshPeerGames(); }
         catch (const std::exception &e) { QMessageBox::warning(&dialog, "Cannot revoke device", QString::fromUtf8(e.what())); }
     });
     connect(pairButton, &QPushButton::clicked, &dialog, [&, this] {
@@ -945,9 +1021,9 @@ void Window::devices() {
             QMessageBox::warning(&pair, "Cannot pair", "Cannot listen for LAN peers: " + listener.errorString()); return;
         }
         auto addresses = localLanAddresses();
-        auto instructions = new QLabel("Open this screen on both devices. On one device, enter the other device's LAN address and port below. Compare the verification phrase on both screens before approving.", &pair);
+        auto instructions = new QLabel("Open this screen on both devices. Select the other device below and connect. Enter its six-digit code here, then confirm on the device displaying the code.", &pair);
         instructions->setWordWrap(true); column->addWidget(instructions);
-        auto local = new QLabel("This device: " + (addresses.isEmpty() ? QString("Find its IP in network settings") : addresses.join(", ")) +
+        auto local = new QLabel("This device: " + QSysInfo::machineHostName() + " · " + (addresses.isEmpty() ? QString("Find its IP in network settings") : addresses.join(", ")) +
                                 "  ·  port " + QString::number(listener.serverPort()), &pair);
         local->setTextInteractionFlags(Qt::TextSelectableByMouse); local->setWordWrap(true); column->addWidget(local);
         auto row = new QHBoxLayout;
@@ -1021,23 +1097,39 @@ void Window::devices() {
         } else discoveryNote->setText("UDP discovery is unavailable here. Enter the other device's LAN IP address above.");
         auto phrase = new QLabel("Waiting for a device…", &pair); phrase->setObjectName("pairingPhrase");
         phrase->setTextInteractionFlags(Qt::TextSelectableByMouse); phrase->setWordWrap(true); column->addWidget(phrase);
-        auto name = new QLineEdit("Other device", &pair); name->setMaxLength(80); column->addWidget(name);
-        auto approve = new QPushButton("Phrases match — approve", &pair); approve->setObjectName("approvePairing");
+        auto code = new QLineEdit(&pair); code->setObjectName("pairingCode"); code->setMaxLength(6);
+        code->setPlaceholderText("Six-digit code"); code->setValidator(new QIntValidator(0, 999999, code));
+        code->hide(); column->addWidget(code);
+        auto approve = new QPushButton("Pair", &pair); approve->setObjectName("approvePairing");
         approve->setEnabled(false); column->addWidget(approve);
         auto state = new QLabel(&pair); state->setWordWrap(true); column->addWidget(state);
         column->addStretch();
         LanConnection *active = nullptr;
-        auto attach = [&](LanConnection *connection) {
+        bool enteringCode = false;
+        auto attach = [&](LanConnection *connection, bool outgoing) {
+            enteringCode = outgoing; code->clear(); code->setEnabled(true); code->setVisible(outgoing);
+            connection->usePairingCode(QSysInfo::machineHostName());
+            connection->setServicePort(saveListener_ ? saveListener_->serverPort() : 0);
+            connection->onEndpoint = [&, this] { render(); refreshPeerGames(); };
             active = connection; approve->setEnabled(false); phrase->setText("Connecting…"); state->clear();
             connection->onPhrase = [&, connection](const QString &fingerprint, const QString &value) {
                 if (active != connection) return;
-                phrase->setText("Compare on both devices: " + value);
-                state->setText("Device certificate: " + fingerprint.left(16) + "…");
-                approve->setEnabled(true);
+                phrase->setToolTip("Device certificate: " + fingerprint);
+                phrase->setText(enteringCode ? "Enter the code displayed on " + connection->peerName() + "." :
+                    "Pairing code: " + value);
+                state->setText(enteringCode ? QString() : "Enter this code on " + connection->peerName() +
+                    ", then confirm here after that device says the code matches.");
+                approve->setText(enteringCode ? "Pair" : "Allow " + connection->peerName());
+                approve->setEnabled(enteringCode);
+                if (enteringCode) code->setFocus();
+            };
+            connection->onRemoteApproval = [&, connection] {
+                if (active == connection && !enteringCode) approve->setEnabled(true);
             };
             connection->onReady = [&, connection](const QString &) {
                 if (active != connection) return;
-                approve->setEnabled(false); state->setText("Paired. This device is now trusted for this Games library.");
+                code->hide(); approve->setEnabled(false); phrase->setText("Paired with " + connection->peerName() + ".");
+                state->setText("Games and saves connect automatically while Novelty is open.");
                 render();
             };
             connection->onError = [&, connection](const QString &error) {
@@ -1048,7 +1140,7 @@ void Window::devices() {
         };
         listener.onConnection = [&](LanConnection *connection) {
             if (active) return false;
-            attach(connection); return true;
+            attach(connection, false); return true;
         };
         connect(connectButton, &QPushButton::clicked, &pair, [&, this] {
             if (active) { state->setText("Finish or close the current pairing first."); return; }
@@ -1056,141 +1148,177 @@ void Window::devices() {
                 state->setText("Enter the other device's LAN IP address."); return;
             }
             auto connection = new LanConnection(*library_, true, &pair);
-            attach(connection);
+            attach(connection, true);
             bool validPort = false;
             const auto number = port->text().toUShort(&validPort);
             if (!validPort || number == 0) { state->setText("Enter a valid port."); connection->deleteLater(); active = nullptr; return; }
             connection->connectTo(host->text().trimmed(), number);
         });
         connect(approve, &QPushButton::clicked, &pair, [&] {
-            if (active) { approve->setEnabled(false); active->approvePairing(name->text()); }
+            if (!active) return;
+            if (enteringCode) {
+                if (!active->submitPairingCode(code->text())) {
+                    if (active) state->setText("That code does not match. Check the other device and retry.");
+                    return;
+                }
+                approve->setEnabled(false); code->setEnabled(false);
+                state->setText("Code matches. Confirm pairing on " + active->peerName() + ".");
+            } else { approve->setEnabled(false); active->approvePairing(active->peerName()); }
         });
+        connect(code, &QLineEdit::returnPressed, approve, &QPushButton::click);
         connect(&pair, &QDialog::finished, &pair, [&] { listener.close(); if (active) active->close(); });
         pair.exec();
         if (discoveryFd >= 0) ::close(discoveryFd);
     });
     auto close = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
     connect(close, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    layout->addWidget(close); dialog.exec();
+    layout->addWidget(close); dialog.exec(); refreshPeerGames();
+}
+void Window::refreshPeerGames() {
+    if (!rootAvailable() || importing_ || removing_) return;
+    try {
+        const auto peers = trustedPeers(*library_);
+        QSet<QString> trusted;
+        for (const auto &peer : peers) trusted.insert(peer.fingerprint);
+        bool changed = false;
+        for (const auto &fingerprint : peerGames_.keys()) if (!trusted.contains(fingerprint)) {
+            peerGames_.remove(fingerprint); peerLastAttempt_.remove(fingerprint); changed = true;
+        }
+        if (changed) refresh();
+        for (const auto &peer : peers) queryPeerGames(peer);
+        if (peerDiscovery_) peerDiscovery_->announce();
+    } catch (const std::exception &e) { message("Could not check paired devices: " + QString::fromUtf8(e.what())); }
+}
+void Window::queryPeerGames(const TrustedPeer &peer) {
+    if (!rootAvailable() || importing_ || removing_ || peer.address.isEmpty() || !peer.port ||
+        catalogueConnections_.size() >= 2 || cataloguePeers_.contains(peer.fingerprint)) return;
+    const auto now = QDateTime::currentMSecsSinceEpoch();
+    if (now - peerLastAttempt_.value(peer.fingerprint) < 5000) return;
+    // Discovery packets cannot change trust or stored addresses. Only the matching
+    // authenticated TLS connection below can publish this endpoint and its games.
+    peerLastAttempt_[peer.fingerprint] = now;
+    auto connection = new LanConnection(*library_, false, this);
+    catalogueConnections_.insert(connection); cataloguePeers_.insert(peer.fingerprint);
+    const auto finish = [this, connection, peer](const QString &error = {}) {
+        if (!catalogueConnections_.remove(connection)) return;
+        cataloguePeers_.remove(peer.fingerprint);
+        connection->close(); connection->deleteLater();
+        if (!error.isEmpty()) {
+            bool changed = false;
+            for (auto &game : peerGames_[peer.fingerprint]) if (game.online) { game.online = false; changed = true; }
+            if (changed) refresh();
+            message(peer.name + " is unavailable: " + error + " Retrying automatically.");
+        } else peerLastAttempt_[peer.fingerprint] = QDateTime::currentMSecsSinceEpoch() + 25000;
+    };
+    connection->onError = finish;
+    connection->onReady = [this, connection, peer, finish](const QString &fingerprint) {
+        if (fingerprint != peer.fingerprint) { finish("Device identity did not match."); return; }
+        try {
+            rememberPeerEndpoint(*library_, fingerprint, peer.address, peer.port);
+            auto router = new LanSaveExchange(*library_, *connection, connection);
+            auto exchange = new LanGameExchange(*library_, *connection, *router, connection);
+            auto remaining = std::make_shared<QStringList>();
+            const auto next = [exchange, remaining, finish] {
+                if (remaining->isEmpty()) { finish(); return; }
+                try { exchange->preview(remaining->takeFirst()); }
+                catch (const std::exception &e) { finish(QString::fromUtf8(e.what())); }
+            };
+            exchange->onError = finish;
+            exchange->onCatalogue = [this, peer, remaining, next](const QJsonArray &catalogue) {
+                auto namedPeer = peer;
+                for (const auto &known : trustedPeers(*library_)) if (known.fingerprint == peer.fingerprint) namedPeer.name = known.name;
+                QList<PeerGame> games;
+                for (const auto &item : catalogue) {
+                    PeerGame game; game.peer = namedPeer; game.descriptor = item.toObject();
+                    for (const auto &prior : peerGames_.value(peer.fingerprint)) if (prior.id() == game.id()) {
+                        game.cover = prior.cover;
+                        game.descriptor["metadata"] = prior.descriptor["metadata"];
+                        break;
+                    }
+                    if (game.descriptor["preview_available"].toBool() && game.cover.isNull())
+                        remaining->append(game.descriptor["profile_game_id"].toString());
+                    games.append(game);
+                }
+                peerGames_[peer.fingerprint] = games;
+                if (notice_->text().startsWith(peer.name + " is unavailable:")) message("Connected to " + namedPeer.name + ".");
+                refresh(); next();
+            };
+            exchange->onPreview = [this, peer, next](const QString &id, const QJsonObject &preview) {
+                for (auto &game : peerGames_[peer.fingerprint]) if (game.descriptor["profile_game_id"] == id) {
+                    game.descriptor["metadata"] = preview["metadata"].toObject();
+                    const auto encoded = preview["cover"].toString();
+                    if (encoded.size() <= 40 * 1024) {
+                        QBuffer buffer; buffer.setData(QByteArray::fromBase64(encoded.toLatin1())); buffer.open(QIODevice::ReadOnly);
+                        QImageReader reader(&buffer, "JPEG");
+                        const auto size = reader.size();
+                        if (size.isValid() && size.width() <= 240 && size.height() <= 336) game.cover = reader.read();
+                    }
+                }
+                refresh(); next();
+            };
+            exchange->catalogue();
+        } catch (const std::exception &e) { finish(QString::fromUtf8(e.what())); }
+    };
+    QTimer::singleShot(30000, connection, [finish] { finish("Game catalogue timed out."); });
+    connection->connectTo(peer.address, peer.port);
 }
 void Window::installFromPeer() {
-    if (!library_ || !rootAvailable()) { message("Choose an available Games folder first."); return; }
-    QList<TrustedPeer> peers;
-    try { peers = trustedPeers(*library_); }
-    catch (const std::exception &e) { message(QString::fromUtf8(e.what())); return; }
-    if (peers.isEmpty()) { message("Pair the other device in Settings → Devices before installing a game."); return; }
+    if (!rootAvailable() || importing_ || removing_ || !pendingLaunch_.isEmpty()) return;
+    const auto selectedId = selected().id;
+    if (!model_->remoteGames.contains(selectedId)) return;
+    auto game = model_->remoteGames.value(selectedId);
+    if (!game.online) { message("Open Novelty on " + game.peer.name + " to install this game."); refreshPeerGames(); return; }
+    // The discovery catalogue is transient UI state, never an installed game row.
+    try {
+        bool trusted = false;
+        for (const auto &peer : trustedPeers(*library_)) if (peer.fingerprint == game.peer.fingerprint) { game.peer = peer; trusted = true; }
+        if (!trusted) { refreshPeerGames(); return; }
+    } catch (const std::exception &e) { message(QString::fromUtf8(e.what())); return; }
     QDialog dialog(this); dialog.setObjectName("installFromPeerDialog");
-    dialog.setWindowTitle("Install from paired device"); dialog.resize(600, 440);
+    dialog.setWindowTitle("Installing " + game.descriptor["name"].toString()); dialog.resize(520, 150);
     auto layout = new QVBoxLayout(&dialog);
-    auto note = new QLabel("Keep Novelty open on the other device. Choose a trusted device, then select a game to transfer into this Games folder.", &dialog);
-    note->setWordWrap(true); layout->addWidget(note);
-    auto peerBox = new QComboBox(&dialog); peerBox->setObjectName("gameTransferPeer");
-    for (const auto &peer : peers) peerBox->addItem(peer.name + " — " + peer.fingerprint.left(12) + "…", peer.fingerprint);
-    layout->addWidget(peerBox);
-    auto row = new QHBoxLayout;
-    auto host = new QLineEdit(&dialog); host->setPlaceholderText("Peer LAN IP address");
-    auto port = new QLineEdit(&dialog); port->setValidator(new QIntValidator(1, 65535, port)); port->setMaximumWidth(85);
-    auto connectButton = new QPushButton("Show games", &dialog);
-    row->addWidget(host, 1); row->addWidget(port); row->addWidget(connectButton); layout->addLayout(row);
-    const auto fillEndpoint = [&] {
-        const auto fingerprint = peerBox->currentData().toString();
-        for (const auto &peer : peers) if (peer.fingerprint == fingerprint) {
-            host->setText(peer.address); port->setText(QString::number(peer.port ? peer.port : 38373)); break;
-        }
-    };
-    connect(peerBox, &QComboBox::currentIndexChanged, &dialog, fillEndpoint); fillEndpoint();
-    auto games = new QListWidget(&dialog); games->setObjectName("peerGames"); layout->addWidget(games, 1);
-    auto status = new QLabel("Connect to list the device's available games.", &dialog);
+    auto status = new QLabel("Connecting to " + game.peer.name + "…", &dialog);
     status->setTextFormat(Qt::PlainText); status->setWordWrap(true); layout->addWidget(status);
-    auto buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
-    auto installButton = buttons->addButton("Install selected game", QDialogButtonBox::ActionRole);
-    installButton->setObjectName("startPeerGameInstall"); installButton->setEnabled(false);
-    layout->addWidget(buttons); connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    connect(games, &QListWidget::itemSelectionChanged, &dialog,
-            [=] { installButton->setEnabled(games->currentItem() != nullptr); });
-    LanConnection *active = nullptr;
-    LanGameExchange *exchange = nullptr;
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog); layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    LanConnection connection(*library_, false, &dialog);
     QString installedId;
-    connect(connectButton, &QPushButton::clicked, &dialog, [&, this] {
-        if (active) return;
-        bool validPort = false; const auto number = port->text().toUShort(&validPort);
-        if (QHostAddress(host->text().trimmed()).isNull() || !validPort || number == 0) {
-            status->setText("Enter the paired device's LAN IP address and port."); return;
-        }
-        const auto expected = peerBox->currentData().toString();
-        auto connection = new LanConnection(*library_, false, &dialog);
-        active = connection; connectButton->setEnabled(false); peerBox->setEnabled(false);
-        games->clear(); installButton->setEnabled(false); status->setText("Connecting to trusted device…");
-        connection->onError = [&, connection](const QString &reason) {
-            if (active != connection) return;
-            status->setText(reason); active = nullptr; exchange = nullptr;
-            connectButton->setEnabled(true); peerBox->setEnabled(true); connection->deleteLater();
-        };
-        connection->onReady = [&, connection, expected, number](const QString &fingerprint) {
-            if (active != connection) return;
-            if (fingerprint != expected) {
-                status->setText("The connected device is different from the one selected.");
-                connection->close(); active = nullptr; exchange = nullptr;
-                connectButton->setEnabled(true); peerBox->setEnabled(true); connection->deleteLater(); return;
-            }
-            try {
-                rememberPeerEndpoint(*library_, fingerprint, host->text().trimmed(), number);
-                auto router = new LanSaveExchange(*library_, *connection, connection);
-                exchange = new LanGameExchange(*library_, *connection, *router, connection);
-                exchange->onError = [&](const QString &reason) { status->setText(reason); };
-                exchange->onCatalogue = [&, connection](const QJsonArray &catalogue) {
-                    if (active != connection) return;
-                    games->clear();
-                    for (const auto &value : catalogue) {
-                        const auto item = value.toObject();
-                        auto row = new QListWidgetItem(item["name"].toString() +
-                            (item["release_identity"].toString().isEmpty() ? QString() :
-                                " · " + item["release_identity"].toString()), games);
-                        row->setData(Qt::UserRole, item);
-                    }
-                    status->setText(catalogue.isEmpty() ? "No transferable games are available on this device." :
-                                     "Select a game, then install it into Games.");
-                };
-                exchange->onProgress = [&, connection](qint64 done, qint64 total) {
-                    if (active != connection) return;
-                    status->setText("Transferring verified game files: " +
-                        QString::number(double(done) / 1048576.0, 'f', 1) + " / " +
-                        QString::number(double(total) / 1048576.0, 'f', 1) + " MiB");
-                };
-                exchange->onInstalled = [&, connection](const QString &gameId) {
-                    if (active != connection) return;
-                    installedId = gameId; dialog.accept();
-                };
-                exchange->catalogue();
-            } catch (const std::exception &e) { status->setText(QString::fromUtf8(e.what())); connection->close(); }
-        };
-        connection->connectTo(host->text().trimmed(), number);
-    });
-    connect(installButton, &QPushButton::clicked, &dialog, [&] {
-        if (!exchange || !games->currentItem()) return;
+    const auto failed = [&](const QString &reason) {
+        status->setText(reason + " Close this window and retry Install; completed files are kept.");
+        buttons->setStandardButtons(QDialogButtonBox::Close);
+    };
+    connection.onError = failed;
+    connection.onReady = [&](const QString &fingerprint) {
+        if (fingerprint != game.peer.fingerprint) { failed("The device identity changed."); connection.close(); return; }
         try {
-            exchange->install(games->currentItem()->data(Qt::UserRole).toJsonObject());
-            installButton->setEnabled(false); games->setEnabled(false); connectButton->setEnabled(false);
-            status->setText("Preparing the game file manifest on the other device…");
-        } catch (const std::exception &e) { status->setText(QString::fromUtf8(e.what())); }
-    });
-    connect(&dialog, &QDialog::finished, &dialog, [&] { if (active) active->close(); });
-    importing_ = true;
-    dialog.exec();
-    importing_ = false;
-    if (installedId.isEmpty()) return;
+            auto router = new LanSaveExchange(*library_, connection, &connection);
+            auto exchange = new LanGameExchange(*library_, connection, *router, &connection);
+            exchange->onError = failed;
+            exchange->onProgress = [&](qint64 done, qint64 total) {
+                status->setText("Transferring verified game files: " + QString::number(double(done) / 1048576.0, 'f', 1) +
+                    " / " + QString::number(double(total) / 1048576.0, 'f', 1) + " MiB");
+            };
+            exchange->onInstalled = [&](const QString &id) { installedId = id; dialog.accept(); };
+            exchange->install(game.descriptor);
+            status->setText("Preparing game files on " + game.peer.name + "…");
+        } catch (const std::exception &e) { failed(QString::fromUtf8(e.what())); connection.close(); }
+    };
+    importing_ = true; selectGame();
+    QTimer::singleShot(0, &dialog, [&] { connection.connectTo(game.peer.address, game.peer.port); });
+    dialog.exec(); connection.close(); importing_ = false;
+    if (installedId.isEmpty()) { selectGame(); return; }
+    if (!game.cover.isNull()) {
+        QByteArray bytes; QBuffer buffer(&bytes); buffer.open(QIODevice::WriteOnly); game.cover.save(&buffer, "PNG");
+        saveMetadataCover(metadataCoverPath(library_->dataRoot(), installedId), bytes);
+    }
     refresh();
     for (int row = 0; row < model_->games.size(); ++row) if (model_->games[row].id == installedId) {
         table_->setCurrentIndex(proxy_->mapFromSource(model_->index(row, 0))); break;
     }
     try {
         const auto result = refreshLinkedPeerSaves(*library_, installedId);
-        message(!result.issues.isEmpty() ?
-                "Game installed. Peer saves can be checked again before Play: " + result.issues.join(" ") :
-                result.peersChecked ? "Game installed from paired device. Save history checked." :
-                "Game installed from paired device. Confirm its save identity and paths to sync progress.");
-        if (library_->game(installedId).executable.isEmpty()) chooseExecutable(installedId);
-        else launch(true);
+        message(result.issues.isEmpty() ? "Game installed. Save history checked; ready for setup on Play." :
+            "Game installed. Peer saves will be checked again before Play: " + result.issues.join(" "));
     } catch (const std::exception &e) { message("Game installed. " + QString::fromUtf8(e.what())); }
 }
 void Window::syncSavesFromPeer(const QString &gameId, QWidget *parent) {
@@ -1246,9 +1374,9 @@ void Window::syncSavesFromPeer(const QString &gameId, QWidget *parent) {
     restorePoll.start(); restoring.exec(); restorePoll.stop(); restore.get();
 }
 void Window::manage() {
-    auto g = selected(); if (!library_ || g.id.isEmpty()) return;
+    auto g = selected(); if (!library_ || g.id.isEmpty() || model_->remoteGames.contains(g.id)) return;
     if (library_->busy(g.id)) {
-        message(library_->supervisorActive(g.id) ? "This game is running or being prepared." : library_->recoveryIssue(g.id)); return;
+        message(library_->supervisorActive(g.id) ? "This game has an operation in progress. Retry when it finishes." : library_->recoveryIssue(g.id)); return;
     }
     QDialog d(this); d.setObjectName("manageDialog"); d.setWindowTitle("Manage — " + g.name); d.resize(860, 650);
     auto layout = new QVBoxLayout(&d); auto tabs = new QTabWidget(&d); layout->addWidget(tabs, 1);
@@ -1413,6 +1541,7 @@ void Window::manage() {
     updateMetadata();
     auto launchTab = new QWidget(&d); auto f = new QFormLayout(launchTab);
     auto name = new QLineEdit(g.name, &d); auto exe = new QLineEdit(g.executable, &d); auto cwd = new QLineEdit(g.workingDirectory, &d);
+    name->setObjectName("gameName");
     auto backend = backendBox(&d, g.backend); auto steamId = new QLineEdit(g.steamId, &d);
     auto args = new QPlainTextEdit(g.arguments.join('\n'), &d); args->setPlaceholderText("One argument per line; spaces within a line are preserved."); args->setMaximumHeight(100);
     f->addRow("Name", name); f->addRow("Executable", pathField(exe, &d, false, "Select game executable"));
@@ -1640,8 +1769,8 @@ void Window::manage() {
             mappingPath->setModified(true); saveMessage->clear();
         } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
     });
-    auto saveMappingsNow = [this, &g, mappingPath] {
-        if (!mappingPath->isModified()) return false;
+    auto editedSaveMappings = [this, &g, mappingPath]() -> std::optional<SaveConfig> {
+        if (!mappingPath->isModified()) return std::nullopt;
         auto config = loadSaveConfig(*library_, g.id);
         const auto path = mappingPath->text().trimmed();
         if (path.isEmpty()) {
@@ -1650,9 +1779,7 @@ void Window::manage() {
             config.mappings = {saveMappingFromPath(*library_, g, path)};
             config.discoveryState = "identified"; config.discoverySource = "manual";
         }
-        saveSaveConfig(*library_, g.id, config);
-        mappingPath->setModified(false);
-        return true;
+        return config;
     };
     connect(syncFromPeer, &QPushButton::clicked, &d, [&, renderSnapshots, renderSaveStatus] {
         try {
@@ -1768,8 +1895,10 @@ void Window::manage() {
                 const int pos = line.indexOf('='); if (pos <= 0) throw std::runtime_error("Environment entries must use KEY=value.");
                 g.environment.insert(line.left(pos).trimmed(), line.mid(pos + 1));
             }
-            const bool savePathChanged = saveMappingsNow();
-            library_->save(g); d.accept();
+            const auto saveConfig = editedSaveMappings();
+            const bool savePathChanged = saveConfig.has_value();
+            library_->save(g, saveConfig ? &*saveConfig : nullptr);
+            mappingPath->setModified(false); d.accept();
             if (savePathChanged && !loadSaveConfig(*library_, g.id).mappings.isEmpty()) {
                 const auto root = library_->root(), id = g.id;
                 auto work = std::async(std::launch::async, [root, id] {
@@ -1786,8 +1915,10 @@ void Window::manage() {
                 poll.start(); progress.exec(); poll.stop();
                 try { work.get(); }
                 catch (const std::exception &e) {
-                    if (!QString::fromUtf8(e.what()).startsWith("No saved data yet"))
-                        message("Save location was saved, but progress could not be captured: " + QString::fromUtf8(e.what()));
+                    if (!QString::fromUtf8(e.what()).startsWith("No saved data yet")) {
+                        const auto issue = "Save location was saved, but progress could not be captured: " + QString::fromUtf8(e.what());
+                        library_->recordStatus(g.id, "Save needs attention", issue); message(issue);
+                    }
                 }
             }
         } catch (const std::exception &e) { QMessageBox::warning(&d, "Cannot save", QString::fromUtf8(e.what())); }
@@ -1830,7 +1961,7 @@ void Window::removeGame(const QString &id, QDialog *manageDialog) {
     }
 }
 void Window::relinkGame() {
-    const auto g = selected(); if (!library_ || g.id.isEmpty()) return;
+    const auto g = selected(); if (!library_ || g.id.isEmpty() || model_->remoteGames.contains(g.id)) return;
     QDialog dialog(this); dialog.setObjectName("relinkDialog"); dialog.setWindowTitle("Relink folder — " + g.name); dialog.resize(800, 520);
     auto layout = new QVBoxLayout(&dialog); auto form = new QFormLayout;
     auto folder = new QLineEdit(g.folder, &dialog); folder->setObjectName("relinkFolder");
@@ -1871,7 +2002,7 @@ void Window::relinkGame() {
     if (dialog.exec() == QDialog::Accepted) { refresh(); message("Folder relinked. This game's settings and prefix were kept."); scanDelay_.start(); }
 }
 void Window::runExecutable(QDialog *manageDialog) {
-    const auto g = selected(); if (!library_ || g.id.isEmpty()) return;
+    const auto g = selected(); if (!library_ || g.id.isEmpty() || model_->remoteGames.contains(g.id)) return;
     QDialog dialog(manageDialog); dialog.setObjectName("extraLaunchDialog"); dialog.setWindowTitle("Run in prefix — " + g.name); dialog.resize(720, 470);
     auto layout = new QVBoxLayout(&dialog);
     auto note = new QLabel("Run a patch or installer using this game's saved runner and prefix. Changes made by the program persist; the saved game executable and arguments stay unchanged.", &dialog);
@@ -1952,7 +2083,17 @@ bool Window::prepareLaunchRuntime(Game &g) {
     return true;
 }
 bool Window::applyIncomingSavesBeforePlay(const QString &gameId) {
-    const auto candidates = importedSaveCandidates(*library_, gameId);
+    QList<ImportedSaveCandidate> candidates;
+    try {
+        candidates = importedSaveCandidates(*library_, gameId);
+        if (!candidates.isEmpty()) {
+            captureAvailableSaveSnapshot(*library_, gameId, "before peer restore");
+            candidates = importedSaveCandidates(*library_, gameId);
+        }
+    } catch (const std::exception &e) {
+        message("Peer saves could not be checked; using local saves. " + QString::fromUtf8(e.what()));
+        return true;
+    }
     if (candidates.isEmpty()) return true;
     QList<ImportedSaveCandidate> newer;
     bool conflict = false;
@@ -1989,7 +2130,8 @@ bool Window::applyIncomingSavesBeforePlay(const QString &gameId) {
     }
 }
 void Window::launch(bool prepareOnly, const QString &tool, const std::optional<ExtraLaunch> &extra, bool installing, bool debugWine) {
-    auto g = selected(); if (!library_ || g.id.isEmpty() || !pendingLaunch_.isEmpty()) return;
+    auto g = selected(); if (!library_ || g.id.isEmpty() || !pendingLaunch_.isEmpty() || importing_) return;
+    if (model_->remoteGames.contains(g.id)) { if (!prepareOnly && tool.isEmpty() && !extra && !installing) installFromPeer(); return; }
     try {
         if (!rootAvailable()) throw std::runtime_error("Games library unavailable. Reconnect it and press Rescan.");
         if (!library_->recoveryIssue(g.id).isEmpty()) throw std::runtime_error(library_->recoveryIssue(g.id).toStdString());
@@ -2004,9 +2146,13 @@ void Window::launch(bool prepareOnly, const QString &tool, const std::optional<E
             const auto peers = trustedPeers(*library_);
             if (!peers.isEmpty()) {
                 message("Checking paired-device saves before Play…");
-                const auto result = refreshLinkedPeerSaves(*library_, g.id);
-                if (!result.issues.isEmpty())
-                    message("Some peers are unavailable; local saves remain usable. " + result.issues.join(" "));
+                try {
+                    const auto result = refreshLinkedPeerSaves(*library_, g.id);
+                    if (!result.issues.isEmpty())
+                        message("Some peers are unavailable; local saves remain usable. " + result.issues.join(" "));
+                } catch (const std::exception &e) {
+                    message("Peer sync failed; local saves remain usable. " + QString::fromUtf8(e.what()));
+                }
             }
             if (!applyIncomingSavesBeforePlay(g.id)) return;
         }

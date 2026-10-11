@@ -96,25 +96,32 @@ int main(int argc, char **argv) {
                 for (auto g : lib.games()) std::printf("%s\t%s\t%s\n", qPrintable(g.id), qPrintable(g.name), qPrintable(lib.status(g)));
                 return 0;
             }
-            if (parser.isSet("run") && !parser.isSet("prefix-tool") && !extra &&
+            if (parser.isSet("run") && !parser.isSet("prefix-tool") && !extra && !parser.isSet("peer-checked") &&
                 lib.recoveryIssue(parser.value("run")).isEmpty() &&
                 !lib.supervisorActive(parser.value("run"))) {
                 const auto id = parser.value("run");
-                if (!parser.isSet("peer-checked")) {
+                bool conflict = false;
+                try {
                     const auto refresh = novelty::refreshLinkedPeerSaves(lib, id);
                     for (const auto &issue : refresh.issues)
                         std::fprintf(stderr, "Novelty peer sync: %s\n", qPrintable(issue));
+                    auto candidates = novelty::importedSaveCandidates(lib, id);
+                    if (!candidates.isEmpty()) {
+                        novelty::captureAvailableSaveSnapshot(lib, id, "before peer restore");
+                        candidates = novelty::importedSaveCandidates(lib, id);
+                    }
+                    QList<novelty::ImportedSaveCandidate> newer;
+                    for (const auto &candidate : candidates) {
+                        if (candidate.relation == "conflict") conflict = true;
+                        else if (candidate.relation == "ahead" || candidate.relation == "available") newer.append(candidate);
+                    }
+                    conflict = conflict || newer.size() > 1;
+                    if (!conflict && newer.size() == 1) novelty::restoreSaveSnapshot(lib, id, newer.first().snapshotId);
+                } catch (const std::exception &e) {
+                    std::fprintf(stderr, "Novelty peer sync failed; keeping local saves: %s\n", e.what());
                 }
-                const auto candidates = novelty::importedSaveCandidates(lib, id);
-                QList<novelty::ImportedSaveCandidate> newer;
-                bool conflict = false;
-                for (const auto &candidate : candidates) {
-                    if (candidate.relation == "conflict") conflict = true;
-                    else if (candidate.relation == "ahead" || candidate.relation == "available") newer.append(candidate);
-                }
-                if (conflict || newer.size() > 1)
+                if (conflict)
                     throw std::runtime_error("Paired-device saves conflict. Open Novelty → Manage → Saves to choose a copy before Play.");
-                if (newer.size() == 1) novelty::restoreSaveSnapshot(lib, id, newer.first().snapshotId);
             }
             return novelty::supervise(lib, parser.value(parser.isSet("install") ? "install" : parser.isSet("prepare") ? "prepare" : "run"), parser.isSet("prepare"), parser.value("prefix-tool"), extra, parser.isSet("install"), parser.isSet("debug-wine"));
         }

@@ -6,6 +6,7 @@
 #include <QtCore/qfile.h>
 #include <QtCore/qhash.h>
 #include <QtCore/qjsonarray.h>
+#include <QtCore/qlockfile.h>
 #include <QtCore/qset.h>
 #include <QtCore/qtimer.h>
 #include <future>
@@ -21,8 +22,11 @@ public:
     LanGameExchange(Library &, LanConnection &, LanSaveExchange &, QObject *parent = nullptr);
     ~LanGameExchange() override;
     void catalogue();
+    void preview(const QString &profileGameId);
     void install(const QJsonObject &descriptor);
     std::function<void(const QJsonArray &)> onCatalogue;
+    std::function<void(const QString &, const QJsonObject &)> onPreview;
+    std::function<QJsonObject(const QString &)> previewData;
     std::function<void(qint64, qint64)> onProgress;
     std::function<void(const QString &)> onInstalled;
     std::function<void(const QString &)> onError;
@@ -46,6 +50,7 @@ private:
     LanSaveExchange &router_;
     QTimer timeout_, manifestPoll_, resumePoll_;
     QString requestId_, remoteGameId_, stage_, sendingFolder_, sendingRequest_;
+    QString previewId_;
     QJsonObject descriptor_;
     QJsonObject sendingDescriptor_;
     QList<Entry> entries_, sendingEntries_;
@@ -65,6 +70,7 @@ private:
     std::future<QPair<QList<Entry>, qint64>> manifestFuture_;
     std::jthread resumeWorker_;
     std::future<QSet<QString>> resumeFuture_;
+    std::shared_ptr<QLockFile> sendingGameLock_;
 };
 
 // Validate the complete untrusted manifest before creating or fetching files.

@@ -2,10 +2,13 @@
 #include "provisioning.h"
 #include "metadata.h"
 #include "saves.h"
+#include "devices.h"
+#include "sync_queue.h"
 #include <QtWidgets/qapplication.h>
 #include <QtWidgets/qdialog.h>
 #include <QtWidgets/qdialogbuttonbox.h>
 #include <QtWidgets/qlabel.h>
+#include <QtWidgets/qmessagebox.h>
 #include <QtWidgets/qlineedit.h>
 #include <QtWidgets/qlistwidget.h>
 #include <QtWidgets/qlistview.h>
@@ -240,6 +243,24 @@ int main(int argc, char **argv) {
             table->setCurrentIndex(table->model()->index(row, 0)); selected = true; break;
         }
         require(selected, "First Play game missing from the library");
+        bool rejectedInvalidSave = false;
+        QTimer::singleShot(0, &firstPlay, [&] {
+            auto dialog = firstPlay.findChild<QDialog *>("manageDialog");
+            auto name = dialog->findChild<QLineEdit *>("gameName");
+            auto location = dialog->findChild<QLineEdit *>("saveLocation");
+            auto buttons = dialog->findChild<QDialogButtonBox *>();
+            name->clear(); location->setText("UserData"); location->setModified(true);
+            QTimer::singleShot(0, dialog, [&] {
+                auto warning = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+                if (warning) { rejectedInvalidSave = warning->windowTitle() == "Cannot save"; warning->accept(); }
+            });
+            buttons->button(QDialogButtonBox::Save)->click();
+            buttons->button(QDialogButtonBox::Cancel)->click();
+        });
+        firstPlay.manage();
+        require(rejectedInvalidSave && loadSaveConfig(library, firstPlayGame.id).mappings.isEmpty() &&
+                library.game(firstPlayGame.id).name == "First Play",
+                "failed Manage Save followed by Cancel must leave mappings and game settings unchanged");
         bool savedSimplePath = false;
         QTimer::singleShot(0, &firstPlay, [&] {
             auto dialog = firstPlay.findChild<QDialog *>("manageDialog");
@@ -301,6 +322,24 @@ int main(int argc, char **argv) {
                 selectedSave.mappings.first().scope == "game" && selectedSave.mappings.first().path == "SaveData" &&
                 selectedSave.discoverySource == "manual",
                 "Saves tab lets the user choose one of multiple detected folders and save it");
+        const auto peerRoot = temporary.path() + "/Offline peer"; QDir().mkpath(peerRoot);
+        Library offlinePeer(peerRoot);
+        const auto peerFingerprint = ensureDeviceIdentity(offlinePeer).fingerprint;
+        approvePairedPeer(library, peerFingerprint, "Offline peer");
+        rememberPeerEndpoint(library, peerFingerprint, "127.0.0.1", 1);
+        const auto aokanaHead = appliedSaveSnapshotId(library, aokanaGame.id);
+        queuePeerSync(library, aokanaGame.id, aokanaHead);
+        const auto headPath = library.gamePath(aokanaGame.id, "save-head.json");
+        const auto intactHead = readJson(headPath);
+        touch(headPath, "damaged snapshot pointer");
+        candidateWindow.syncPendingPeers();
+        bool preservedPendingSync = pendingPeerSync(library).size() == 1;
+        QFile::remove(headPath); candidateWindow.syncPendingPeers();
+        preservedPendingSync &= pendingPeerSync(library).size() == 1;
+        writeJson(headPath, intactHead);
+        acknowledgePeerSync(library, peerFingerprint, aokanaGame.id, aokanaHead);
+        revokePeer(library, peerFingerprint);
+        require(preservedPendingSync, "a save-head read error must not discard pending peer work");
         candidateWindow.close();
         firstPlay.launch();
         deadline.restart();

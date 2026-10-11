@@ -28,6 +28,13 @@ public:
     void close();
     bool ready() const { return ready_; }
     QString peerFingerprint() const { return peerFingerprint_; }
+    void setServicePort(quint16 port) { servicePort_ = port; }
+    void usePairingCode(const QString &deviceName) { codePairing_ = true; deviceName_ = deviceName.left(80).trimmed(); }
+    bool submitPairingCode(const QString &code);
+    QString peerName() const { return remoteName_; }
+    QString pairingCode() const { return pairingCode_; }
+    std::function<void()> onEndpoint;
+    std::function<void()> onRemoteApproval;
     PhraseCallback onPhrase;
     ReadyCallback onReady;
     MessageCallback onMessage;
@@ -39,12 +46,18 @@ private:
     void read();
     void process(const QJsonObject &);
     void finishPairing();
+    void showVerification();
     void fail(const QString &);
     Library &library_;
     QSslSocket socket_;
     QTimer timeout_;
     QByteArray input_, localNonce_, remoteNonce_;
+    QByteArray remoteCommitment_;
     QString peerFingerprint_, pendingPeerName_;
+    QString deviceName_, remoteName_, pairingCode_;
+    bool codePairing_ = false, outgoing_ = false, codeVerified_ = false;
+    int codeAttempts_ = 0;
+    quint16 servicePort_ = 0;
     bool pairing_ = false, encrypted_ = false, ready_ = false;
     bool helloReceived_ = false, localApproved_ = false, remoteApproved_ = false, failed_ = false;
 };

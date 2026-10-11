@@ -62,6 +62,9 @@ void testLanGameManifest() {
     broken = valid; broken[1].sha256 = "invalid";
     rejects([&] { validateLanGameManifest(descriptor, broken, 4); }, "LAN manifest rejects unverified file");
     rejects([&] { validateLanGameManifest(descriptor, valid, 5); }, "LAN manifest rejects byte mismatch");
+    broken = valid; broken.append({"saves", true, 0, {}});
+    broken.append({"saves/slot.sav", false, 4, QString(64, QLatin1Char('a'))});
+    rejects([&] { validateLanGameManifest(descriptor, broken, 8); }, "LAN game manifest cannot deliver mapped saves as installation files");
     auto unsafeDescriptor = descriptor;
     unsafeDescriptor["mappings"] = QJsonArray{QJsonObject{{"scope", "game"}, {"path", "../escape"}}};
     rejects([&] { validateLanGameManifest(unsafeDescriptor, valid, 4); }, "LAN install rejects unsafe save mapping before import");
@@ -94,6 +97,11 @@ void testLanGameManifest() {
     require(protectedManifest.contains("game.exe") && protectedManifest.contains("assets/background.bin") &&
             !protectedManifest.contains("UserData") && !protectedManifest.contains("UserData/slot.sav"),
             "confirmed game-local saves are excluded while game assets remain transferable");
+    transferConfig = loadSaveConfig(transfer, transferGame.id);
+    transferConfig.discoveryState = "searching"; // A supported older configuration can retain mappings while searching.
+    saveSaveConfig(transfer, transferGame.id, transferConfig);
+    require(!paths(previewLanGameManifest(transfer, transferGame.id)).contains("UserData/slot.sav"),
+            "existing mappings remain protected regardless of discovery status");
     require(captureAvailableSaveSnapshot(transfer, transferGame.id, "before game transfer") &&
             listSaveSnapshots(transfer, transferGame.id).size() == 1,
             "peer game transfer captures existing progress before excluding its save folder");

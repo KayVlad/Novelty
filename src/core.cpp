@@ -208,6 +208,7 @@ QList<Candidate> discover(const QString &root) {
     QDir d(root);
     for (auto f : d.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks, QDir::Name)) {
         if (f.fileName().startsWith('.')) continue;
+        if (QFileInfo::exists(f.absoluteFilePath() + "/.novelty-transfer.json")) continue;
         auto c = inspect(f.absoluteFilePath());
         if (!c.executables.isEmpty()) out.append(c);
     }
@@ -222,6 +223,7 @@ DiscoverySnapshot scanDiscovery(const QString &root, const QStringList &knownFol
     for (const auto &folder : QDir(root).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks, QDir::Name)) {
         if (folder.fileName().startsWith('.')) continue;
         const auto path = canonicalPath(folder.absoluteFilePath());
+        if (QFileInfo::exists(path + "/.novelty-transfer.json")) continue;
         result.folderIdentities.insert(path, folderIdentity(path));
         if (knownFolders.contains(path)) { result.watchDirectories.append(path); continue; }
         auto candidate = inspect(path);
@@ -322,20 +324,82 @@ Game Library::game(const QString &id) const {
     if (!q.next()) fail("Game not found: " + id);
     return Game::fromJson(QJsonDocument::fromJson(q.value(0).toByteArray()).object());
 }
-void Library::save(Game g) {
+void Library::save(Game g, const SaveConfig *saveConfig) {
     const bool creating = g.id.isEmpty();
     if (g.id.isEmpty()) g.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     if (!safeId(g.id) || g.name.trimmed().isEmpty()) fail("A game needs a valid ID and name.");
     if (g.backend == "umu") resolveSetupProfile(g);
     QLockFile mutation(dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
-    if (!mutation.tryLock()) fail("Library maintenance is in progress. Retry saving shortly.");
+    if (!mutation.tryLock(saveConfig ? 2000 : 0)) fail("Library maintenance is in progress. Retry saving shortly.");
     if (!creating) game(g.id); // A stale Manage window must not recreate a removed installation.
     if (busy(g.id)) fail("Wait until the game's launch or preparation finishes before editing it.");
+    if (!QDir().mkpath(QFileInfo(gamePath(g.id, "launch.lock")).absolutePath())) fail("Cannot lock game settings.");
+    QLockFile launch(gamePath(g.id, "launch.lock")); launch.setStaleLockTime(0);
+    if (!launch.tryLock() || !recoveryIssue(g.id).isEmpty()) fail("This game is busy. Retry saving shortly.");
     if (!g.runner.isEmpty()) g.runnerRevision = runnerVersion(g.runner);
     g.folder = canonicalPath(g.folder);
     if (g.folderIdentity.isEmpty()) g.folderIdentity = folderIdentity(g.folder);
     g.source = "manual";
-    store(g);
+    if (!saveConfig) { store(g); return; }
+    if (creating) fail("Create the game before configuring its saves.");
+    if (!pendingSaveSnapshotIssue(*this, g.id).isEmpty()) fail("Finish the pending post-play snapshot before editing save mappings.");
+    const auto before = game(g.id);
+    const auto config = validatedSaveConfig(*this, g, *saveConfig);
+    sql(db_, "BEGIN IMMEDIATE");
+    try {
+        store(g);
+        if (before.json() != g.json()) stageSaveConfig(before, g, config);
+        sql(db_, "COMMIT");
+    } catch (...) {
+        db_.rollback();
+        try { recoverSettingsChange(g.id); } catch (...) { /* Keep the journal and block edits until Rescan. */ }
+        throw;
+    }
+    if (before.json() == g.json()) writeJson(gamePath(g.id, "saves.json"), config);
+    else QFile::remove(gamePath(g.id, "settings-change.json"));
+}
+void Library::stageSaveConfig(const Game &before, const Game &after, const QJsonObject &config) {
+    const auto path = gamePath(after.id, "saves.json");
+    // SQLite decides the outcome. If killed before COMMIT, recovery restores the old JSON;
+    // after COMMIT it retains the new JSON. The game records must differ for this journal.
+    writeJson(gamePath(after.id, "settings-change.json"), {{"schema", 1},
+        {"before_game", before.json()}, {"after_game", after.json()},
+        {"had_config", QFileInfo::exists(path)}, {"before_config", readJson(path)}, {"after_config", config}});
+    writeJson(path, config);
+}
+void Library::recoverSettingsChange(const QString &id) {
+    const auto path = gamePath(id, "settings-change.json");
+    if (!QFileInfo::exists(path)) return;
+    const auto journal = readJson(path);
+    const auto before = journal["before_game"].toObject(), after = journal["after_game"].toObject();
+    const auto current = game(id).json();
+    if (journal["schema"] != 1 || before["id"] != id || after["id"] != id || before == after ||
+        !journal["before_config"].isObject() || !journal["after_config"].isObject() ||
+        (current != before && current != after)) fail("Settings recovery needs review; the game changed after an interrupted update.");
+    const auto configPath = gamePath(id, "saves.json");
+    if (current == before && !journal["had_config"].toBool()) {
+        if (QFileInfo::exists(configPath) && !QFile::remove(configPath)) fail("Cannot undo interrupted save settings.");
+    } else {
+        const auto desired = journal[current == after ? "after_config" : "before_config"].toObject();
+        if (readJson(configPath) != desired) writeJson(configPath, desired);
+    }
+    if (!QFile::remove(path)) fail("Cannot clear settings recovery journal. Use Rescan to retry.");
+}
+QStringList Library::recoverSettingsChanges() {
+    QStringList messages;
+    auto pending = games();
+    pending.removeIf([&](const Game &g) { return !QFileInfo::exists(gamePath(g.id, "settings-change.json")); });
+    if (pending.isEmpty()) return messages;
+    QLockFile mutation(dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
+    if (!mutation.tryLock()) return messages;
+    for (const auto &g : pending) {
+        if (!QFileInfo::exists(gamePath(g.id, "settings-change.json"))) continue;
+        QLockFile launch(gamePath(g.id, "launch.lock")); launch.setStaleLockTime(0);
+        if (!launch.tryLock()) continue;
+        try { recoverSettingsChange(g.id); messages.append("Recovered settings for " + g.name + "."); }
+        catch (const std::exception &e) { messages.append(QString::fromUtf8(e.what())); }
+    }
+    return messages;
 }
 Game Library::selectExecutable(const QString &id, const QString &chosen) {
     QLockFile mutation(dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
@@ -431,9 +495,20 @@ void Library::relink(const RelinkPlan &plan) {
             QSqlQuery remove(db_); remove.prepare("DELETE FROM games WHERE id=?"); remove.addBindValue(plan.duplicateId); check(remove);
         }
         store(g);
+        const auto previousName = QFileInfo(plan.original.folder).fileName();
+        if (normalizedSaveGameName(previousName) != normalizedSaveGameName(QFileInfo(g.folder).fileName())) {
+            auto config = loadSaveConfig(*this, id);
+            config.folderAliases.removeAll(previousName); config.folderAliases.prepend(previousName);
+            while (config.folderAliases.size() > 8) config.folderAliases.removeLast();
+            stageSaveConfig(plan.original, g, validatedSaveConfig(*this, g, config));
+        }
         sql(db_, "COMMIT");
-    } catch (...) { db_.rollback(); throw; }
-    recordSaveFolderRename(*this, id, QFileInfo(plan.original.folder).fileName());
+    } catch (...) {
+        db_.rollback();
+        try { recoverSettingsChange(id); } catch (...) { /* Recover before the next edit or Play. */ }
+        throw;
+    }
+    QFile::remove(gamePath(id, "settings-change.json"));
     if (duplicateLock) { duplicateLock->unlock(); QDir().rmdir(duplicateDirectory); }
 }
 int Library::reconcileFolders(const DiscoverySnapshot &snapshot) {
@@ -488,6 +563,8 @@ bool Library::busy(const QString &id) const {
     return supervisorActive(id) || !recoveryIssue(id).isEmpty();
 }
 QString Library::recoveryIssue(const QString &id) const {
+    if (QFileInfo::exists(gamePath(id, "settings-change.json")))
+        return "An interrupted settings change needs recovery. Use Rescan before Play.";
     const auto removal = removalRecoveryIssue(id);
     if (!removal.isEmpty()) return removal;
     const auto saves = saveRestoreIssue(*this, id);
@@ -514,7 +591,9 @@ QString Library::status(const Game &g) const {
     const auto last = readJson(gamePath(g.id, "status.json"));
     if (last["state"].toString() == "Needs attention") return "Needs attention";
     if (QStringList{"Preparing", "Running", "Starting", "Configuring"}.contains(last["state"].toString())) return "Interrupted";
+    if (last["state"] == "Save needs attention" || !pendingSaveSnapshotIssue(*this, g.id).isEmpty()) return "Save needs attention";
     if (g.installPending) return "Installation pending";
+    if (QFileInfo::exists(g.folder + "/.novelty-transfer.json")) return "Transfer incomplete";
     if (g.backend == "steam") return g.steamId.isEmpty() ? "Needs Steam shortcut" : "Steam shortcut";
     if (!findSetupProfile(g.setupProfile)) return "Choose setup profile";
     if (g.executable.isEmpty()) return "Choose executable";

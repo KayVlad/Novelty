@@ -33,6 +33,7 @@ QProcessEnvironment externalToolEnvironment() {
     return environment;
 }
 Command launchCommand(const Library &lib, const Game &g, bool prepare) {
+    if (QFileInfo::exists(g.folder + "/.novelty-transfer.json")) fail("This LAN installation is incomplete. Retry its transfer before Play.");
     if (g.installPending && !prepare) fail("Finish installation in Manage before using Play.");
     const auto pathIssue = launchPathIssue(g);
     if (!pathIssue.isEmpty()) fail(pathIssue);
@@ -231,20 +232,21 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
         lib.recordStatus(id, extra || !tool.isEmpty() ? "Configuring" : "Running",
             extra ? "Running another executable" : debugWine ? "Wine debug enabled for this launch" : tool.isEmpty() ? QString() : "Prefix tool: " + tool);
         const bool ordinaryPlay = !extra && tool.isEmpty();
+        QString discoveryIssue, snapshotIssue;
         if (ordinaryPlay) {
             try { finishPostExitSaveSnapshot(lib, g); }
-            catch (const std::exception &e) { log.write(("Earlier save snapshot pending: " + QString::fromUtf8(e.what()) + "\n").toUtf8()); }
+            catch (const std::exception &e) { snapshotIssue = QString::fromUtf8(e.what()); log.write(("Earlier save snapshot pending: " + snapshotIssue + "\n").toUtf8()); }
             try { beginSaveObservation(lib, g); }
-            catch (const std::exception &e) { log.write(("Save discovery needs attention: " + QString::fromUtf8(e.what()) + "\n").toUtf8()); }
+            catch (const std::exception &e) { discoveryIssue = QString::fromUtf8(e.what()); log.write(("Save discovery needs attention: " + discoveryIssue + "\n").toUtf8()); }
             try { queuePostExitSaveSnapshot(lib, g); }
-            catch (const std::exception &e) { log.write(("Save snapshot needs attention: " + QString::fromUtf8(e.what()) + "\n").toUtf8()); }
+            catch (const std::exception &e) { snapshotIssue = QString::fromUtf8(e.what()); log.write(("Save snapshot needs attention: " + snapshotIssue + "\n").toUtf8()); }
         }
         const auto finishSaves = [&] {
             if (!ordinaryPlay) return;
-            try { finishSaveObservation(lib, g); }
-            catch (const std::exception &e) { log.write(("Save discovery needs attention: " + QString::fromUtf8(e.what()) + "\n").toUtf8()); }
-            try { queuePostExitSaveSnapshot(lib, g); finishPostExitSaveSnapshot(lib, g); }
-            catch (const std::exception &e) { log.write(("Save snapshot pending: " + QString::fromUtf8(e.what()) + "\n").toUtf8()); }
+            try { finishSaveObservation(lib, g); discoveryIssue.clear(); }
+            catch (const std::exception &e) { discoveryIssue = QString::fromUtf8(e.what()); log.write(("Save discovery needs attention: " + discoveryIssue + "\n").toUtf8()); }
+            try { queuePostExitSaveSnapshot(lib, g); finishPostExitSaveSnapshot(lib, g); snapshotIssue.clear(); }
+            catch (const std::exception &e) { snapshotIssue = QString::fromUtf8(e.what()); log.write(("Save snapshot pending: " + snapshotIssue + "\n").toUtf8()); }
         };
         int result = 0;
         try { result = executeTracked(lib, id, cmd, log); }
@@ -259,6 +261,13 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
         if (installing) {
             // A completed operation remains durable if detection fails or the process dies here.
             operation = {}; lib.finishInstallation(id); return 0;
+        }
+        if (!discoveryIssue.isEmpty() || !snapshotIssue.isEmpty()) {
+            QStringList issues;
+            if (!discoveryIssue.isEmpty()) issues.append(discoveryIssue);
+            if (!snapshotIssue.isEmpty() && snapshotIssue != discoveryIssue) issues.append(snapshotIssue);
+            lib.recordStatus(id, "Save needs attention", "Progress was not backed up: " + issues.join(" "));
+            return 0; // Backup failure must not turn a successful offline Play into a launch failure.
         }
         lib.recordStatus(id, "Ready", extra ? "Executable closed. The game's saved launch settings are unchanged." :
             tool.isEmpty() ? QString() : tool + " closed. Changes made in the tool stay in this game's prefix."); return 0;
