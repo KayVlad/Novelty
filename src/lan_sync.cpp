@@ -1,0 +1,115 @@
+#include "lan_sync.h"
+#include "devices.h"
+#include "lan_connection.h"
+#include "lan_saves.h"
+#include "saves.h"
+#include <QtCore/qeventloop.h>
+#include <QtCore/qset.h>
+#include <QtCore/qtimer.h>
+#include <QtCore/quuid.h>
+#include <stdexcept>
+
+namespace novelty {
+
+PeerRefreshResult refreshLinkedPeerSaves(Library &library, const QString &gameId,
+                                         int connectTimeoutMs) {
+    if (connectTimeoutMs < 100 || connectTimeoutMs > 30000)
+        throw std::runtime_error("Invalid peer connection timeout.");
+    if (library.busy(gameId)) throw std::runtime_error("Wait for the game to finish before checking peer saves.");
+    const auto config = loadSaveConfig(library, gameId);
+    PeerRefreshResult result;
+    if (config.gameIdentity.isEmpty() || config.releaseIdentity.isEmpty() ||
+        config.saveCompatibility.isEmpty() || config.mappings.isEmpty()) return result;
+    const auto peers = trustedPeers(library);
+    for (const auto &peer : peers) {
+        QString linkedId;
+        for (const auto &link : config.peerLinks)
+            if (link.fingerprint == peer.fingerprint) { linkedId = link.profileGameId; break; }
+        if (linkedId.isEmpty()) linkedId = config.profileGameId;
+        if (peer.address.isEmpty() || peer.port == 0) continue;
+        ++result.peersChecked;
+        QEventLoop loop;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        QString issue;
+        bool complete = false;
+        QStringList remaining;
+        const auto finish = [&](const QString &message = {}) {
+            if (complete) return;
+            complete = true; issue = message; loop.quit();
+        };
+        QObject::connect(&timeout, &QTimer::timeout, &loop,
+                         [&] { finish("Peer save check timed out."); });
+        LanConnection connection(library, false);
+        connection.onError = [&](const QString &message) { finish(message); };
+        connection.onReady = [&](const QString &fingerprint) {
+            if (fingerprint != peer.fingerprint) { finish("Peer identity changed."); return; }
+            try {
+                auto exchange = new LanSaveExchange(library, connection, &connection);
+                exchange->onError = [&](const QString &message) { finish(message); };
+                exchange->onProgress = [&](qint64, qint64) { timeout.start(120000); };
+                const auto fetchNext = [&, exchange] {
+                    if (remaining.isEmpty()) { finish(); return; }
+                    try {
+                        timeout.start(120000);
+                        exchange->fetch(gameId, linkedId, remaining.first());
+                    } catch (const std::exception &e) { finish(QString::fromUtf8(e.what())); }
+                };
+                exchange->onMatches = [&, fetchNext](const QJsonArray &matches) {
+                    QJsonObject match;
+                    for (const auto &value : matches) {
+                        const auto item = value.toObject();
+                        if (item["profile_game_id"].toString() == linkedId) {
+                            if (!match.isEmpty()) { finish("Peer reported duplicate game identities."); return; }
+                            match = item;
+                        }
+                    }
+                    const auto snapshotId = match["snapshot_id"].toString();
+                    if (snapshotId.isEmpty() || snapshotId == appliedSaveSnapshotId(library, gameId)) {
+                        finish(); return;
+                    }
+                    try {
+                        QStringList history;
+                        const auto advertised = match["snapshot_ids"].toArray();
+                        if (advertised.size() > 64) throw std::runtime_error("Peer save history is too long.");
+                        QSet<QString> seen;
+                        for (const auto &value : advertised) {
+                            const auto id = value.toString();
+                            if (QUuid(id).isNull() || seen.contains(id))
+                                throw std::runtime_error("Peer save history is invalid.");
+                            seen.insert(id); history.append(id);
+                        }
+                        if (history.isEmpty()) history.append(snapshotId);
+                        if (history.last() != snapshotId)
+                            throw std::runtime_error("Peer save head does not match its history.");
+                        QSet<QString> known;
+                        for (const auto &snapshot : listSaveSnapshots(library, gameId)) known.insert(snapshot.id);
+                        remaining.clear();
+                        for (const auto &id : history) {
+                            if (known.contains(id)) verifiedSaveSnapshotBundle(library, gameId, id);
+                            else remaining.append(id);
+                        }
+                        fetchNext();
+                    } catch (const std::exception &e) { finish(QString::fromUtf8(e.what())); }
+                };
+                exchange->onImported = [&, fetchNext](const SaveImportResult &imported) {
+                    if (remaining.isEmpty() || imported.snapshotId != remaining.first()) {
+                        finish("Peer sent an unexpected save snapshot."); return;
+                    }
+                    remaining.removeFirst();
+                    if (imported.added) ++result.snapshotsImported;
+                    fetchNext();
+                };
+                exchange->locate(config);
+            } catch (const std::exception &e) { finish(QString::fromUtf8(e.what())); }
+        };
+        timeout.start(connectTimeoutMs);
+        connection.connectTo(peer.address, peer.port);
+        if (!complete) loop.exec();
+        timeout.stop(); connection.close();
+        if (!issue.isEmpty()) result.issues.append(peer.name + ": " + issue);
+    }
+    return result;
+}
+
+} // namespace novelty
