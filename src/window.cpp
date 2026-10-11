@@ -103,6 +103,23 @@ QStringList localLanAddresses() {
     addresses.removeDuplicates();
     return addresses;
 }
+struct SetupHint { bool pending = false; QString message; };
+SetupHint setupHint(const Library &lib, const Game &game, const QString &status) {
+    // Active and failure states should retain their more urgent status colour.
+    if (QStringList{"Unavailable", "Folder changed", "Path needs rename", "Recovery required",
+                    "Needs attention", "Interrupted", "Starting", "Preparing", "Configuring", "Running"}.contains(status)) return {};
+    QStringList messages;
+    if (game.executable.isEmpty())
+        messages.append(game.installPending ? "Choose a game executable after installation finishes." :
+                        "No executable selected yet. Choose one on Play or in Manage → Overview.");
+    try {
+        if (loadSaveConfig(lib, game.id).mappings.isEmpty())
+            messages.append("No save folder found yet. Novelty checks again after Play; choose one in Manage → Saves if needed.");
+    } catch (const std::exception &) {
+        messages.append("Save settings need review in Manage → Saves.");
+    }
+    return {!messages.isEmpty(), messages.join(" ")};
+}
 }
 QVariant GameModel::data(const QModelIndex &i, int role) const {
     if (!i.isValid() || i.row() < 0 || i.row() >= games.size() || i.column() < 0 || i.column() >= 3) return {};
@@ -111,8 +128,11 @@ QVariant GameModel::data(const QModelIndex &i, int role) const {
         switch (i.column()) { case 0: return g.name; case 1: return g.engine; default: return states.value(i.row()); }
     }
     if (role == Qt::TextAlignmentRole) return int(Qt::AlignLeft | Qt::AlignVCenter);
+    if (role == Qt::ForegroundRole && i.column() == 2)
+        return statusColor(states.value(i.row()), setupPending.value(i.row()));
     if (role == EngineRole) return g.engine;
     if (role == StatusRole) return states.value(i.row());
+    if (role == SetupPendingRole) return setupPending.value(i.row());
     if (role == LaunchableRole) return actionsAllowed && launchable.value(i.row());
     if (role == ManageableRole) return actionsAllowed && manageable.value(i.row());
     if (role == CoverRole) return games[i.row()].metadata.isEmpty() ? QString() :
@@ -125,9 +145,10 @@ QVariant GameModel::headerData(int section, Qt::Orientation o, int role) const {
     return {};
 }
 void GameModel::load(const Library &lib) {
-    beginResetModel(); games = lib.games(); coverDataRoot = lib.dataRoot(); states.clear(); launchable.clear(); manageable.clear();
+    beginResetModel(); games = lib.games(); coverDataRoot = lib.dataRoot(); states.clear(); launchable.clear(); manageable.clear(); setupPending.clear();
     for (const auto &g : games) {
-        states.append(lib.status(g));
+        const auto state = lib.status(g);
+        states.append(state); setupPending.append(setupHint(lib, g, state).pending);
         const bool available = !lib.busy(g.id);
         manageable.append(available);
         launchable.append(available && !g.installPending && QFileInfo(g.folder).isDir() &&
@@ -136,19 +157,22 @@ void GameModel::load(const Library &lib) {
     endResetModel();
 }
 void GameModel::unavailable() {
-    beginResetModel(); states.clear(); launchable.clear(); manageable.clear();
-    for (qsizetype row = 0; row < games.size(); ++row) states.append("Unavailable");
+    beginResetModel(); states.clear(); launchable.clear(); manageable.clear(); setupPending.clear();
+    for (qsizetype row = 0; row < games.size(); ++row) { states.append("Unavailable"); setupPending.append(false); }
     endResetModel();
 }
 bool GameModel::updateState(const Library &lib, const QString &id) {
     for (int row = 0; row < games.size(); ++row) if (games[row].id == id) {
         const auto state = lib.status(games[row]);
+        const bool pendingSetup = setupHint(lib, games[row], state).pending;
         const bool canManage = !lib.busy(id);
         const bool canLaunch = canManage && !games[row].installPending && QFileInfo(games[row].folder).isDir() &&
                                (games[row].executable.isEmpty() || QFileInfo(games[row].executable).isFile());
-        if (states.value(row) == state && manageable.value(row) == canManage && launchable.value(row) == canLaunch) return false;
-        states[row] = state; manageable[row] = canManage; launchable[row] = canLaunch;
-        emit dataChanged(index(row, 0), index(row, 2), {Qt::DisplayRole, StatusRole, LaunchableRole, ManageableRole});
+        if (states.value(row) == state && setupPending.value(row) == pendingSetup &&
+            manageable.value(row) == canManage && launchable.value(row) == canLaunch) return false;
+        states[row] = state; setupPending[row] = pendingSetup; manageable[row] = canManage; launchable[row] = canLaunch;
+        emit dataChanged(index(row, 0), index(row, 2), {Qt::DisplayRole, Qt::ForegroundRole,
+                         StatusRole, SetupPendingRole, LaunchableRole, ManageableRole});
         return true;
     }
     return false;
@@ -227,6 +251,8 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
     originalTitle_ = new QLabel(content); originalTitle_->setObjectName("gameOriginalTitle"); originalTitle_->setWordWrap(true);
     originalTitle_->setTextFormat(Qt::PlainText); originalTitle_->setProperty("muted", true); originalTitle_->hide(); info->addWidget(originalTitle_);
     status_ = new QLabel(content); status_->setObjectName("gameStatus"); info->addWidget(status_);
+    setupState_ = new QLabel(content); setupState_->setObjectName("gameSetupStatus");
+    setupState_->setWordWrap(true); setupState_->setTextFormat(Qt::PlainText); setupState_->hide(); info->addWidget(setupState_);
     syncState_ = new QLabel(content); syncState_->setObjectName("gameSyncStatus");
     syncState_->setWordWrap(true); syncState_->setTextFormat(Qt::PlainText); info->addWidget(syncState_);
     description_ = new QLabel("No description yet.", content); description_->setObjectName("gameDescription"); description_->setWordWrap(true); description_->setTextFormat(Qt::PlainText); info->addWidget(description_);
@@ -242,6 +268,7 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
         QLabel { background: transparent; }
         QLabel[muted="true"], QLabel#libraryNotice, QLabel#gameDescription { color: #9eafc5; font-size: 13px; }
         QLabel#gameOriginalTitle { color: #9eafc5; font-size: 12px; }
+        QLabel#gameSetupStatus { color: #8dcfff; font-size: 13px; }
         QLabel#brand { font-size: 27px; font-weight: bold; }
         QLabel#gameTitle { font-size: 25px; font-weight: bold; }
         QWidget#detailPanel { background: #122237; border: 1px solid #263b55; border-radius: 9px; }
@@ -565,7 +592,9 @@ void Window::selectGame() {
         title_->setText(g.name); const auto state = accessible ? library_->status(g) : "Unavailable";
         originalTitle_->setText(g.metadata["original_title"].toString());
         originalTitle_->setVisible(!originalTitle_->text().isEmpty());
-        status_->setText("●  " + state); status_->setStyleSheet("color: " + statusColor(state).name() + "; font-size: 13px;");
+        const auto setup = accessible ? setupHint(*library_, g, state) : SetupHint{};
+        status_->setText("●  " + state); status_->setStyleSheet("color: " + statusColor(state, setup.pending).name() + "; font-size: 13px;");
+        setupState_->setText(setup.message); setupState_->setVisible(setup.pending);
         syncState_->clear();
         if (accessible) try {
             int pending = 0; bool ahead = false, conflict = false;
@@ -588,6 +617,7 @@ void Window::selectGame() {
         detail_->setVisible(!detail_->text().isEmpty());
     } else {
         title_->setText("Your next story"); status_->setText("No game selected"); status_->setStyleSheet("color: #9eafc5; font-size: 13px;");
+        setupState_->clear(); setupState_->hide();
         syncState_->clear(); syncState_->hide();
         originalTitle_->hide();
         detail_->setText(!search_->text().isEmpty() ? "No games match your search." : "Choose a Games folder in Settings, or use Add game to select a folder or run an installer."); detail_->show();
@@ -1509,7 +1539,7 @@ void Window::manage() {
     connect(runExtra, &QPushButton::clicked, &d, [this, &d] { runExecutable(&d); });
     runtimeScroll->setWidget(runtimeTab); tabs->addTab(runtimeScroll, "Runtime");
     auto savesTab = new QWidget(&d); auto savesLayout = new QVBoxLayout(savesTab);
-    auto savesIntro = new QLabel("Novelty checks common save folders and captures progress after Play. Choose a path only if it does not find one.", savesTab);
+    auto savesIntro = new QLabel("Novelty checks common save folders and captures progress after Play. If several folders match, select one below and press Save.", savesTab);
     savesIntro->setWordWrap(true); savesLayout->addWidget(savesIntro);
     auto discoveryStatus = new QLabel(savesTab); discoveryStatus->setObjectName("saveDiscoveryStatus");
     discoveryStatus->setWordWrap(true); discoveryStatus->setTextFormat(Qt::PlainText);
@@ -1521,6 +1551,11 @@ void Window::manage() {
     auto browseSave = new QPushButton("Browse…", savesTab);
     mappingRow->addWidget(mappingPath, 1); mappingRow->addWidget(browseSave);
     savesLayout->addLayout(mappingRow);
+    auto candidateLabel = new QLabel("Possible save folders", savesTab);
+    savesLayout->addWidget(candidateLabel);
+    auto saveCandidates = new QListWidget(savesTab); saveCandidates->setObjectName("saveLocationCandidates");
+    saveCandidates->setMaximumHeight(140);
+    savesLayout->addWidget(saveCandidates);
     auto legacyPaths = new QLabel(savesTab); legacyPaths->setWordWrap(true); legacyPaths->setTextFormat(Qt::PlainText);
     savesLayout->addWidget(legacyPaths);
     savesLayout->addWidget(new QLabel("Backup history", savesTab));
@@ -1554,10 +1589,20 @@ void Window::manage() {
                            mapping.scope == "documents" ? "Documents" : "Prefix";
         return QString(scope) + ":/" + mapping.path;
     };
-    auto renderSaveStatus = [this, discoveryStatus, mappingPath, legacyPaths, g, displaySaveLocation] {
+    auto renderSaveStatus = [this, discoveryStatus, mappingPath, candidateLabel, saveCandidates,
+                             legacyPaths, g, displaySaveLocation] {
         const auto config = loadSaveConfig(*library_, g.id);
+        saveCandidates->clear();
+        const auto candidates = config.mappings.isEmpty() ? saveDiscoveryCandidates(*library_, g.id) : QList<SaveMapping>{};
+        const bool needsChoice = candidates.size() > 1;
+        candidateLabel->setVisible(needsChoice);
+        saveCandidates->setVisible(needsChoice);
+        for (const auto &candidate : candidates)
+            if (needsChoice) new QListWidgetItem(displaySaveLocation(candidate), saveCandidates);
         if (config.mappings.isEmpty()) {
-            discoveryStatus->setText("Not found — select a save folder or file. Novelty will check again after Play.");
+            discoveryStatus->setText(needsChoice ?
+                "Multiple possible save folders found. Select one below, then press Save." :
+                "Not found — select a save folder or file. Novelty will check again after Play.");
             legacyPaths->clear();
             return;
         }
@@ -1574,6 +1619,12 @@ void Window::manage() {
     try {
         renderSnapshots(); renderSaveStatus();
     } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
+    connect(saveCandidates, &QListWidget::currentItemChanged, &d, [mappingPath, saveMessage](QListWidgetItem *item) {
+        if (!item) return;
+        mappingPath->setText(item->text());
+        mappingPath->setModified(true);
+        saveMessage->clear();
+    });
     connect(browseSave, &QPushButton::clicked, &d, [&, mappingPath, displaySaveLocation] {
         QMenu choices(&d);
         auto folder = choices.addAction("Select folder…");

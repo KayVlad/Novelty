@@ -187,6 +187,14 @@ int main(int argc, char **argv) {
             throw std::runtime_error("New LAN game did not reconcile its source save history.");
         restoreSaveSnapshot(newDevice, installedId, nextSnapshot.id);
         std::puts("PASS: trusted LAN game install and saved-progress reconciliation");
+        // These callbacks capture local event loops, so destroy the listener's connections first.
+        trustedClient.close(); trustedListener.close();
+        const auto trustedConnections = trustedListener.children();
+        for (auto child : trustedConnections)
+            if (auto connection = dynamic_cast<LanConnection *>(child)) delete connection;
+        const auto pairingConnections = listener.children();
+        for (auto child : pairingConnections)
+            if (auto connection = dynamic_cast<LanConnection *>(child)) delete connection;
     } catch (const std::exception &e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1;
     }

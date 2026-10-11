@@ -36,7 +36,7 @@ public:
     void unavailable();
     QList<Game> games;
     QStringList states;
-    QList<bool> launchable, manageable;
+    QList<bool> launchable, manageable, setupPending;
     QString coverDataRoot;
     bool actionsAllowed = true;
 };
@@ -84,7 +84,7 @@ private:
     GameGrid *grid_;
     QStackedWidget *views_;
     Cover *cover_;
-    QLabel *status_, *syncState_, *description_, *playtimeValue_, *tags_;
+    QLabel *status_, *setupState_, *syncState_, *description_, *playtimeValue_, *tags_;
     QLabel *rootLabel_, *title_, *originalTitle_, *detail_, *notice_;
     QPushButton *scanButton_;
     QAction *listPlay_, *listManage_;

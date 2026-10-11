@@ -320,7 +320,8 @@ QList<SaveMapping> heuristicSaveMappings(const Library &lib, const Game &game) {
                     if (--budget < 0) break;
                     const auto key = saveNameKey(child.fileName());
                     if (QSet<QString>{"cache", "caches", "logs", "temp", "tmp", "shadercache"}.contains(key)) continue;
-                    if (titles.contains(key)) add(child.absoluteFilePath());
+                    if (titles.contains(key))
+                        add(child.absoluteFilePath());
                     else if (depth < 4) self(self, child.absoluteFilePath(), depth + 1);
                 }
             };
@@ -678,6 +679,10 @@ void beginSaveObservation(Library &lib, const Game &game) {
     discoverSavePaths(lib, game);
 }
 void finishSaveObservation(Library &lib, const Game &game) { discoverSavePaths(lib, game); }
+QList<SaveMapping> saveDiscoveryCandidates(const Library &lib, const QString &gameId) {
+    if (!loadSaveConfig(lib, gameId).mappings.isEmpty()) return {};
+    return heuristicSaveMappings(lib, lib.game(gameId));
+}
 QStringList unresolvedGameSaveLocations(const Library &lib, const QString &gameId) {
     const auto game = lib.game(gameId);
     if (!loadSaveConfig(lib, gameId).mappings.isEmpty()) return {};

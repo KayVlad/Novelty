@@ -132,6 +132,13 @@ int main(int argc, char **argv) {
                 games.first().workingDirectory == root + "/Many/Sub", "UI choice did not save executable and cwd");
         auto grid = window.findChild<QListView *>("gameGrid");
         require(grid && grid->currentIndex().data(LaunchableRole).toBool(), "Chosen game did not reach Play");
+        auto setupStatus = window.findChild<QLabel *>("gameSetupStatus");
+        require(setupStatus && setupStatus->isVisible() &&
+                setupStatus->text().contains("No save folder found yet") &&
+                !setupStatus->text().contains("No executable selected yet") &&
+                grid->currentIndex().data(SetupPendingRole).toBool() &&
+                grid->currentIndex().siblingAtColumn(2).data(Qt::ForegroundRole).value<QColor>() == QColor("#8dcfff"),
+                "Missing save folder did not show the light blue setup status and explanation");
         const auto id = games.first().id;
         addFolder(window, missing, {}, true);
         games = library.games();
@@ -139,6 +146,11 @@ int main(int argc, char **argv) {
         Game pending;
         for (const auto &game : games) if (game.name == "No executable") pending = game;
         require(!pending.id.isEmpty() && pending.executable.isEmpty(), "No-candidate game was not left pending");
+        require(setupStatus->isVisible() && setupStatus->text().contains("No executable selected yet") &&
+                setupStatus->text().contains("No save folder found yet") &&
+                grid->currentIndex().data(SetupPendingRole).toBool() &&
+                grid->currentIndex().siblingAtColumn(2).data(Qt::ForegroundRole).value<QColor>() == QColor("#8dcfff"),
+                "Missing executable and save folder did not explain both setup steps");
         touch(pending.folder + "/Manual.EXE");
         require(grid->currentIndex().data(LaunchableRole).toBool(), "Missing executable did not allow first Play selection");
         bool firstPlayPicker = false;
@@ -249,6 +261,47 @@ int main(int argc, char **argv) {
         require(savedSimplePath && loadSaveConfig(library, firstPlayGame.id).mappings.size() == 1 &&
                 loadSaveConfig(library, firstPlayGame.id).mappings.first().path == "UserData",
                 "simple Saves tab persists the one manual path through global Save");
+        const auto aokanaFolder = root + "/Aokana";
+        touch(aokanaFolder + "/Aokana.exe");
+        touch(aokanaFolder + "/SaveData/AoKana001.dat", "saved progress");
+        const auto aokanaGame = library.addFolder(aokanaFolder).game;
+        touch(library.prefix(aokanaGame.id) +
+              "/drive_c/users/steamuser/AppData/LocalLow/NekoNyanSoft/Aokana/output_log.txt", "Unity diagnostics");
+        Window candidateWindow(root, argv[1], QUrl("http://127.0.0.1:1/kana/")); candidateWindow.show();
+        auto candidateTable = candidateWindow.findChild<QTableView *>("gameList");
+        bool candidateSelected = false;
+        for (int row = 0; row < candidateTable->model()->rowCount(); ++row)
+            if (candidateTable->model()->index(row, 0).data().toString() == "Aokana") {
+                candidateTable->setCurrentIndex(candidateTable->model()->index(row, 0));
+                candidateSelected = true; break;
+            }
+        require(candidateSelected, "Aokana candidate fixture missing from the library");
+        bool candidatesShown = false, candidateFilledInput = false;
+        QTimer::singleShot(0, &candidateWindow, [&] {
+            auto dialog = candidateWindow.findChild<QDialog *>("manageDialog");
+            auto candidates = dialog ? dialog->findChild<QListWidget *>("saveLocationCandidates") : nullptr;
+            auto location = dialog ? dialog->findChild<QLineEdit *>("saveLocation") : nullptr;
+            auto status = dialog ? dialog->findChild<QLabel *>("saveDiscoveryStatus") : nullptr;
+            auto tabs = dialog ? dialog->findChild<QTabWidget *>("manageTabs") : nullptr;
+            auto buttons = dialog ? dialog->findChild<QDialogButtonBox *>() : nullptr;
+            if (!candidates || !location || !status || !tabs || !buttons || candidates->count() != 2) {
+                if (dialog) dialog->reject(); return;
+            }
+            tabs->setCurrentWidget(candidates->parentWidget());
+            candidatesShown = candidates->item(0)->text().endsWith("/Aokana/SaveData") &&
+                              candidates->item(1)->text().endsWith("/NekoNyanSoft/Aokana") &&
+                              status->text().contains("Multiple possible save folders") && candidates->isVisible();
+            candidates->setCurrentRow(0);
+            candidateFilledInput = location->text().endsWith("/Aokana/SaveData") && location->isModified();
+            buttons->button(QDialogButtonBox::Save)->click();
+        });
+        candidateWindow.manage();
+        const auto selectedSave = loadSaveConfig(library, aokanaGame.id);
+        require(candidatesShown && candidateFilledInput && selectedSave.mappings.size() == 1 &&
+                selectedSave.mappings.first().scope == "game" && selectedSave.mappings.first().path == "SaveData" &&
+                selectedSave.discoverySource == "manual",
+                "Saves tab lets the user choose one of multiple detected folders and save it");
+        candidateWindow.close();
         firstPlay.launch();
         deadline.restart();
         while (deadline.elapsed() < 8000 && !QFileInfo::exists(library.prefix(firstPlayGame.id) + "/played")) {

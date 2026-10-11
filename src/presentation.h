@@ -19,11 +19,11 @@ struct GameMetadata {
     std::optional<QString> playtime;
     std::optional<QString> lastPlayed;
 };
-enum GameRole { EngineRole = Qt::UserRole + 1, StatusRole, LaunchableRole, ManageableRole, CoverRole };
+enum GameRole { EngineRole = Qt::UserRole + 1, StatusRole, LaunchableRole, ManageableRole, CoverRole, SetupPendingRole };
 QImage cachedCover(const QString &path);
 void invalidateCover(const QString &path);
 QIcon uiIcon(const QString &name);
-QColor statusColor(const QString &status);
+QColor statusColor(const QString &status, bool setupPending = false);
 class Cover : public QWidget {
 public:
     explicit Cover(QWidget *parent = nullptr);

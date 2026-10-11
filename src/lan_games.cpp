@@ -17,10 +17,10 @@ constexpr qint64 maxGameBytes = 512LL * 1024 * 1024 * 1024;
 constexpr int maxGameEntries = 100000;
 constexpr qsizetype chunkBytes = 24 * 1024;
 bool uuid(const QString &id) { return !QUuid(id).isNull() && !id.contains('/'); }
-bool safePath(const QString &path) {
+bool safePath(const QString &path, bool internalPartFile = false) {
     if (path.isEmpty() || path.size() > 1024 || path.startsWith('/') ||
         path.contains('\\') || path.contains(QChar::Null) || QDir::cleanPath(path) != path ||
-        path == ".novelty-transfer.json" || path.endsWith(".novelty-part")) return false;
+        path == ".novelty-transfer.json" || (!internalPartFile && path.endsWith(".novelty-part"))) return false;
     for (const auto &part : path.split('/')) if (part.isEmpty() || part == "." || part == "..") return false;
     return true;
 }
@@ -55,11 +55,11 @@ QByteArray fileHash(const QString &path, std::stop_token stop = {}) {
     }
     return hash.result().toHex();
 }
-void noLinks(const QString &path, const QString &root) {
+void noLinks(const QString &path, const QString &root, bool internalPartFile = false) {
     auto current = root;
     if (QFileInfo(current).isSymbolicLink()) throw std::runtime_error("LAN staging root is a symbolic link.");
     const auto relative = QDir(root).relativeFilePath(path);
-    if (!safePath(relative)) throw std::runtime_error("Unsafe LAN game path.");
+    if (!safePath(relative, internalPartFile)) throw std::runtime_error("Unsafe LAN game path.");
     for (const auto &part : relative.split('/')) {
         current += '/' + part;
         if (QFileInfo(current).isSymbolicLink())
@@ -535,7 +535,7 @@ void LanGameExchange::receiveFileBegin(const QJsonObject &message) {
         message["sha256"].toString() != entry.sha256)
         throw std::runtime_error("Game file does not match the verified manifest.");
     const auto path = stage_ + '/' + entry.path + ".novelty-part";
-    noLinks(path, stage_);
+    noLinks(path, stage_, true);
     if (QFileInfo(path).exists() && (!QFileInfo(path).isFile() || !QFile::remove(path)))
         throw std::runtime_error("Cannot replace incomplete staged game data.");
     currentFile_.setFileName(path);

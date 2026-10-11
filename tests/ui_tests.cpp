@@ -143,7 +143,9 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("Grid card lost its 3:4 aspect ratio");
             const QPoint statusPoint(smallCard.right() - 18, smallCard.bottom() - 27);
             if (!grid->viewport()->rect().contains(statusPoint)) throw std::runtime_error("Card status light escapes smaller window");
-            if (grid->viewport()->grab().toImage().pixelColor(statusPoint) != statusColor(grid->currentIndex().data(StatusRole).toString()))
+            if (grid->viewport()->grab().toImage().pixelColor(statusPoint) !=
+                statusColor(grid->currentIndex().data(StatusRole).toString(),
+                            grid->currentIndex().data(SetupPendingRole).toBool()))
                 throw std::runtime_error("Card status light is not at the bottom right");
             const auto previewDirectory = qEnvironmentVariable("NOVELTY_UI_PREVIEW_DIR");
             if (!previewDirectory.isEmpty()) {

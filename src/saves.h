@@ -39,6 +39,8 @@ struct SaveImportResult { bool added = false; QString relation; QString snapshot
 struct ImportedSaveCandidate { QString snapshotId; QString created; QString relation; };
 
 SaveConfig loadSaveConfig(const Library &, const QString &gameId);
+// Plausible folders for an unmapped game; a choice is needed when more than one exists.
+QList<SaveMapping> saveDiscoveryCandidates(const Library &, const QString &gameId);
 QList<SaveMapping> suggestedSaveMappings(const Library &, const QString &gameId);
 void saveSaveConfig(Library &, const QString &gameId, const SaveConfig &);
 void setSaveDiscoveryState(Library &, const QString &gameId, const QString &state);

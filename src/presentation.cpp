@@ -60,7 +60,8 @@ QImage cachedCover(const QString &path) {
     return image;
 }
 void invalidateCover(const QString &path) { coverCache().remove(path); }
-QColor statusColor(const QString &status) {
+QColor statusColor(const QString &status, bool setupPending) {
+    if (setupPending) return QColor("#8dcfff");
     if (status == "Ready" || status == "Running") return QColor("#83ce9c");
     if (status.contains("attention", Qt::CaseInsensitive) || status.contains("rename", Qt::CaseInsensitive)) return QColor("#dfb676");
     return QColor("#91a3b8");
@@ -114,7 +115,7 @@ void CardDelegate::paint(QPainter *painter, const QStyleOptionViewItem &o, const
     fade.setColorAt(0.7, QColor(5, 15, 29, 205)); fade.setColorAt(1, QColor(5, 15, 29, 250)); p.fillRect(r, fade); p.restore();
     textLine(p, QRect(r.left() + 12, r.bottom() - 65, r.width() - 24, 28), i.data().toString(), QColor("#f0f4fa"), true, 17);
     textLine(p, QRect(r.left() + 12, r.bottom() - 38, r.width() - 48, 22), i.data(EngineRole).toString(), QColor("#a7b9cf"), false, 12);
-    p.setPen(Qt::NoPen); p.setBrush(statusColor(i.data(StatusRole).toString()));
+    p.setPen(Qt::NoPen); p.setBrush(statusColor(i.data(StatusRole).toString(), i.data(SetupPendingRole).toBool()));
     p.drawEllipse(QPointF(r.right() - 18, r.bottom() - 27), 4, 4);
     p.restore();
 }

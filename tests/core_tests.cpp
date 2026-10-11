@@ -53,6 +53,8 @@ void testLanGameManifest() {
     auto broken = valid;
     broken[1].path = "../outside.exe";
     rejects([&] { validateLanGameManifest(descriptor, broken, 4); }, "LAN manifest rejects path traversal");
+    broken = valid; broken[1].path = "bin/game.novelty-part";
+    rejects([&] { validateLanGameManifest(descriptor, broken, 4); }, "LAN manifest rejects internal partial-file names");
     broken = valid; broken.removeFirst();
     rejects([&] { validateLanGameManifest(descriptor, broken, 4); }, "LAN manifest requires declared parent directory");
     broken = valid; broken.append(valid.last());
@@ -521,6 +523,10 @@ void testSaveDiscovery(const QString &base) {
     const auto uncertain = loadSaveConfig(ambiguous, ambiguousGame.id);
     require(uncertain.discoveryState == "searching" && uncertain.mappings.isEmpty(),
             "two conventional save folders require a manual choice");
+    const auto ambiguousCandidates = saveDiscoveryCandidates(ambiguous, ambiguousGame.id);
+    require(ambiguousCandidates.size() == 2 && ambiguousCandidates.first().path == "saves" &&
+            ambiguousCandidates.last().path == "savedata",
+            "both conventional save folders remain available for manual selection");
     auto manual = uncertain; manual.mappings = {{"game", "savedata"}};
     saveSaveConfig(ambiguous, ambiguousGame.id, manual);
     require(loadSaveConfig(ambiguous, ambiguousGame.id).discoveryState == "identified" &&
@@ -537,6 +543,23 @@ void testSaveDiscovery(const QString &base) {
             titleConfig.mappings.first().scope == "appdata" &&
             titleConfig.mappings.first().path == "Publisher/Amairo Chocolata",
             "title-named AppData folder is detected within bounded Wine locations");
+
+    const auto unityRoot = base + "/Unity candidate folders";
+    touch(unityRoot + "/Aokana/Aokana.exe");
+    touch(unityRoot + "/Aokana/SaveData/AoKana001.dat", "saved progress");
+    Library unity(unityRoot); unity.import({inspect(unityRoot + "/Aokana")}, {});
+    const auto unityGame = unity.games().first();
+    const auto prefixTitle = unity.prefix(unityGame.id) +
+        "/drive_c/users/steamuser/AppData/LocalLow/NekoNyanSoft/Aokana";
+    touch(prefixTitle + "/output_log.txt", "Unity diagnostics");
+    beginSaveObservation(unity, unityGame);
+    const auto unityConfig = loadSaveConfig(unity, unityGame.id);
+    const auto unityCandidates = saveDiscoveryCandidates(unity, unityGame.id);
+    require(unityConfig.discoveryState == "searching" && unityConfig.mappings.isEmpty() &&
+            unityCandidates.size() == 2 && unityCandidates.first().scope == "game" &&
+            unityCandidates.first().path == "SaveData" && unityCandidates.last().scope == "prefix" &&
+            unityCandidates.last().path.endsWith("/NekoNyanSoft/Aokana"),
+            "Aokana-style local saves and title-matched Wine folder are both offered for selection");
 
     const auto adjacentRoot = base + "/Executable adjacent saves";
     touch(adjacentRoot + "/Game/bin/game.exe");
