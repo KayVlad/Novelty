@@ -63,6 +63,7 @@ void invalidateCover(const QString &path) { coverCache().remove(path); }
 QColor statusColor(const QString &status, bool setupPending) {
     if (setupPending) return QColor("#8dcfff");
     if (status == "Ready" || status == "Running") return QColor("#83ce9c");
+    if (status == "Sync pending" || status == "Save conflict") return QColor("#dfb676");
     if (status.contains("attention", Qt::CaseInsensitive) || status.contains("rename", Qt::CaseInsensitive)) return QColor("#dfb676");
     return QColor("#91a3b8");
 }

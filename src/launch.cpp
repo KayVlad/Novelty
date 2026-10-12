@@ -3,6 +3,8 @@
 #include "profiles.h"
 #include "runtime.h"
 #include "saves.h"
+#include "save_server_config.h"
+#include "save_server_sync.h"
 #include <QtCore/qdatetime.h>
 #include <QtCore/qdir.h>
 #include <QtCore/qfileinfo.h>
@@ -210,7 +212,34 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
             lib.recordStatus(id, "Preparing");
             preparePrefix(lib, g, [&] { return executeTracked(lib, id, launchCommand(lib, g, true), log); });
         }
-        if (prepareOnly) { lib.recordStatus(id, "Ready"); return 0; }
+        SaveServerConfig saveServer;
+        bool serverMode = false;
+        QString serverSetupIssue;
+        ServerSyncResult beforeSync{ServerSyncStatus::Unavailable, {}};
+        if (!extra && tool.isEmpty()) {
+            try {
+                saveServer = loadSaveServerConfig(lib);
+                serverMode = saveServer.enabled;
+                if (serverMode) {
+                    beforeSync = syncServerBeforePlay(lib, id, saveServer);
+                    if (!beforeSync.detail.isEmpty())
+                        log.write(("Save server before Play: " + beforeSync.detail + "\n").toUtf8());
+                }
+            } catch (const std::exception &error) {
+                serverSetupIssue = QString::fromUtf8(error.what());
+                log.write(("Save server settings need attention: " + serverSetupIssue + "\n").toUtf8());
+            }
+        }
+        if (prepareOnly) {
+            if (serverMode && beforeSync.status == ServerSyncStatus::Conflict)
+                lib.recordStatus(id, "Save conflict", beforeSync.detail);
+            else if (serverMode && beforeSync.status == ServerSyncStatus::Pending)
+                lib.recordStatus(id, "Sync pending", beforeSync.detail);
+            else if (!serverSetupIssue.isEmpty())
+                lib.recordStatus(id, "Sync pending", serverSetupIssue);
+            else lib.recordStatus(id, "Ready");
+            return 0;
+        }
         if (!tool.isEmpty()) {
             if (!QFileInfo(cmd.arguments.first()).isFile())
                 fail("The selected runner did not provide " + tool + " in this prefix. Review the runner or use Prepare in Manage.");
@@ -258,6 +287,20 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
             throw;
         }
         finishSaves();
+        ServerSyncResult afterSync{ServerSyncStatus::Unavailable, {}};
+        if (serverMode && ordinaryPlay && snapshotIssue.isEmpty()) {
+            try {
+                const auto currentServer = loadSaveServerConfig(lib);
+                if (currentServer.enabled && currentServer.url == saveServer.url &&
+                    currentServer.token == saveServer.token && currentServer.serverId == saveServer.serverId)
+                    afterSync = syncServerAfterPlay(lib, id, saveServer);
+                else afterSync = {ServerSyncStatus::Pending, "Save server settings changed during Play. Review them before syncing."};
+            } catch (const std::exception &error) {
+                afterSync = {ServerSyncStatus::Pending, QString::fromUtf8(error.what())};
+            }
+            if (!afterSync.detail.isEmpty())
+                log.write(("Save server after Play: " + afterSync.detail + "\n").toUtf8());
+        }
         if (extra) operation["exit_code"] = result;
         if (result != 0) fail((extra ? QString("One-time executable") : tool.isEmpty() ? QString("Launch") : tool) + " exited with code " + QString::number(result) + ". See the launch log.");
         if (extra) { operation["state"] = "complete"; operation["finished_at"] = now(); writeJson(operationPath, operation); }
@@ -271,6 +314,17 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
             if (!snapshotIssue.isEmpty() && snapshotIssue != discoveryIssue) issues.append(snapshotIssue);
             lib.recordStatus(id, "Save needs attention", "Progress was not backed up: " + issues.join(" "));
             return 0; // Backup failure must not turn a successful offline Play into a launch failure.
+        }
+        if (serverMode && ordinaryPlay) {
+            if (afterSync.status == ServerSyncStatus::Conflict)
+                lib.recordStatus(id, "Save conflict", afterSync.detail);
+            else if (afterSync.status == ServerSyncStatus::Pending)
+                lib.recordStatus(id, "Sync pending", afterSync.detail);
+            else lib.recordStatus(id, "Ready", "Saves synced with the configured server.");
+            return 0;
+        }
+        if (!serverSetupIssue.isEmpty() && ordinaryPlay) {
+            lib.recordStatus(id, "Sync pending", serverSetupIssue); return 0;
         }
         lib.recordStatus(id, "Ready", extra ? "Executable closed. The game's saved launch settings are unchanged." :
             tool.isEmpty() ? QString() : tool + " closed. Changes made in the tool stay in this game's prefix."); return 0;

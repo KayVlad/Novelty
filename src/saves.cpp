@@ -1,6 +1,5 @@
 #include "saves.h"
 #include "devices.h"
-#include "sync_queue.h"
 #include "runtime.h"
 #include <QtCore/qcryptographichash.h>
 #include <QtCore/qdatetime.h>
@@ -37,6 +36,7 @@ bool validFingerprint(const QString &value) {
 bool profileGameMatches(const SaveConfig &config, const QString &profileGameId,
                         const QString &authenticatedPeer = {}) {
     if (profileGameId == config.profileGameId) return true;
+    if (authenticatedPeer.isEmpty() && !config.serverGameKey.isEmpty()) return true;
     for (const auto &link : config.peerLinks)
         if (link.profileGameId == profileGameId &&
             (authenticatedPeer.isEmpty() || link.fingerprint == authenticatedPeer)) return true;
@@ -63,6 +63,8 @@ QString journalPath(const Library &lib, const QString &id) { return lib.gamePath
 QString pendingPath(const Library &lib, const QString &id) { return lib.gamePath(id, "save-pending.json"); }
 QString headPath(const Library &lib, const QString &id) { return lib.gamePath(id, "save-head.json"); }
 QString observationPath(const Library &lib, const QString &id) { return lib.gamePath(id, "save-observation.json"); }
+QString transferIntentPath(const Library &lib, const QString &id) { return lib.gamePath(id, "save-transfer-intent.json"); }
+QString transferUndoPath(const Library &lib, const QString &id) { return lib.gamePath(id, "save-transfer-undo.json"); }
 QString snapshotsRoot(const Library &lib, const QString &id) {
     return QFileInfo(lib.gamePath(id, "saves.json")).absolutePath() + "/snapshots";
 }
@@ -139,6 +141,10 @@ void validate(const Library &lib, const Game &game, const SaveConfig &config) {
         fail("Stop searching is available only when no save location is confirmed.");
     for (const auto &identity : {config.gameIdentity, config.releaseIdentity, config.saveCompatibility})
         if (identity.size() > 256 || identity.contains(QChar::Null)) fail("Save identity is too long or invalid.");
+    if (config.serverGameKey.toUtf8().size() > 256) fail("Server game link is too long.");
+    for (const auto ch : config.serverGameKey)
+        if (ch.isNull() || ch.category() == QChar::Other_Control)
+            fail("Server game link contains an invalid character.");
     if (config.mappings.size() > 32) fail("Use at most 32 save locations per game.");
     if (config.peerLinks.size() > 32) fail("Use at most 32 paired game links.");
     if (config.folderAliases.size() > 8) fail("Too many previous game folder names.");
@@ -170,7 +176,8 @@ QJsonObject configJson(const SaveConfig &config) {
         peerLinks.append(QJsonObject{{"fingerprint", link.fingerprint}, {"profile_game_id", link.profileGameId}});
     return {{"schema", 2}, {"profile_id", config.profileId}, {"profile_game_id", config.profileGameId},
             {"game_identity", config.gameIdentity}, {"release_identity", config.releaseIdentity},
-            {"save_compatibility", config.saveCompatibility}, {"discovery_state", config.discoveryState},
+            {"save_compatibility", config.saveCompatibility}, {"server_game_key", config.serverGameKey},
+            {"discovery_state", config.discoveryState},
             {"discovery_source", config.discoverySource}, {"candidates", config.candidates},
             {"folder_aliases", QJsonArray::fromStringList(config.folderAliases)}, {"mappings", mappings},
             {"peer_links", peerLinks}};
@@ -183,6 +190,7 @@ SaveConfig parseConfig(const QJsonObject &data, const QString &gameId) {
     if (schema == 2) {
         config.profileId = data["profile_id"].toString();
         config.profileGameId = data["profile_game_id"].toString();
+        config.serverGameKey = data["server_game_key"].toString();
         config.discoveryState = data["discovery_state"].toString();
         config.discoverySource = data["discovery_source"].toString();
         config.candidates = data["candidates"].toArray();
@@ -475,9 +483,29 @@ void verifySnapshot(const QString &directory, const QJsonObject &manifest) {
         }
     }
 }
-SaveSnapshot snapshotLocked(Library &lib, const Game &game, const SaveConfig &config, const QString &reason) {
+void verifyAvailableMappingRoots(const Library &lib, const Game &game, const SaveConfig &config) {
+    for (const auto &mapping : config.mappings) {
+        const auto base = mapping.scope == "game" ? mappingRoot(lib, game, "game") : lib.prefix(game.id);
+        noLinks(base);
+        const QFileInfo baseInfo(base);
+        if (!baseInfo.isDir() || !baseInfo.isReadable() || !baseInfo.isExecutable())
+            fail("The game or prefix save root is unavailable. Reconnect it before capturing saves: " + base);
+        const auto target = targetPath(lib, game, mapping);
+        auto parent = QFileInfo(target).absolutePath();
+        while (parent.startsWith(base + '/') || parent == base) {
+            const QFileInfo info(parent);
+            if (exists(parent) && (!info.isDir() || !info.isReadable() || !info.isExecutable()))
+                fail("Cannot inspect the mapped save location: " + parent);
+            if (parent == base) break;
+            parent = QFileInfo(parent).absolutePath();
+        }
+    }
+}
+SaveSnapshot snapshotLocked(Library &lib, const Game &game, const SaveConfig &config, const QString &reason,
+                            bool allowEmpty = false) {
     validate(lib, game, config);
     if (config.mappings.isEmpty()) fail("Map at least one save file or folder before creating a snapshot.");
+    if (allowEmpty) verifyAvailableMappingRoots(lib, game, config);
     const auto root = snapshotsRoot(lib, game.id);
     noLinks(root);
     if (!QDir().mkpath(root)) fail("Cannot create save snapshot storage.");
@@ -509,7 +537,7 @@ SaveSnapshot snapshotLocked(Library &lib, const Game &game, const SaveConfig &co
             }
             items.append(QJsonObject{{"scope", mapping.scope}, {"path", mapping.path}, {"entries", after}});
         }
-        if (result.files == 0) throw NoSaveData();
+        if (result.files == 0 && !allowEmpty) throw NoSaveData();
         QString parent;
         QString head = currentHead(lib, game.id);
         // Only an explicitly applied head proves ancestry. Imported history may never have been played.
@@ -567,11 +595,7 @@ void finishPendingLocked(Library &lib, const Game &game) {
         current["save_compatibility"] != previous["save_compatibility"] ||
         current["mappings"] != previous["mappings"])
         fail("Save mappings changed since the game ran. Review them before completing the pending snapshot.");
-    try {
-        const auto snapshot = snapshotLocked(lib, game, config, "after play");
-        queuePeerSync(lib, game.id, snapshot.id);
-    }
-    catch (const NoSaveData &) { /* A confirmed, empty root is not a failed Play. */ }
+    snapshotLocked(lib, game, config, "after play", true);
     if (!QFile::remove(pendingPath(lib, game.id))) fail("Cannot clear pending save snapshot record.");
     if (readJson(lib.gamePath(game.id, "status.json"))["state"] == "Save needs attention")
         lib.recordStatus(game.id, "Ready", "Pending save backup completed.");
@@ -595,6 +619,17 @@ QJsonObject snapshotManifest(const Library &lib, const QString &id, const QStrin
     if (manifest["id"].toString() != snapshotId) fail("Save snapshot ID does not match its manifest.");
     if (verifyContents) verifySnapshot(root, manifest);
     return manifest;
+}
+bool liveMatchesSnapshot(const Library &lib, const Game &game, const SaveConfig &config,
+                         const QJsonObject &manifest) {
+    validate(lib, game, config);
+    verifyAvailableMappingRoots(lib, game, config);
+    if (!mappingsMatch(config, manifest)) fail("Save mappings changed since the peer transfer.");
+    const auto items = manifest["items"].toArray();
+    for (int i = 0; i < items.size(); ++i)
+        if (inventory(targetPath(lib, game, config.mappings[i])) != items[i].toObject()["entries"].toArray())
+            return false;
+    return true;
 }
 bool hasAncestor(const Library &lib, const QString &gameId, const QString &descendant, const QString &ancestor) {
     if (descendant == ancestor) return true;
@@ -861,9 +896,73 @@ SaveSnapshot createSaveSnapshot(Library &lib, const QString &gameId, const QStri
     if (!saveRestoreIssue(lib, gameId).isEmpty()) fail("Recover the interrupted save restore before creating a snapshot.");
     const auto game = lib.game(gameId);
     const auto config = loadSaveConfig(lib, gameId);
-    const auto snapshot = snapshotLocked(lib, game, config, reason.left(80));
-    queuePeerSync(lib, gameId, snapshot.id);
-    return snapshot;
+    return snapshotLocked(lib, game, config, reason.left(80));
+}
+SaveSnapshot captureVerifiedSaveState(Library &lib, const QString &gameId, const QString &reason) {
+    SaveLocks locks(lib, gameId);
+    if (!saveRestoreIssue(lib, gameId).isEmpty()) fail("Recover the interrupted save restore before capturing saves.");
+    if (!pendingSaveSnapshotIssue(lib, gameId).isEmpty())
+        fail("Finish the pending post-play snapshot before capturing saves.");
+    const auto game = lib.game(gameId);
+    const auto config = loadSaveConfig(lib, gameId);
+    return snapshotLocked(lib, game, config, reason.left(80), true);
+}
+SaveSnapshot captureVerifiedSaveStateDuringLaunch(Library &lib, const QString &gameId, const QString &reason) {
+    if (!saveRestoreIssue(lib, gameId).isEmpty() || !pendingSaveSnapshotIssue(lib, gameId).isEmpty())
+        fail("Finish save recovery or the pending post-play snapshot before server sync.");
+    const auto game = lib.game(gameId);
+    return snapshotLocked(lib, game, loadSaveConfig(lib, gameId), reason.left(80), true);
+}
+QJsonObject verifyPortableSaveBundle(const QString &bundleDirectory) {
+    const auto source = QDir::cleanPath(bundleDirectory);
+    noLinks(source);
+    const QFileInfo root(source), metadata(source + "/manifest.json");
+    noLinks(metadata.absoluteFilePath());
+    if (!root.isDir() || metadata.size() < 1 || metadata.size() > 1024 * 1024)
+        fail("Portable save bundle or its manifest is unavailable.");
+    const auto manifest = readJson(metadata.absoluteFilePath());
+    if (manifest["schema"].toInt() != 2 || !validToken(manifest["id"].toString()) ||
+        !validToken(manifest["profile_id"].toString()) ||
+        !validToken(manifest["profile_game_id"].toString()) || !manifest["items"].isArray())
+        fail("Portable save bundle identity or version is invalid.");
+    const auto items = manifest["items"].toArray();
+    if (items.isEmpty() || items.size() > 32 || manifest["files"].toInt(-1) < 0 ||
+        manifest["bytes"].toDouble(-1) < 0 || manifest["bytes"].toDouble() > 512.0 * 1024 * 1024)
+        fail("Portable save bundle exceeds the server transfer limit.");
+    QSet<QString> paths;
+    qsizetype entries = 0;
+    for (const auto &value : items) {
+        const auto item = value.toObject();
+        const auto scope = item["scope"].toString(), path = item["path"].toString();
+        if (!QStringList{"game", "prefix", "appdata", "documents"}.contains(scope) ||
+            cleanMappingPath(path) != path || paths.contains(scope + ':' + path))
+            fail("Portable save bundle mapping is invalid or duplicated.");
+        paths.insert(scope + ':' + path);
+        entries += item["entries"].toArray().size();
+        if (entries > 20000) fail("Portable save bundle has too many entries.");
+    }
+    verifySnapshot(source, manifest);
+    return manifest;
+}
+QJsonObject inspectVerifiedLiveSaveState(const Library &lib, const QString &gameId) {
+    const auto game = lib.game(gameId);
+    const auto config = loadSaveConfig(lib, gameId);
+    validate(lib, game, config);
+    if (config.mappings.isEmpty()) fail("Map at least one save location before checking server saves.");
+    verifyAvailableMappingRoots(lib, game, config);
+    SnapshotBudget budget;
+    QJsonArray items;
+    int files = 0;
+    for (const auto &mapping : config.mappings) {
+        const auto entries = inventory(targetPath(lib, game, mapping), &budget);
+        for (const auto &value : entries) if (value.toObject()["type"] == "file") ++files;
+        items.append(QJsonObject{{"scope", mapping.scope}, {"path", mapping.path}, {"entries", entries}});
+    }
+    if (budget.bytes > 512LL * 1024 * 1024)
+        fail("Mapped saves exceed the 512 MiB server transfer limit.");
+    return {{"items", items}, {"files", files}, {"bytes", static_cast<double>(budget.bytes)},
+            {"game_identity", config.gameIdentity}, {"release_identity", config.releaseIdentity},
+            {"save_compatibility", config.saveCompatibility}};
 }
 bool captureAvailableSaveSnapshot(Library &lib, const QString &gameId, const QString &reason) {
     SaveLocks locks(lib, gameId, 2000);
@@ -875,8 +974,7 @@ bool captureAvailableSaveSnapshot(Library &lib, const QString &gameId, const QSt
     const auto config = loadSaveConfig(lib, gameId);
     if (config.mappings.isEmpty()) return false;
     try {
-        const auto snapshot = snapshotLocked(lib, game, config, reason.left(80));
-        queuePeerSync(lib, gameId, snapshot.id);
+        snapshotLocked(lib, game, config, reason.left(80));
         return true;
     } catch (const NoSaveData &) {
         return false;
@@ -968,9 +1066,7 @@ bool adoptInitialPeerSave(Library &lib, const QString &gameId) {
     restoreSaveSnapshot(lib, gameId, candidates.first().snapshotId);
     return true;
 }
-void restoreSaveSnapshot(Library &lib, const QString &gameId, const QString &snapshotId) {
-    SaveLocks locks(lib, gameId);
-    if (!saveRestoreIssue(lib, gameId).isEmpty()) fail("Recover the interrupted save restore before restoring another snapshot.");
+void restoreSaveSnapshotLocked(Library &lib, const QString &gameId, const QString &snapshotId) {
     const auto game = lib.game(gameId);
     const auto config = loadSaveConfig(lib, gameId);
     const auto manifest = snapshotManifest(lib, gameId, snapshotId);
@@ -1037,9 +1133,85 @@ void restoreSaveSnapshot(Library &lib, const QString &gameId, const QString &sna
         throw;
     }
 }
-SaveImportResult importSaveSnapshot(Library &lib, const QString &gameId, const QString &bundleDirectory,
-                                    const QString &authenticatedPeer) {
+void restoreSaveSnapshot(Library &lib, const QString &gameId, const QString &snapshotId) {
     SaveLocks locks(lib, gameId);
+    if (!saveRestoreIssue(lib, gameId).isEmpty()) fail("Recover the interrupted save restore before restoring another snapshot.");
+    restoreSaveSnapshotLocked(lib, gameId, snapshotId);
+}
+void restoreSaveSnapshotDuringLaunch(Library &lib, const QString &gameId, const QString &snapshotId) {
+    if (!saveRestoreIssue(lib, gameId).isEmpty() || !pendingSaveSnapshotIssue(lib, gameId).isEmpty())
+        fail("Finish save recovery or the pending post-play snapshot before server restore.");
+    restoreSaveSnapshotLocked(lib, gameId, snapshotId);
+}
+PeerTransferUndo peerTransferUndo(const Library &lib, const QString &gameId) {
+    const auto record = readJson(transferUndoPath(lib, gameId));
+    if (record.isEmpty()) return {};
+    const auto rollbackId = record["rollback_snapshot"].toString();
+    const auto installedId = record["installed_snapshot"].toString();
+    if (record["schema"].toInt() != 1 || record["game_id"].toString() != gameId ||
+        !validToken(rollbackId) || !validToken(installedId))
+        fail("The peer transfer Undo record is damaged. Inspect it before replacing saves.");
+    snapshotManifest(lib, gameId, rollbackId);
+    const auto installed = snapshotManifest(lib, gameId, installedId);
+    const auto game = lib.game(gameId);
+    const auto config = loadSaveConfig(lib, gameId);
+    return {rollbackId, installedId, !liveMatchesSnapshot(lib, game, config, installed)};
+}
+void replaceSavesFromPeer(Library &lib, const QString &gameId, const QString &snapshotId,
+                          const QString &expectedLocalSnapshotId) {
+    SaveLocks locks(lib, gameId);
+    if (!saveRestoreIssue(lib, gameId).isEmpty() || !pendingSaveSnapshotIssue(lib, gameId).isEmpty())
+        fail("Finish save recovery and pending capture before transferring saves.");
+    if (snapshotId == currentHead(lib, gameId)) fail("Those peer saves are already installed.");
+    const auto game = lib.game(gameId);
+    const auto config = loadSaveConfig(lib, gameId);
+    const auto incoming = snapshotManifest(lib, gameId, snapshotId);
+    if (incoming["schema"].toInt() != 2 || !profileGameMatches(config, incoming["profile_game_id"].toString()) ||
+        !labelsCompatible(config, incoming) || !mappingsMatch(config, incoming))
+        fail("The selected peer save is incompatible with this installation.");
+    const auto previous = snapshotLocked(lib, game, config, "before peer transfer", true);
+    if (!expectedLocalSnapshotId.isEmpty() && previous.id != expectedLocalSnapshotId)
+        fail("Local saves changed since confirmation. Review them and retry the transfer.");
+    const auto intentPath = transferIntentPath(lib, gameId);
+    writeJson(intentPath, {{"schema", 1}, {"kind", "replace"}, {"game_id", gameId},
+                           {"rollback_snapshot", previous.id}, {"installed_snapshot", snapshotId}});
+    try {
+        restoreSaveSnapshotLocked(lib, gameId, snapshotId);
+    } catch (...) {
+        if (!exists(journalPath(lib, gameId)) && currentHead(lib, gameId) != snapshotId) QFile::remove(intentPath);
+        throw;
+    }
+    writeJson(transferUndoPath(lib, gameId), {{"schema", 1}, {"game_id", gameId},
+        {"rollback_snapshot", previous.id}, {"installed_snapshot", snapshotId}});
+    if (!QFile::remove(intentPath)) fail("Peer transfer committed, but its recovery intent needs cleanup.");
+}
+void undoPeerSaveTransfer(Library &lib, const QString &gameId, bool preserveChanged) {
+    SaveLocks locks(lib, gameId);
+    if (!saveRestoreIssue(lib, gameId).isEmpty() || !pendingSaveSnapshotIssue(lib, gameId).isEmpty())
+        fail("Finish save recovery and pending capture before undoing a transfer.");
+    const auto undo = peerTransferUndo(lib, gameId);
+    if (undo.rollbackSnapshotId.isEmpty()) fail("There is no peer transfer to undo.");
+    if (undo.liveChanged && !preserveChanged)
+        fail("Saves changed since the transfer. Confirm that current progress should be kept before undoing.");
+    const auto game = lib.game(gameId);
+    const auto config = loadSaveConfig(lib, gameId);
+    if (undo.liveChanged) snapshotLocked(lib, game, config, "before peer transfer undo", true);
+    const auto intentPath = transferIntentPath(lib, gameId);
+    writeJson(intentPath, {{"schema", 1}, {"kind", "undo"}, {"game_id", gameId},
+                           {"rollback_snapshot", undo.rollbackSnapshotId},
+                           {"installed_snapshot", undo.installedSnapshotId}});
+    try {
+        restoreSaveSnapshotLocked(lib, gameId, undo.rollbackSnapshotId);
+    } catch (...) {
+        if (!exists(journalPath(lib, gameId)) && currentHead(lib, gameId) != undo.rollbackSnapshotId)
+            QFile::remove(intentPath);
+        throw;
+    }
+    if (!QFile::remove(transferUndoPath(lib, gameId))) fail("Undo committed, but its record needs cleanup.");
+    if (!QFile::remove(intentPath)) fail("Undo committed, but its recovery intent needs cleanup.");
+}
+SaveImportResult importSaveSnapshotLocked(Library &lib, const QString &gameId, const QString &bundleDirectory,
+                                          const QString &authenticatedPeer) {
     if (!saveRestoreIssue(lib, gameId).isEmpty()) fail("Recover the interrupted save restore before importing saves.");
     const auto game = lib.game(gameId);
     const auto config = loadSaveConfig(lib, gameId);
@@ -1089,8 +1261,21 @@ SaveImportResult importSaveSnapshot(Library &lib, const QString &gameId, const Q
                           hasAncestor(lib, gameId, head, id) ? "behind" : "conflict";
     return {added, relation, id};
 }
+SaveImportResult importSaveSnapshot(Library &lib, const QString &gameId, const QString &bundleDirectory,
+                                    const QString &authenticatedPeer) {
+    SaveLocks locks(lib, gameId);
+    return importSaveSnapshotLocked(lib, gameId, bundleDirectory, authenticatedPeer);
+}
+SaveImportResult importSaveSnapshotDuringLaunch(Library &lib, const QString &gameId,
+                                                const QString &bundleDirectory) {
+    if (!saveRestoreIssue(lib, gameId).isEmpty() || !pendingSaveSnapshotIssue(lib, gameId).isEmpty())
+        fail("Finish save recovery or the pending post-play snapshot before server import.");
+    return importSaveSnapshotLocked(lib, gameId, bundleDirectory, {});
+}
 QString saveRestoreIssue(const Library &lib, const QString &gameId) {
-    return exists(journalPath(lib, gameId)) ? "An interrupted save restore needs recovery before Play." : QString();
+    if (exists(journalPath(lib, gameId))) return "An interrupted save restore needs recovery before Play.";
+    if (exists(transferIntentPath(lib, gameId))) return "An interrupted peer save transfer needs recovery before Play.";
+    return {};
 }
 QString pendingSaveSnapshotIssue(const Library &lib, const QString &gameId) {
     return exists(pendingPath(lib, gameId)) ? "A post-play backup is pending. Use Rescan to retry; local Play remains available." : QString();
@@ -1137,6 +1322,48 @@ QStringList recoverSaveRestores(Library &lib) {
                             "Recovered the original saves for " + game.name + " after an interrupted restore.");
         } catch (const std::exception &e) {
             messages.append("Save restore recovery for " + game.name + " needs attention: " + QString::fromUtf8(e.what()));
+        }
+    }
+    return messages;
+}
+QStringList recoverPeerSaveTransfers(Library &lib) {
+    QStringList messages;
+    for (const auto &game : lib.games()) {
+        const auto intentPath = transferIntentPath(lib, game.id);
+        if (!exists(intentPath) || lib.supervisorActive(game.id) || exists(journalPath(lib, game.id))) continue;
+        try {
+            SaveLocks locks(lib, game.id);
+            const auto intent = readJson(intentPath);
+            const auto kind = intent["kind"].toString();
+            const auto rollbackId = intent["rollback_snapshot"].toString();
+            const auto installedId = intent["installed_snapshot"].toString();
+            if (intent["schema"].toInt() != 1 || intent["game_id"].toString() != game.id ||
+                (kind != "replace" && kind != "undo") || !validToken(rollbackId) || !validToken(installedId))
+                fail("Peer transfer intent is damaged.");
+            const auto rollbackManifest = snapshotManifest(lib, game.id, rollbackId);
+            const auto installedManifest = snapshotManifest(lib, game.id, installedId);
+            const auto config = loadSaveConfig(lib, game.id);
+            const auto head = currentHead(lib, game.id);
+            if (kind == "replace" && head == installedId) {
+                writeJson(transferUndoPath(lib, game.id), {{"schema", 1}, {"game_id", game.id},
+                    {"rollback_snapshot", rollbackId}, {"installed_snapshot", installedId}});
+                messages.append("Completed peer transfer Undo recovery for " + game.name + ".");
+            } else if (kind == "undo" && head == rollbackId &&
+                       liveMatchesSnapshot(lib, game, config, rollbackManifest)) {
+                if (exists(transferUndoPath(lib, game.id)) && !QFile::remove(transferUndoPath(lib, game.id)))
+                    fail("Cannot clear completed peer transfer Undo record.");
+                messages.append("Completed peer transfer Undo recovery for " + game.name + ".");
+            } else {
+                const auto &original = kind == "replace" ? rollbackManifest : installedManifest;
+                if (kind == "replace" && !liveMatchesSnapshot(lib, game, config, original))
+                    fail("Save files changed during peer transfer recovery.");
+                // Undo may have captured changed progress before the restore intent. If the
+                // rollback state was not installed, the previous Undo point stays available.
+                messages.append("Retained the previous saves for " + game.name + " after an interrupted peer transfer.");
+            }
+            if (!QFile::remove(intentPath)) fail("Cannot clear completed peer transfer intent.");
+        } catch (const std::exception &e) {
+            messages.append("Peer transfer recovery for " + game.name + " needs attention: " + QString::fromUtf8(e.what()));
         }
     }
     return messages;

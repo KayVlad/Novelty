@@ -262,6 +262,132 @@ void unappliedImport() {
     require(readJson(target.bundle(local.id) + "/manifest.json")["parent_ids"].toArray().isEmpty(),
             "an imported but unapplied snapshot must not become the local ancestor");
 }
+void verifiedEmptyState() {
+    Fixture f;
+    const auto target = f.game.folder + "/save";
+    touch(target + "/slot.dat", "progress to restore");
+    const auto populated = createSaveSnapshot(f.library, f.game.id);
+    require(QFile::remove(target + "/slot.dat"), "fixture removes save file");
+    const auto empty = captureVerifiedSaveState(f.library, f.game.id, "explicit empty state");
+    require(empty.files == 0 && empty.id != populated.id &&
+            readJson(f.bundle(empty.id) + "/manifest.json")["files"].toInt(-1) == 0,
+            "a verified deletion has its own durable empty snapshot");
+    touch(target + "/slot.dat", "later local progress");
+    restoreSaveSnapshot(f.library, f.game.id, empty.id);
+    require(!QFileInfo::exists(target + "/slot.dat") && appliedSaveSnapshotId(f.library, f.game.id) == empty.id,
+            "an empty state restores as a real deletion");
+    restoreSaveSnapshot(f.library, f.game.id, populated.id);
+    require(contents(target + "/slot.dat") == "progress to restore",
+            "older populated snapshots remain restorable after an empty state");
+
+    auto config = loadSaveConfig(f.library, f.game.id);
+    config.mappings = {{"prefix", "drive_c/save"}};
+    saveSaveConfig(f.library, f.game.id, config);
+    rejects([&] { captureVerifiedSaveState(f.library, f.game.id, "missing prefix"); });
+    config.mappings = {{"game", "save"}};
+    saveSaveConfig(f.library, f.game.id, config);
+    require(QDir(f.game.folder).rename("save", "save.offline"), "fixture moves save root");
+    // An absent mapped path is valid only while the owning game folder remains available.
+    require(captureVerifiedSaveState(f.library, f.game.id, "absent mapped path").files == 0,
+            "missing save leaf under an available game root can be an empty state");
+    require(QDir().rename(f.game.folder, f.game.folder + ".offline"), "fixture disconnects game folder");
+    rejects([&] { captureVerifiedSaveState(f.library, f.game.id, "missing game folder"); });
+}
+void manualTransferUndoCase() {
+    Fixture source, target;
+    const auto sourcePath = source.game.folder + "/save/slot.dat";
+    const auto targetPath = target.game.folder + "/save/slot.dat";
+    touch(sourcePath, "peer progress");
+    const auto peer = createSaveSnapshot(source.library, source.game.id);
+    auto config = loadSaveConfig(source.library, source.game.id);
+    config.profileId = target.library.profileId();
+    saveSaveConfig(target.library, target.game.id, config);
+    importSaveSnapshot(target.library, target.game.id, source.bundle(peer.id));
+    touch(targetPath, "local progress");
+    replaceSavesFromPeer(target.library, target.game.id, peer.id);
+    require(contents(targetPath) == "peer progress", "manual peer replacement installs the chosen state");
+    {
+        Library reopened(target.directory.path());
+        const auto undo = peerTransferUndo(reopened, target.game.id);
+        require(!undo.rollbackSnapshotId.isEmpty() && undo.installedSnapshotId == peer.id && !undo.liveChanged,
+                "the one-transfer Undo point survives closing and reopening the library");
+    }
+    touch(targetPath, "progress after transfer");
+    require(peerTransferUndo(target.library, target.game.id).liveChanged,
+            "Undo detects live progress after the transfer");
+    rejects([&] { undoPeerSaveTransfer(target.library, target.game.id, false); });
+    require(contents(targetPath) == "progress after transfer", "unconfirmed Undo preserves changed progress");
+    undoPeerSaveTransfer(target.library, target.game.id, true);
+    require(contents(targetPath) == "local progress" &&
+            peerTransferUndo(target.library, target.game.id).rollbackSnapshotId.isEmpty(),
+            "confirmed Undo restores prior progress and consumes the dedicated Undo point");
+    bool preserved = false;
+    for (const auto &snapshot : listSaveSnapshots(target.library, target.game.id))
+        if (snapshot.reason == "before peer transfer undo") preserved = true;
+    require(preserved, "changed progress remains available in general snapshot history after Undo");
+
+    require(QFile::remove(sourcePath), "fixture clears source progress");
+    const auto emptyPeer = captureVerifiedSaveState(source.library, source.game.id, "source deleted saves");
+    importSaveSnapshot(target.library, target.game.id, source.bundle(emptyPeer.id));
+    replaceSavesFromPeer(target.library, target.game.id, emptyPeer.id);
+    require(!QFileInfo::exists(targetPath), "an explicit peer transfer can install a verified empty state");
+    undoPeerSaveTransfer(target.library, target.game.id, false);
+    require(contents(targetPath) == "local progress", "Undo recovers populated saves after an empty peer transfer");
+
+    Fixture fresh;
+    config.profileId = fresh.library.profileId();
+    saveSaveConfig(fresh.library, fresh.game.id, config);
+    importSaveSnapshot(fresh.library, fresh.game.id, source.bundle(peer.id));
+    replaceSavesFromPeer(fresh.library, fresh.game.id, peer.id);
+    require(peerTransferUndo(fresh.library, fresh.game.id).rollbackSnapshotId.size() > 0,
+            "an initially empty installation has a durable transfer Undo point");
+    undoPeerSaveTransfer(fresh.library, fresh.game.id, false);
+    require(!QFileInfo::exists(fresh.game.folder + "/save/slot.dat"),
+            "Undo returns a fresh installation to its verified empty state");
+}
+void peerTransferRecovery() {
+    Fixture source, target;
+    touch(source.game.folder + "/save/slot.dat", "peer one");
+    const auto first = createSaveSnapshot(source.library, source.game.id);
+    touch(source.game.folder + "/save/slot.dat", "peer two");
+    const auto second = createSaveSnapshot(source.library, source.game.id);
+    auto config = loadSaveConfig(source.library, source.game.id);
+    config.profileId = target.library.profileId();
+    saveSaveConfig(target.library, target.game.id, config);
+    importSaveSnapshot(target.library, target.game.id, source.bundle(first.id));
+    importSaveSnapshot(target.library, target.game.id, source.bundle(second.id));
+    touch(target.game.folder + "/save/slot.dat", "local original");
+    const auto confirmed = captureVerifiedSaveState(target.library, target.game.id, "preview");
+    touch(target.game.folder + "/save/slot.dat", "changed after preview");
+    rejects([&] { replaceSavesFromPeer(target.library, target.game.id, first.id, confirmed.id); });
+    require(contents(target.game.folder + "/save/slot.dat") == "changed after preview" &&
+            !QFileInfo::exists(target.library.gamePath(target.game.id, "save-transfer-undo.json")),
+            "a stale confirmation never replaces newer local progress or publishes Undo");
+    replaceSavesFromPeer(target.library, target.game.id, first.id);
+    const auto oldUndo = peerTransferUndo(target.library, target.game.id);
+    const auto intentPath = target.library.gamePath(target.game.id, "save-transfer-intent.json");
+    writeJson(intentPath, {{"schema", 1}, {"kind", "replace"}, {"game_id", target.game.id},
+                           {"rollback_snapshot", first.id}, {"installed_snapshot", second.id}});
+    recoverPeerSaveTransfers(target.library);
+    require(!QFileInfo::exists(intentPath) &&
+            peerTransferUndo(target.library, target.game.id).rollbackSnapshotId == oldUndo.rollbackSnapshotId &&
+            contents(target.game.folder + "/save/slot.dat") == "peer one",
+            "pre-commit interruption keeps the previous dedicated Undo point");
+    restoreSaveSnapshot(target.library, target.game.id, second.id);
+    writeJson(intentPath, {{"schema", 1}, {"kind", "replace"}, {"game_id", target.game.id},
+                           {"rollback_snapshot", first.id}, {"installed_snapshot", second.id}});
+    recoverPeerSaveTransfers(target.library);
+    require(!QFileInfo::exists(intentPath) &&
+            peerTransferUndo(target.library, target.game.id).rollbackSnapshotId == first.id &&
+            contents(target.game.folder + "/save/slot.dat") == "peer two",
+            "post-commit interruption publishes the new Undo point after restart recovery");
+    replaceSavesFromPeer(target.library, target.game.id, first.id);
+    require(peerTransferUndo(target.library, target.game.id).rollbackSnapshotId == second.id,
+            "a later successful transfer replaces only the dedicated one-transfer Undo point");
+    undoPeerSaveTransfer(target.library, target.game.id, false);
+    require(contents(target.game.folder + "/save/slot.dat") == "peer two",
+            "Undo returns to the state directly before the most recent transfer");
+}
 void failedRelink() {
     Fixture f;
     const auto original = f.library.game(f.game.id).json();
@@ -282,7 +408,9 @@ int main(int argc, char **argv) {
              {"restore recovery cleanup failure", recoveryCleanupFailure},
              {"committed restore cleanup", committedRestoreCleanup},
              {"bounded backups and visible failures", boundedBackup}, {"unreadable save directory", unreadableSaveDirectory},
-             {"legacy snapshot compatibility", legacySnapshots}, {"metadata-only history queries", metadataQueries}}) {
+             {"legacy snapshot compatibility", legacySnapshots}, {"metadata-only history queries", metadataQueries},
+             {"verified empty state", verifiedEmptyState}, {"peer transfer undo", manualTransferUndoCase},
+             {"peer transfer recovery", peerTransferRecovery}}) {
         try { test(); std::printf("PASS: %s\n", name); }
         catch (const std::exception &e) { ++failures; std::fprintf(stderr, "FAIL: %s: %s\n", name, e.what()); }
     }

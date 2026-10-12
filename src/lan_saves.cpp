@@ -176,6 +176,7 @@ void LanSaveExchange::answerLocate(const QJsonObject &request) {
         for (const auto &alias : config.folderAliases)
             if (remoteNames.contains(normalizedSaveGameName(alias))) named = true;
         if (!linked && !named) continue;
+        if (labelsMatch) captureVerifiedSaveState(library_, game.id, "on-demand peer transfer");
         QJsonArray history;
         for (const auto &snapshotId : saveSnapshotLineage(library_, game.id)) history.append(snapshotId);
         matches.append(QJsonObject{{"profile_game_id", config.profileGameId},

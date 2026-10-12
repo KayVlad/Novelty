@@ -59,12 +59,17 @@ def package(binary: Path, output: Path) -> None:
         raise RuntimeError(f"Output already exists: {output}")
     if not binary.is_file():
         raise RuntimeError(f"Build Novelty first: {binary}")
+    server_binary = binary.with_name("novelty-save-server")
+    if not server_binary.is_file():
+        raise RuntimeError(f"Build the save server first: {server_binary}")
     output.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".novelty-package-", dir=output.parent))
     try:
         destination = stage / "bin" / "novelty"
         destination.parent.mkdir()
         shutil.copy2(binary, destination)
+        server_destination = stage / "bin" / "novelty-save-server"
+        shutil.copy2(server_binary, server_destination)
         helpers = stage / "share" / "novelty"
         helpers.mkdir(parents=True)
         for name in ("install-ge.py", "install-umu.py"):
@@ -108,7 +113,7 @@ exec "$novelty_app_dir/python/bin/python3-real" "$@"
 
         libraries = {}
         python_extensions = list(bundled_stdlib.rglob("*.so"))
-        for target in (destination, python_binary, *copied_plugins, *python_extensions):
+        for target in (destination, server_destination, python_binary, *copied_plugins, *python_extensions):
             for name, path in dependencies(target).items():
                 previous = libraries.get(name)
                 if previous and previous.resolve() != path.resolve():
@@ -131,12 +136,23 @@ export QT_PLUGIN_PATH="$novelty_app_dir/plugins"
 exec "$novelty_app_dir/bin/novelty" "$@"
 ''')
         launcher.chmod(0o755)
+        server_launcher = stage / "NoveltySaveServer"
+        server_launcher.write_text('''#!/bin/sh
+set -eu
+novelty_app_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export LD_LIBRARY_PATH="$novelty_app_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$novelty_app_dir/bin/novelty-save-server" "$@"
+''')
+        server_launcher.chmod(0o755)
         (stage / "bin" / "qt.conf").write_text("[Paths]\nPlugins=../plugins\n")
         (stage / "README.txt").write_text(
             "Run ./Novelty from this folder. Keep the folder writable for data/bin settings.\n"
             "This is a native test package, not clean-device acceptance. It uses the host\n"
             "glibc, graphics drivers and certificate store. Python for installers is bundled.\n"
             "GE-Proton, umu and Steam Linux Runtime are managed in the Games folder.\n"
+            "Optional self-hosted saves: run ./NoveltySaveServer --data PRIVATE_FOLDER.\n"
+            "The owner-only access token is PRIVATE_FOLDER/access.token; use a TLS reverse proxy\n"
+            "for access from another device. The service listens on loopback only.\n"
         )
         manifest = {}
         for file in sorted(p for p in stage.rglob("*") if p.is_file()):

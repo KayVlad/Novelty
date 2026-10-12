@@ -3,6 +3,9 @@
 #include "profiles.h"
 #include "metadata.h"
 #include "saves.h"
+#include "save_server_config.h"
+#include "save_server_client.h"
+#include "save_server_sync.h"
 #include "steam_shortcut.h"
 #include "devices.h"
 #include "lan_connection.h"
@@ -22,6 +25,7 @@
 #include <QtCore/qjsondocument.h>
 #include <QtCore/qbuffer.h>
 #include <QtCore/qsettings.h>
+#include <QtCore/qprocess.h>
 #include <QtCore/qsavefile.h>
 #include <QtCore/quuid.h>
 #include <QtCore/qsysinfo.h>
@@ -111,7 +115,8 @@ struct SetupHint { bool pending = false; QString message; };
 SetupHint setupHint(const Library &lib, const Game &game, const QString &status) {
     // Active and failure states should retain their more urgent status colour.
     if (QStringList{"Unavailable", "Folder changed", "Path needs rename", "Recovery required",
-                    "Needs attention", "Save needs attention", "Interrupted", "Starting", "Preparing", "Configuring", "Running"}.contains(status)) return {};
+                    "Needs attention", "Save needs attention", "Sync pending", "Save conflict",
+                    "Interrupted", "Starting", "Preparing", "Configuring", "Running"}.contains(status)) return {};
     QStringList messages;
     if (game.executable.isEmpty())
         messages.append(game.installPending ? "Choose a game executable after installation finishes." :
@@ -400,6 +405,7 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
                 launchPoll_.stop(); pendingLaunch_.clear(); pendingInstaller_ = false; pendingPrepare_ = false;
                 refresh(); message(recovery.isEmpty() ? j["message"].toString(state) : recovery); scanDelay_.start();
                 if (completedPrepare && recovery.isEmpty() && state == "Ready" &&
+                    !loadSaveServerConfig(*library_).enabled &&
                     !importedSaveCandidates(*library_, completedId).isEmpty()) {
                     try {
                         const auto root = library_->root();
@@ -431,7 +437,9 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
         } catch (const std::exception &e) { launchPoll_.stop(); pendingLaunch_.clear(); pendingInstaller_ = false; pendingPrepare_ = false; message(QString::fromUtf8(e.what())); }
     });
     syncTimer_.setInterval(30000);
-    connect(&syncTimer_, &QTimer::timeout, this, [this] { syncPendingPeers(); refreshPeerGames(); selectGame(); });
+    connect(&syncTimer_, &QTimer::timeout, this, [this] {
+        refreshPeerGames(); retryPendingServerSaves(); selectGame();
+    });
     selectGame();
     const auto initial = root.isEmpty() ? QSettings().value("gamesRoot").toString() : root;
     if (!initial.isEmpty()) {
@@ -443,6 +451,9 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
 }
 Window::~Window() {
     syncTimer_.stop();
+    if (serverRetryProcess_ && serverRetryProcess_->state() != QProcess::NotRunning) {
+        serverRetryProcess_->kill(); serverRetryProcess_->waitForFinished(1000);
+    }
     peerDiscovery_.reset();
     for (auto connection : catalogueConnections_) { connection->close(); delete connection; }
     catalogueConnections_.clear();
@@ -450,6 +461,47 @@ Window::~Window() {
     autoConnections_.clear();
     activePeerIds_.clear();
     saveListener_.reset();
+}
+void Window::retryPendingServerSaves() {
+    if (!library_ || !rootAvailable() || serverRetryProcess_ || !pendingLaunch_.isEmpty() || importing_ || removing_) return;
+    try {
+        if (!loadSaveServerConfig(*library_).enabled) return;
+        const auto now = QDateTime::currentMSecsSinceEpoch();
+        for (const auto &game : library_->games()) {
+            if (library_->status(game) != "Sync pending" || library_->busy(game.id) ||
+                serverNextRetry_.value(game.id) > now) continue;
+            try { if (loadSaveConfig(*library_, game.id).mappings.isEmpty()) continue; }
+            catch (const std::exception &) { continue; }
+            const auto root = library_->root(), id = game.id;
+            auto process = new QProcess(this);
+            serverRetryProcess_ = process;
+            const auto complete = [this, process, root, id](bool succeeded) {
+                if (serverRetryProcess_ != process) return;
+                serverRetryProcess_ = nullptr;
+                process->deleteLater();
+                if (!library_ || library_->root() != root) return;
+                const auto state = library_->status(library_->game(id));
+                if (succeeded || state == "Ready" || state == "Save conflict") {
+                    serverRetryFailures_.remove(id); serverNextRetry_.remove(id);
+                } else {
+                    const auto failures = std::min(4, serverRetryFailures_.value(id) + 1);
+                    serverRetryFailures_.insert(id, failures);
+                    serverNextRetry_.insert(id, QDateTime::currentMSecsSinceEpoch() +
+                                               qint64(30000) * (1 << failures));
+                }
+                model_->updateState(*library_, id); selectGame();
+            };
+            connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+                    [complete](int code, QProcess::ExitStatus exit) { complete(exit == QProcess::NormalExit && code == 0); });
+            connect(process, &QProcess::errorOccurred, this, [complete](QProcess::ProcessError error) {
+                if (error == QProcess::FailedToStart) complete(false);
+            });
+            process->setProgram(launcherExecutable_);
+            process->setArguments({"--root", root, "--sync-server-game", id});
+            process->start();
+            return;
+        }
+    } catch (const std::exception &error) { message(QString::fromUtf8(error.what())); }
 }
 void Window::message(const QString &s) { notice_->setText(s); }
 void Window::updateRootLink() {
@@ -470,6 +522,7 @@ void Window::openRoot(const QString &root, bool allowCreation) {
     auto next = std::make_unique<Library>(root);
     auto saveRecovery = next->recoverSettingsChanges();
     saveRecovery.append(recoverSaveRestores(*next));
+    saveRecovery.append(recoverPeerSaveTransfers(*next));
     saveRecovery.append(recoverSaveObservations(*next));
     saveRecovery.append(recoverPendingSaveSnapshots(*next));
     peerDiscovery_.reset();
@@ -492,58 +545,8 @@ void Window::openRoot(const QString &root, bool allowCreation) {
                 if (!image.isNull()) image.scaled(240, 336, Qt::KeepAspectRatio, Qt::SmoothTransformation).save(&buffer, "JPEG", 65);
                 return QJsonObject{{"cover", bytes.size() <= 30 * 1024 ? QString::fromLatin1(bytes.toBase64()) : QString()}};
             };
-            exchange->onOffer = [this, connection, exchange](const QJsonObject &offer) {
-                const auto remoteId = offer["profile_game_id"].toString();
-                const auto offerId = offer["request_id"].toString();
-                const auto snapshotId = offer["snapshot_id"].toString();
-                QString localId;
-                try {
-                    for (const auto &game : library_->games()) {
-                        const auto config = loadSaveConfig(*library_, game.id);
-                        const auto compatible = [](const QString &local, const QString &remote) {
-                            return local.isEmpty() || remote.isEmpty() || local == remote;
-                        };
-                        if (config.mappings.isEmpty()) continue;
-                        bool linked = config.profileGameId == remoteId;
-                        for (const auto &link : config.peerLinks)
-                            if (link.fingerprint == connection->peerFingerprint() &&
-                                link.profileGameId == remoteId) linked = true;
-                        if (linked) {
-                            if (!compatible(config.gameIdentity, offer["game_identity"].toString()) ||
-                                !compatible(config.releaseIdentity, offer["release_identity"].toString()) ||
-                                !compatible(config.saveCompatibility, offer["save_compatibility"].toString())) {
-                                exchange->deferOffer(offerId, "This linked game's saved edition or compatibility labels differ.");
-                                return;
-                            }
-                            if (!localId.isEmpty()) { localId.clear(); break; }
-                            localId = game.id;
-                        }
-                    }
-                    if (localId.isEmpty()) {
-                        exchange->deferOffer(offerId, "Confirm the matching game in Manage → Saves first."); return;
-                    }
-                    if (library_->busy(localId)) {
-                        exchange->deferOffer(offerId, "The matching game is currently busy."); return;
-                    }
-                    const auto gameId = localId;
-                    exchange->onImported = [this, exchange, offerId, snapshotId, gameId](const SaveImportResult &result) {
-                        try {
-                            exchange->acknowledgeOffer(offerId, snapshotId);
-                            selectGame();
-                            if (result.relation == "conflict")
-                                message("Peer saves for " + library_->game(gameId).name +
-                                        " conflict with local progress. Both copies are in Manage → Saves.");
-                            else if (result.relation == "ahead" || result.relation == "available")
-                                message("New peer saves for " + library_->game(gameId).name +
-                                        " are verified and available before the next Play.");
-                        } catch (const std::exception &e) { message(QString::fromUtf8(e.what())); }
-                    };
-                    exchange->fetch(gameId, remoteId, snapshotId);
-                } catch (const std::exception &e) {
-                    try { exchange->deferOffer(offerId, QString::fromUtf8(e.what())); }
-                    catch (...) { connection->close(); }
-                }
-            };
+            // Legacy unsolicited offers are deferred by LanSaveExchange. The listener
+            // remains available for game installation and requested manual transfers.
         };
         connection->onError = [connection](const QString &) { connection->deleteLater(); };
         return true;
@@ -558,7 +561,7 @@ void Window::openRoot(const QString &root, bool allowCreation) {
         peerDiscovery_ = std::make_unique<LanDiscovery>(*library_, saveListener_->serverPort());
         peerDiscovery_->onPeer = [this](const TrustedPeer &peer) { queryPeerGames(peer); };
     }
-    QTimer::singleShot(1000, this, [this] { syncPendingPeers(); refreshPeerGames(); });
+    QTimer::singleShot(1000, this, [this] { refreshPeerGames(); });
     ++autoMetadataGeneration_; autoMetadataQueue_.clear(); autoMetadataQueued_.clear(); autoMetadataActive_ = false;
     rootRequiresDatabase_ = true; ++scanGeneration_;
     QSettings().setValue("gamesRoot", library_->root());
@@ -572,68 +575,8 @@ void Window::openRoot(const QString &root, bool allowCreation) {
     QTimer::singleShot(0, this, [this] { scan(); });
 }
 void Window::syncPendingPeers() {
-    if (!rootAvailable() || !saveListener_ || autoConnections_.size() >= 2) return;
-    try {
-        const auto tasks = pendingPeerSync(*library_);
-        const auto peers = trustedPeers(*library_);
-        QSet<QString> gameIds;
-        for (const auto &game : library_->games()) gameIds.insert(game.id);
-        QSet<QString> attempted;
-        syncQueueIssue_.clear();
-        for (const auto &task : tasks) {
-            if (autoConnections_.size() >= 2) break;
-            if (!gameIds.contains(task.gameId)) {
-                acknowledgePeerSync(*library_, task.fingerprint, task.gameId, task.snapshotId);
-                continue;
-            }
-            if (activePeerIds_.contains(task.fingerprint) || attempted.contains(task.fingerprint)) continue;
-            attempted.insert(task.fingerprint);
-            TrustedPeer peer;
-            for (const auto &candidate : peers)
-                if (candidate.fingerprint == task.fingerprint) { peer = candidate; break; }
-            if (peer.address.isEmpty() || peer.port == 0) continue;
-            try {
-                if (appliedSaveSnapshotId(*library_, task.gameId) != task.snapshotId) {
-                    const auto current = appliedSaveSnapshotId(*library_, task.gameId);
-                    if (current.isEmpty()) throw std::runtime_error("The applied save pointer is missing; pending sync was retained.");
-                    queuePeerSync(*library_, task.gameId, current);
-                    continue;
-                }
-            } catch (const std::exception &e) {
-                message("Peer sync is pending: " + QString::fromUtf8(e.what()));
-                continue;
-            }
-            auto connection = new LanConnection(*library_, false, this);
-            autoConnections_.insert(connection); activePeerIds_.insert(task.fingerprint);
-            const auto finish = [this, connection, fingerprint = task.fingerprint](bool nextNow = false) {
-                if (!autoConnections_.contains(connection)) return;
-                autoConnections_.remove(connection); activePeerIds_.remove(fingerprint);
-                connection->close(); connection->deleteLater();
-                if (nextNow) QTimer::singleShot(0, this, [this] { syncPendingPeers(); });
-            };
-            connection->onError = [finish](const QString &) { finish(false); };
-            connection->onReady = [this, connection, task, finish](const QString &fingerprint) {
-                if (fingerprint != task.fingerprint) { finish(); return; }
-                try {
-                    auto exchange = new LanSaveExchange(*library_, *connection, connection);
-                    exchange->onAcknowledged = [this, task, finish](const QString &gameId, const QString &snapshotId) {
-                        try { acknowledgePeerSync(*library_, task.fingerprint, gameId, snapshotId); }
-                        catch (const std::exception &e) { message(QString::fromUtf8(e.what())); }
-                        selectGame();
-                        finish(true);
-                    };
-                    exchange->onDeferred = [finish](const QString &) { finish(false); };
-                    exchange->onError = [finish](const QString &) { finish(false); };
-                    exchange->offer(task.gameId, task.snapshotId);
-                    QTimer::singleShot(60000, connection, [finish] { finish(false); });
-                } catch (const std::exception &) { finish(false); }
-            };
-            connection->connectTo(peer.address, peer.port);
-        }
-    } catch (const std::exception &e) {
-        const auto issue = QString::fromUtf8(e.what());
-        if (issue != syncQueueIssue_) { syncQueueIssue_ = issue; message("Peer sync is pending: " + issue); }
-    }
+    // Retained as a harmless legacy entry point. Old queue records stay on disk
+    // for migration/recovery reference checks and are never sent automatically.
 }
 void Window::chooseRoot() {
     if (!pendingLaunch_.isEmpty()) { message("Wait until this launch finishes before switching libraries."); return; }
@@ -693,25 +636,19 @@ void Window::selectGame() {
         status_->setText("●  " + state); status_->setStyleSheet("color: " + statusColor(state, setup.pending).name() + "; font-size: 13px;");
         setupState_->setText(setup.message); setupState_->setVisible(setup.pending);
         syncState_->clear();
-        if (accessible) try {
-            int pending = 0; bool ahead = false, conflict = false;
-            for (const auto &task : pendingPeerSync(*library_)) if (task.gameId == g.id) ++pending;
-            for (const auto &candidate : importedSaveCandidates(*library_, g.id)) {
-                if (candidate.relation == "conflict") conflict = true;
-                if (candidate.relation == "ahead" || candidate.relation == "available") ahead = true;
-            }
-            QStringList parts;
-            if (conflict) parts.append("Save conflict: choose a copy in Manage → Saves.");
-            else if (ahead) parts.append("New peer save ready for the next Play.");
-            if (pending) parts.append(QString::number(pending) + " peer save transfer" + (pending == 1 ? "" : "s") + " pending.");
-            syncState_->setText(parts.join(" "));
-        } catch (const std::exception &e) { syncState_->setText("Peer save status needs review: " + QString::fromUtf8(e.what())); }
+        if (accessible && QFileInfo::exists(library_->gamePath(g.id, "save-transfer-undo.json"))) {
+            try {
+                if (!loadSaveServerConfig(*library_).enabled)
+                    syncState_->setText("Last manual save transfer can be undone in Manage → Saves.");
+            } catch (const std::exception &) { /* The status gives the settings issue. */ }
+        }
         syncState_->setVisible(!syncState_->text().isEmpty());
         detail_->setText(!accessible ? "Reconnect your Games folder and press Rescan." : launchPathIssue(g));
         if (accessible && state == "Needs setup")
             detail_->setText("Play will verify setup in the existing prefix before starting the game. You can also use Prepare in Manage → Runtime.");
         if (accessible && state == "Recovery required") detail_->setText(library_->recoveryIssue(g.id));
-        if (accessible && (state == "Save needs attention" || state == "Needs attention")) {
+        if (accessible && (state == "Save needs attention" || state == "Needs attention" ||
+                           state == "Sync pending" || state == "Save conflict")) {
             const auto last = readJson(library_->gamePath(g.id, "status.json"));
             detail_->setText(last["state"] == state ? last["message"].toString() : pendingSaveSnapshotIssue(*library_, g.id));
         }
@@ -738,7 +675,8 @@ void Window::scan() {
         Library worker(root); auto recovered = worker.recoverSettingsChanges();
         recovered.append(worker.recoverRemovals()); recovered.append(worker.recoverFolderImports());
         recovered.append(worker.recoverInstallations());
-        recovered.append(recoverSaveRestores(worker)); recovered.append(recoverSaveObservations(worker));
+        recovered.append(recoverSaveRestores(worker)); recovered.append(recoverPeerSaveTransfers(worker));
+        recovered.append(recoverSaveObservations(worker));
         recovered.append(recoverPendingSaveSnapshots(worker));
         auto found = scanDiscovery(root, known); found.recoveryMessages = recovered; return found;
     });
@@ -912,7 +850,7 @@ bool Window::chooseExecutable(const QString &id) {
     return false;
 }
 void Window::settings() {
-    QDialog dialog(this); dialog.setObjectName("settingsDialog"); dialog.setWindowTitle("Settings"); dialog.resize(750, 420);
+    QDialog dialog(this); dialog.setObjectName("settingsDialog"); dialog.setWindowTitle("Settings"); dialog.resize(750, 520);
     auto layout = new QVBoxLayout(&dialog); auto form = new QFormLayout;
     auto folderField = new QLineEdit(rootPath_, &dialog); folderField->setObjectName("settingsGamesFolder");
     form->addRow("Games folder", pathField(folderField, &dialog, true, "Choose your main Games folder"));
@@ -933,6 +871,21 @@ void Window::settings() {
         if (!installed.isEmpty()) umu->setText(installed);
     });
     form->addRow("Steam executable", pathField(steam, &dialog, false, "Select Steam")); layout->addLayout(form);
+    SaveServerConfig existingServer;
+    try { if (library_) existingServer = loadSaveServerConfig(*library_); }
+    catch (const std::exception &e) { message(QString::fromUtf8(e.what())); }
+    auto serverEnabled = new QCheckBox("Automatically sync saves with my server", &dialog);
+    serverEnabled->setObjectName("saveServerEnabled"); serverEnabled->setChecked(existingServer.enabled);
+    layout->addWidget(serverEnabled);
+    auto serverForm = new QFormLayout;
+    auto serverUrl = new QLineEdit(existingServer.url.toString(), &dialog);
+    serverUrl->setObjectName("saveServerUrl"); serverUrl->setPlaceholderText("https://my-save-server.example");
+    auto serverToken = new QLineEdit(QString::fromLatin1(existingServer.token), &dialog);
+    serverToken->setObjectName("saveServerToken"); serverToken->setEchoMode(QLineEdit::Password);
+    serverForm->addRow("Server address", serverUrl); serverForm->addRow("Access token", serverToken);
+    layout->addLayout(serverForm);
+    auto serverNote = new QLabel("When enabled, Play checks this server and uploads changed saves. Offline Play remains available. Peer save replacement is available after turning server sync off.", &dialog);
+    serverNote->setWordWrap(true); layout->addWidget(serverNote);
     if (library_ && !library_->managedRuntimeStorage()) {
         auto migrate = new QPushButton("Migrate legacy umu runtime into Games…", &dialog);
         migrate->setObjectName("migrateLegacyRuntime"); layout->addWidget(migrate);
@@ -992,12 +945,61 @@ void Window::settings() {
     try {
         const auto folder = folderField->text().trimmed();
         if (folder.isEmpty()) throw std::runtime_error("Choose a Games folder.");
-        if (!library_ || canonicalPath(folder) != library_->root()) {
+        const bool changedRoot = !library_ || canonicalPath(folder) != library_->root();
+        if (changedRoot) {
             if (!pendingLaunch_.isEmpty()) throw std::runtime_error("Wait until this launch finishes before switching libraries.");
             openRoot(folder);
         }
         s["backend"] = backend->currentData().toString(); s["runner"] = runner->currentText();
-        s["umu"] = umu->text(); s["steam"] = steam->text(); library_->setSettings(s); refresh();
+        s["umu"] = umu->text(); s["steam"] = steam->text();
+        if (!changedRoot) {
+            SaveServerConfig configured;
+            configured.enabled = serverEnabled->isChecked();
+            configured.url = QUrl(serverUrl->text().trimmed());
+            configured.token = serverToken->text().toLatin1();
+            configured.serverId = existingServer.serverId;
+            const bool serverChanged = configured.enabled != existingServer.enabled ||
+                configured.url != existingServer.url || configured.token != existingServer.token;
+            if (serverChanged) {
+                for (const auto &running : library_->games())
+                    if (library_->busy(running.id))
+                        throw std::runtime_error("Wait until active games close before changing save server settings.");
+            }
+            if (serverChanged && configured.enabled) {
+                const auto url = configured.url;
+                const auto token = configured.token;
+                auto check = std::async(std::launch::async, [url, token] {
+                    SaveServerClient client(url, token); return client.identity();
+                });
+                RemovalProgress progress(this); progress.setWindowTitle("Checking save server");
+                auto progressLayout = new QVBoxLayout(&progress);
+                progressLayout->addWidget(new QLabel("Checking the server identity and access token…", &progress));
+                QTimer poll; poll.setInterval(60);
+                connect(&poll, &QTimer::timeout, &progress, [&] {
+                    if (check.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
+                });
+                poll.start(); progress.exec(); poll.stop();
+                configured.serverId = check.get();
+            }
+            if (serverChanged) {
+                saveSaveServerConfig(*library_, configured);
+                for (const auto &game : library_->games()) {
+                    const auto state = library_->status(game);
+                    if (configured.enabled && state == "Ready") {
+                        try {
+                            if (!loadSaveConfig(*library_, game.id).mappings.isEmpty())
+                                library_->recordStatus(game.id, "Sync pending", "Checking this game's saves with the server.");
+                        } catch (const std::exception &) { /* Save settings remain visible in Manage. */ }
+                    }
+                    else if (!configured.enabled && (state == "Sync pending" || state == "Save conflict"))
+                        library_->recordStatus(game.id, "Ready", "Automatic server sync is off. Local save history remains available.");
+                }
+                serverRetryFailures_.clear(); serverNextRetry_.clear();
+                if (configured.enabled) QTimer::singleShot(0, this, [this] { retryPendingServerSaves(); });
+            }
+        }
+        library_->setSettings(s);
+        refresh();
     } catch (const std::exception &e) { message(QString::fromUtf8(e.what())); }
 }
 void Window::devices() {
@@ -1336,25 +1338,27 @@ void Window::installFromPeer() {
     }
     refresh();
     try {
-        const auto root = library_->root();
-        auto work = std::async(std::launch::async, [root, installedId] {
-            Library worker(root);
-            const auto result = refreshLinkedPeerSaves(worker, installedId);
-            return result;
-        });
-        RemovalProgress progress(this); progress.setWindowTitle("Syncing installed game saves");
-        auto layout = new QVBoxLayout(&progress);
-        layout->addWidget(new QLabel("Checking verified peer save history…", &progress));
-        progress.resize(440, 110);
-        QTimer poll; poll.setInterval(60);
-        connect(&poll, &QTimer::timeout, &progress, [&] {
-            if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
-        });
-        poll.start(); progress.exec(); poll.stop();
-        const auto result = work.get();
-        message(result.issues.isEmpty() ?
-            "Game installed. Save history checked; preparing local setup…" :
-            "Game installed. Some peer saves need a later check: " + result.issues.join(" "));
+        if (!loadSaveServerConfig(*library_).enabled) {
+            const auto root = library_->root();
+            auto work = std::async(std::launch::async, [root, installedId, fingerprint = game.peer.fingerprint] {
+                Library worker(root);
+                const auto result = refreshLinkedPeerSaves(worker, installedId, 5000, fingerprint);
+                return result;
+            });
+            RemovalProgress progress(this); progress.setWindowTitle("Checking initial saves");
+            auto layout = new QVBoxLayout(&progress);
+            layout->addWidget(new QLabel("Fetching the source device's latest verified save state…", &progress));
+            progress.resize(440, 110);
+            QTimer poll; poll.setInterval(60);
+            connect(&poll, &QTimer::timeout, &progress, [&] {
+                if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
+            });
+            poll.start(); progress.exec(); poll.stop();
+            const auto result = work.get();
+            message(result.issues.isEmpty() ?
+                "Game installed. Initial saves checked; preparing local setup…" :
+                "Game installed. Initial saves need attention: " + result.issues.join(" "));
+        } else message("Game installed. Preparing local setup and checking server saves…");
     } catch (const std::exception &e) { message("Game installed. " + QString::fromUtf8(e.what())); }
     for (int row = 0; row < model_->games.size(); ++row) if (model_->games[row].id == installedId) {
         table_->setCurrentIndex(proxy_->mapFromSource(model_->index(row, 0)));
@@ -1365,59 +1369,88 @@ void Window::installFromPeer() {
     }
 }
 void Window::syncSavesFromPeer(const QString &gameId, QWidget *parent) {
-    if (!library_ || !rootAvailable()) throw std::runtime_error("Reconnect the Games folder before syncing saves.");
+    if (!library_ || !rootAvailable()) throw std::runtime_error("Reconnect the Games folder before transferring saves.");
+    if (loadSaveServerConfig(*library_).enabled)
+        throw std::runtime_error("Turn off automatic server sync before transferring peer saves.");
     if (loadSaveConfig(*library_, gameId).mappings.isEmpty())
-        throw std::runtime_error("Choose this game's save location before syncing.");
-    if (trustedPeers(*library_).isEmpty()) {
+        throw std::runtime_error("Choose this game's save location before transferring saves.");
+    auto peers = trustedPeers(*library_);
+    if (peers.isEmpty()) {
         devices();
-        if (trustedPeers(*library_).isEmpty()) return;
+        peers = trustedPeers(*library_);
+        if (peers.isEmpty()) return;
+    }
+    QStringList choices;
+    for (const auto &peer : peers)
+        choices.append(peer.name + " · " + peer.fingerprint.left(12) +
+                       (peer.address.isEmpty() || peer.port == 0 ? " · no remembered address" : QString()));
+    QDialog chooser(parent); chooser.setWindowTitle("Transfer saves");
+    auto chooserLayout = new QVBoxLayout(&chooser);
+    chooserLayout->addWidget(new QLabel("Choose the source device:", &chooser));
+    auto source = new QComboBox(&chooser); source->addItems(choices); chooserLayout->addWidget(source);
+    auto chooserButtons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &chooser);
+    chooserLayout->addWidget(chooserButtons);
+    connect(chooserButtons, &QDialogButtonBox::accepted, &chooser, &QDialog::accept);
+    connect(chooserButtons, &QDialogButtonBox::rejected, &chooser, &QDialog::reject);
+    if (chooser.exec() != QDialog::Accepted) return;
+    const auto selected = source->currentIndex();
+    if (selected < 0) return;
+    const auto peer = peers[selected];
+    if (peer.address.isEmpty() || peer.port == 0) {
+        QMessageBox::information(parent, "Transfer saves", "Open Devices and connect to this paired device first.");
+        return;
     }
     const auto root = library_->root();
-    auto work = std::async(std::launch::async, [root, gameId] {
+    auto work = std::async(std::launch::async, [root, gameId, fingerprint = peer.fingerprint] {
         Library worker(root);
-        const auto result = refreshLinkedPeerSaves(worker, gameId);
-        return std::pair{result, adoptInitialPeerSave(worker, gameId)};
+        const auto result = refreshLinkedPeerSaves(worker, gameId, 5000, fingerprint);
+        if (!result.issues.isEmpty() || result.latestSnapshotId.isEmpty()) return std::pair{result, SaveSnapshot{}};
+        return std::pair{result, captureVerifiedSaveState(worker, gameId, "before manual peer transfer")};
     });
-    RemovalProgress progress(parent); progress.setWindowTitle("Syncing saves");
+    RemovalProgress progress(parent); progress.setWindowTitle("Fetching saves");
     auto progressLayout = new QVBoxLayout(&progress);
-    progressLayout->addWidget(new QLabel("Checking paired devices and verified save history…", &progress));
+    progressLayout->addWidget(new QLabel("Checking the selected device and verifying both save states…", &progress));
     progress.resize(420, 100);
     QTimer poll; poll.setInterval(60);
     connect(&poll, &QTimer::timeout, &progress, [&] {
         if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
     });
     poll.start(); progress.exec(); poll.stop();
-    const auto [result, adopted] = work.get();
-    if (adopted) { message("Verified peer saves are ready to play."); refresh(); return; }
-    if (!result.issues.isEmpty())
-        QMessageBox::information(parent, "Save sync", result.issues.join("\n"));
+    const auto [result, local] = work.get();
+    if (!result.issues.isEmpty()) {
+        QMessageBox::information(parent, "Transfer saves", result.issues.join("\n"));
+        return;
+    }
     if (result.peersChecked == 0) {
-        QMessageBox::information(parent, "Save sync", "No paired device has a remembered address yet. Open Devices to connect to your peer.");
+        QMessageBox::information(parent, "Transfer saves", "The selected device is unavailable. Open Devices to reconnect it.");
         return;
     }
-    const auto candidates = importedSaveCandidates(*library_, gameId);
-    if (candidates.isEmpty()) return;
-    if (candidates.size() != 1 || candidates.first().relation == "conflict") {
-        QMessageBox::information(parent, "Save conflict",
-            "Both devices have save progress. Both copies are preserved in Backup history; choose one to restore there.");
+    const auto snapshotId = result.latestSnapshotId;
+    if (snapshotId.isEmpty()) {
+        QMessageBox::information(parent, "Transfer saves", "This device has no verified save state for the matching game.");
         return;
     }
-    const auto snapshotId = candidates.first().snapshotId;
-    if (QMessageBox::question(parent, "Continue with peer saves?",
-        "Restore the verified peer save? Novelty keeps a backup of your current progress.",
+    if (local.id == snapshotId) {
+        QMessageBox::information(parent, "Transfer saves", "These saves are already installed locally.");
+        return;
+    }
+    if (local.files > 0 && QMessageBox::question(parent, "Replace local saves?",
+        "Saves in this game's configured locations will be replaced with saves from " + peer.name +
+        ". Novelty will keep the current state so you can undo this transfer.",
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
-    auto restore = std::async(std::launch::async, [root, gameId, snapshotId] {
-        Library worker(root); restoreSaveSnapshot(worker, gameId, snapshotId);
+    auto restore = std::async(std::launch::async, [root, gameId, snapshotId, expected = local.id] {
+        Library worker(root); replaceSavesFromPeer(worker, gameId, snapshotId, expected);
     });
-    RemovalProgress restoring(parent); restoring.setWindowTitle("Restoring peer saves");
+    RemovalProgress restoring(parent); restoring.setWindowTitle("Transferring saves");
     auto restoringLayout = new QVBoxLayout(&restoring);
-    restoringLayout->addWidget(new QLabel("Verifying and restoring peer progress…", &restoring));
+    restoringLayout->addWidget(new QLabel("Installing the selected saves and recording Undo…", &restoring));
     restoring.resize(420, 100);
     QTimer restorePoll; restorePoll.setInterval(60);
     connect(&restorePoll, &QTimer::timeout, &restoring, [&] {
         if (restore.wait_for(std::chrono::seconds(0)) == std::future_status::ready) restoring.accept();
     });
     restorePoll.start(); restoring.exec(); restorePoll.stop(); restore.get();
+    message("Saves transferred from " + peer.name + ". Undo is available in Manage → Saves.");
 }
 void Window::manage() {
     auto g = selected(); if (!library_ || g.id.isEmpty() || model_->remoteGames.contains(g.id)) return;
@@ -1719,6 +1752,19 @@ void Window::manage() {
     auto discoveryStatus = new QLabel(savesTab); discoveryStatus->setObjectName("saveDiscoveryStatus");
     discoveryStatus->setWordWrap(true); discoveryStatus->setTextFormat(Qt::PlainText);
     savesLayout->addWidget(discoveryStatus);
+    auto serverLinkLabel = new QLabel("Server game link", savesTab);
+    auto serverGameKey = new QLineEdit(savesTab); serverGameKey->setObjectName("serverGameKey");
+    serverGameKey->setToolTip("Independent installations can use the same explicit key to share one server save state. P2P installations already share a stable default key.");
+    try {
+        const auto config = loadSaveConfig(*library_, g.id);
+        serverGameKey->setText(config.serverGameKey);
+        serverGameKey->setPlaceholderText(config.profileGameId);
+        const bool serverMode = loadSaveServerConfig(*library_).enabled;
+        serverLinkLabel->setVisible(serverMode); serverGameKey->setVisible(serverMode);
+    } catch (const std::exception &) {
+        serverLinkLabel->hide(); serverGameKey->hide();
+    }
+    savesLayout->addWidget(serverLinkLabel); savesLayout->addWidget(serverGameKey);
     auto mappingRow = new QHBoxLayout;
     auto mappingPath = new QLineEdit(savesTab); mappingPath->setObjectName("saveLocation");
     mappingPath->setPlaceholderText("Save folder or file, for example UserData");
@@ -1739,9 +1785,15 @@ void Window::manage() {
     auto snapshotActions = new QHBoxLayout;
     auto restoreSnapshot = new QPushButton("Restore selected…", savesTab);
     restoreSnapshot->setObjectName("restoreSaveSnapshot");
-    auto syncFromPeer = new QPushButton("Sync", savesTab); syncFromPeer->setObjectName("syncSavesFromPeer");
-    snapshotActions->addWidget(restoreSnapshot); snapshotActions->addWidget(syncFromPeer); snapshotActions->addStretch();
+    auto syncFromPeer = new QPushButton("Transfer saves…", savesTab); syncFromPeer->setObjectName("syncSavesFromPeer");
+    auto undoPeerTransfer = new QPushButton("Undo last transfer…", savesTab);
+    undoPeerTransfer->setObjectName("undoPeerSaveTransfer");
+    auto resolveServer = new QPushButton("Resolve server saves…", savesTab);
+    resolveServer->setObjectName("resolveServerSaves");
+    snapshotActions->addWidget(restoreSnapshot); snapshotActions->addWidget(syncFromPeer);
+    snapshotActions->addWidget(undoPeerTransfer); snapshotActions->addWidget(resolveServer); snapshotActions->addStretch();
     savesLayout->addLayout(snapshotActions);
+    syncFromPeer->setEnabled(false); undoPeerTransfer->setEnabled(false); resolveServer->hide();
     auto saveMessage = new QLabel(savesTab); saveMessage->setWordWrap(true); saveMessage->setTextFormat(Qt::PlainText);
     savesLayout->addWidget(saveMessage);
     auto renderSnapshots = [this, snapshots, id = g.id] {
@@ -1793,6 +1845,11 @@ void Window::manage() {
     };
     try {
         renderSnapshots(); renderSaveStatus();
+        const bool serverMode = loadSaveServerConfig(*library_).enabled;
+        syncFromPeer->setEnabled(!serverMode);
+        undoPeerTransfer->setEnabled(!serverMode && QFileInfo::exists(library_->gamePath(g.id, "save-transfer-undo.json")));
+        resolveServer->setVisible(serverMode && library_->status(g) == "Save conflict");
+        if (serverMode) saveMessage->setText("Automatic server sync is enabled. Peer save transfer is available when it is turned off in Settings.");
     } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
     connect(saveCandidates, &QListWidget::currentItemChanged, &d, [mappingPath, saveMessage](QListWidgetItem *item) {
         if (!item) return;
@@ -1815,24 +1872,113 @@ void Window::manage() {
             mappingPath->setModified(true); saveMessage->clear();
         } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
     });
-    auto editedSaveMappings = [this, &g, mappingPath]() -> std::optional<SaveConfig> {
-        if (!mappingPath->isModified()) return std::nullopt;
+    auto editedSaveMappings = [this, &g, mappingPath, serverGameKey]() -> std::optional<SaveConfig> {
+        if (!mappingPath->isModified() && !serverGameKey->isModified()) return std::nullopt;
         auto config = loadSaveConfig(*library_, g.id);
-        const auto path = mappingPath->text().trimmed();
-        if (path.isEmpty()) {
-            config.mappings.clear(); config.discoveryState = "searching"; config.discoverySource.clear();
-        } else {
-            config.mappings = {saveMappingFromPath(*library_, g, path)};
-            config.discoveryState = "identified"; config.discoverySource = "manual";
+        if (serverGameKey->isModified()) config.serverGameKey = serverGameKey->text().trimmed();
+        if (mappingPath->isModified()) {
+            const auto path = mappingPath->text().trimmed();
+            if (path.isEmpty()) {
+                config.mappings.clear(); config.discoveryState = "searching"; config.discoverySource.clear();
+            } else {
+                config.mappings = {saveMappingFromPath(*library_, g, path)};
+                config.discoveryState = "identified"; config.discoverySource = "manual";
+            }
         }
         return config;
     };
     connect(syncFromPeer, &QPushButton::clicked, &d, [&, renderSnapshots, renderSaveStatus] {
         try {
-            if (mappingPath->isModified()) { saveMessage->setText("Save the new location before syncing."); return; }
+            if (mappingPath->isModified()) { saveMessage->setText("Save the new location before transferring saves."); return; }
             syncSavesFromPeer(g.id, &d);
             renderSnapshots(); renderSaveStatus();
+            undoPeerTransfer->setEnabled(QFileInfo::exists(library_->gamePath(g.id, "save-transfer-undo.json")));
             saveMessage->clear();
+        } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
+    });
+    connect(undoPeerTransfer, &QPushButton::clicked, &d, [&, renderSnapshots, renderSaveStatus] {
+        if (mappingPath->isModified()) { saveMessage->setText("Save the new location before undoing a transfer."); return; }
+        try {
+            const auto root = library_->root(), id = g.id;
+            auto check = std::async(std::launch::async, [root, id] {
+                Library worker(root); return peerTransferUndo(worker, id);
+            });
+            RemovalProgress checking(&d); checking.setWindowTitle("Checking transfer Undo");
+            auto checkingLayout = new QVBoxLayout(&checking);
+            checkingLayout->addWidget(new QLabel("Verifying the saved Undo point and current progress…", &checking));
+            QTimer checkPoll; checkPoll.setInterval(60);
+            connect(&checkPoll, &QTimer::timeout, &checking, [&] {
+                if (check.wait_for(std::chrono::seconds(0)) == std::future_status::ready) checking.accept();
+            });
+            checkPoll.start(); checking.exec(); checkPoll.stop();
+            const auto undo = check.get();
+            if (undo.rollbackSnapshotId.isEmpty()) { saveMessage->setText("No transfer Undo is available."); return; }
+            const auto warning = undo.liveChanged ?
+                "Current saves changed since the transfer. Novelty will keep them in Backup history, then restore the state from before the transfer. Continue?" :
+                "Restore the saves from before the last peer transfer?";
+            if (QMessageBox::question(&d, "Undo last transfer?", warning,
+                                      QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+            auto work = std::async(std::launch::async, [root, id, preserveChanged = undo.liveChanged] {
+                Library worker(root); undoPeerSaveTransfer(worker, id, preserveChanged);
+            });
+            RemovalProgress restoring(&d); restoring.setWindowTitle("Undoing peer transfer");
+            auto restoringLayout = new QVBoxLayout(&restoring);
+            restoringLayout->addWidget(new QLabel("Restoring the saved pre-transfer state…", &restoring));
+            QTimer restorePoll; restorePoll.setInterval(60);
+            connect(&restorePoll, &QTimer::timeout, &restoring, [&] {
+                if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) restoring.accept();
+            });
+            restorePoll.start(); restoring.exec(); restorePoll.stop(); work.get();
+            renderSnapshots(); renderSaveStatus(); undoPeerTransfer->setEnabled(false);
+            saveMessage->setText("The prior saves were restored. Any changed progress was kept in Backup history.");
+        } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
+    });
+    connect(resolveServer, &QPushButton::clicked, &d, [&, renderSnapshots, renderSaveStatus] {
+        if (mappingPath->isModified() || serverGameKey->isModified()) { saveMessage->setText("Save the new location or server link before resolving server saves."); return; }
+        try {
+            const auto config = loadSaveServerConfig(*library_);
+            const auto root = library_->root(), id = g.id;
+            auto check = std::async(std::launch::async, [root, id, config] {
+                Library worker(root); return reviewServerSaveConflict(worker, id, config);
+            });
+            RemovalProgress checking(&d); checking.setWindowTitle("Checking server saves");
+            auto checkingLayout = new QVBoxLayout(&checking);
+            checkingLayout->addWidget(new QLabel("Checking current local files and the server revision…", &checking));
+            QTimer checkPoll; checkPoll.setInterval(60);
+            connect(&checkPoll, &QTimer::timeout, &checking, [&] {
+                if (check.wait_for(std::chrono::seconds(0)) == std::future_status::ready) checking.accept();
+            });
+            checkPoll.start(); checking.exec(); checkPoll.stop();
+            const auto preview = check.get();
+            QMessageBox choice(&d);
+            choice.setWindowTitle("Resolve server saves");
+            choice.setIcon(QMessageBox::Warning);
+            choice.setText("Choose which complete save state to keep for " + g.name + ".");
+            choice.setInformativeText("Local: " + QString::number(preview.verifiedLive["files"].toInt()) +
+                " files. Server revision " + QString::number(preview.remote.revision) + ": " +
+                QString::number(preview.remote.files) +
+                " files. The replaced local state stays in Backup history. The choice is checked again before anything changes.");
+            auto useLocal = choice.addButton("Keep local saves", QMessageBox::AcceptRole);
+            auto useServer = choice.addButton("Use server saves", QMessageBox::DestructiveRole);
+            useServer->setEnabled(preview.remote.revision > 0);
+            choice.addButton(QMessageBox::Cancel);
+            choice.exec();
+            if (choice.clickedButton() != useLocal && choice.clickedButton() != useServer) return;
+            const bool local = choice.clickedButton() == useLocal;
+            auto work = std::async(std::launch::async, [root, id, config, preview, local] {
+                Library worker(root); resolveServerSaveConflict(worker, id, config, preview, local);
+            });
+            RemovalProgress resolving(&d); resolving.setWindowTitle("Resolving server saves");
+            auto resolvingLayout = new QVBoxLayout(&resolving);
+            resolvingLayout->addWidget(new QLabel("Verifying and applying the chosen save state…", &resolving));
+            QTimer resolvePoll; resolvePoll.setInterval(60);
+            connect(&resolvePoll, &QTimer::timeout, &resolving, [&] {
+                if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) resolving.accept();
+            });
+            resolvePoll.start(); resolving.exec(); resolvePoll.stop(); work.get();
+            renderSnapshots(); renderSaveStatus(); resolveServer->hide();
+            saveMessage->setText("Chosen saves accepted by the server. Replaced local progress remains in Backup history.");
+            refresh();
         } catch (const std::exception &e) { saveMessage->setText(QString::fromUtf8(e.what())); }
     });
     connect(restoreSnapshot, &QPushButton::clicked, &d, [&, renderSnapshots, renderSaveStatus] {
@@ -1942,9 +2088,10 @@ void Window::manage() {
                 g.environment.insert(line.left(pos).trimmed(), line.mid(pos + 1));
             }
             const auto saveConfig = editedSaveMappings();
-            const bool savePathChanged = saveConfig.has_value();
+            const bool savePathChanged = mappingPath->isModified();
+            const bool serverLinkChanged = serverGameKey->isModified();
             library_->save(g, saveConfig ? &*saveConfig : nullptr);
-            mappingPath->setModified(false); d.accept();
+            mappingPath->setModified(false); serverGameKey->setModified(false); d.accept();
             if (savePathChanged && !loadSaveConfig(*library_, g.id).mappings.isEmpty()) {
                 const auto root = library_->root(), id = g.id;
                 auto work = std::async(std::launch::async, [root, id] {
@@ -1966,6 +2113,14 @@ void Window::manage() {
                         library_->recordStatus(g.id, "Save needs attention", issue); message(issue);
                     }
                 }
+            }
+            if ((savePathChanged || serverLinkChanged) && library_->status(library_->game(g.id)) != "Save needs attention") {
+                try {
+                    if (loadSaveServerConfig(*library_).enabled) {
+                        library_->recordStatus(g.id, "Sync pending", "Checking updated save settings with the server.");
+                        QTimer::singleShot(0, this, [this] { retryPendingServerSaves(); });
+                    }
+                } catch (const std::exception &) { /* Settings remain available for review. */ }
             }
         } catch (const std::exception &e) { QMessageBox::warning(&d, "Cannot save", QString::fromUtf8(e.what())); }
     }); d.exec(); refresh();
@@ -2128,53 +2283,6 @@ bool Window::prepareLaunchRuntime(Game &g) {
     } else if (settingsBefore != library_->settings()) refresh();
     return true;
 }
-bool Window::applyIncomingSavesBeforePlay(const QString &gameId) {
-    QList<ImportedSaveCandidate> candidates;
-    try {
-        candidates = importedSaveCandidates(*library_, gameId);
-        if (!candidates.isEmpty()) {
-            captureAvailableSaveSnapshot(*library_, gameId, "before peer restore");
-            candidates = importedSaveCandidates(*library_, gameId);
-        }
-    } catch (const std::exception &e) {
-        message("Peer saves could not be checked; using local saves. " + QString::fromUtf8(e.what()));
-        return true;
-    }
-    if (candidates.isEmpty()) return true;
-    QList<ImportedSaveCandidate> newer;
-    bool conflict = false;
-    for (const auto &candidate : candidates) {
-        if (candidate.relation == "conflict") conflict = true;
-        else if (candidate.relation == "ahead" || candidate.relation == "available") newer.append(candidate);
-    }
-    if (conflict || newer.size() > 1) {
-        const auto choice = QMessageBox::question(this, "Different saves on paired devices",
-            "Paired-device save histories differ. Both copies are preserved in Manage → Saves. Play using the current local saves?",
-            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-        return choice == QMessageBox::Yes;
-    }
-    if (newer.isEmpty()) return true;
-    const auto root = library_->root(), snapshotId = newer.first().snapshotId;
-    try {
-        auto work = std::async(std::launch::async, [root, gameId, snapshotId] {
-            Library worker(root); restoreSaveSnapshot(worker, gameId, snapshotId);
-        });
-        RemovalProgress progress(this); progress.setWindowTitle("Applying paired-device saves");
-        auto layout = new QVBoxLayout(&progress);
-        layout->addWidget(new QLabel("Verifying and restoring the newer save before Play…", &progress));
-        progress.resize(440, 110);
-        QTimer poll; poll.setInterval(60);
-        connect(&poll, &QTimer::timeout, &progress, [&] {
-            if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
-        });
-        poll.start(); progress.exec(); poll.stop(); work.get();
-        refresh();
-        return true;
-    } catch (const std::exception &e) {
-        message("Newer peer saves could not be applied: " + QString::fromUtf8(e.what()));
-        return false;
-    }
-}
 void Window::launch(bool prepareOnly, const QString &tool, const std::optional<ExtraLaunch> &extra, bool installing, bool debugWine) {
     auto g = selected(); if (!library_ || g.id.isEmpty() || !pendingLaunch_.isEmpty() || importing_) return;
     if (model_->remoteGames.contains(g.id)) { if (!prepareOnly && tool.isEmpty() && !extra && !installing) installFromPeer(); return; }
@@ -2188,20 +2296,6 @@ void Window::launch(bool prepareOnly, const QString &tool, const std::optional<E
             if (!chooseExecutable(g.id)) return;
             g = library_->game(g.id);
         }
-        if (!installing && !prepareOnly && tool.isEmpty() && !extra) {
-            const auto peers = trustedPeers(*library_);
-            if (!peers.isEmpty()) {
-                message("Checking paired-device saves before Play…");
-                try {
-                    const auto result = refreshLinkedPeerSaves(*library_, g.id);
-                    if (!result.issues.isEmpty())
-                        message("Some peers are unavailable; local saves remain usable. " + result.issues.join(" "));
-                } catch (const std::exception &e) {
-                    message("Peer sync failed; local saves remain usable. " + QString::fromUtf8(e.what()));
-                }
-            }
-            if (!applyIncomingSavesBeforePlay(g.id)) return;
-        }
         if (!prepareLaunchRuntime(g)) { message("Play preparation was cancelled. Your game and existing settings were kept."); return; }
         if (installing) extraLaunchCommand(*library_, g, {g.installer, {}, {}});
         else if (extra) extraLaunchCommand(*library_, g, *extra);
@@ -2209,7 +2303,6 @@ void Window::launch(bool prepareOnly, const QString &tool, const std::optional<E
         library_->recordStatus(g.id, "Starting");
         QProcess p; p.setProgram(launcherExecutable_);
         QStringList arguments{"--root", library_->root(), installing ? "--install" : prepareOnly ? "--prepare" : "--run", g.id};
-        if (!installing && !prepareOnly && tool.isEmpty() && !extra) arguments.append("--peer-checked");
         if (!tool.isEmpty()) arguments.append({"--prefix-tool", tool});
         if (debugWine) arguments.append("--debug-wine");
         if (extra) {

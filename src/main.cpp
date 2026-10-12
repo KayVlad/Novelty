@@ -1,7 +1,8 @@
 #include "core.h"
 #include "window.h"
 #include "saves.h"
-#include "lan_sync.h"
+#include "save_server_config.h"
+#include "save_server_sync.h"
 #include <QtWidgets/qapplication.h>
 #include <QtCore/qcommandlineparser.h>
 #include <QtCore/qcoreapplication.h>
@@ -53,7 +54,7 @@ int main(int argc, char **argv) {
     bool headless = false;
     for (int i = 1; i < argc; ++i) {
         const auto option = QByteArray(argv[i]).split('=').first();
-        if (option == "--install" || option == "--debug-wine" || option == "--run" || option == "--prepare" || option == "--prefix-tool" || option == "--peer-checked" || option.startsWith("--extra-") || option == "--list" || option == "--version" || option == "--help") headless = true;
+        if (option == "--install" || option == "--debug-wine" || option == "--run" || option == "--prepare" || option == "--sync-server-game" || option == "--prefix-tool" || option == "--peer-checked" || option.startsWith("--extra-") || option == "--list" || option == "--version" || option == "--help") headless = true;
     }
     std::unique_ptr<QCoreApplication> app;
     if (headless) app = std::make_unique<QCoreApplication>(argc, argv);
@@ -66,6 +67,7 @@ int main(int argc, char **argv) {
     parser.addOption({"novelty-shortcut", "Steam shortcut identity marker", "identity"});
     parser.addOption({"install", "Run the installer for a pending installation", "id"});
     parser.addOption({"prepare", "Prepare a saved installation without opening the UI", "id"});
+    parser.addOption({"sync-server-game", "Retry pending server saves for a saved installation", "id"});
     parser.addOption({"prefix-tool", "Open winecfg or regedit in the --run installation's prefix", "tool"});
     parser.addOption({"extra-exe", "Run a Windows .exe once in the --run installation's prefix", "path"});
     parser.addOption({"extra-cwd", "Working directory for --extra-exe (defaults to its folder)", "path"});
@@ -79,10 +81,10 @@ int main(int argc, char **argv) {
     try {
         if (headless) {
             if (!parser.isSet("root")) throw std::runtime_error("--root is required for headless commands.");
-            if (int(parser.isSet("run")) + int(parser.isSet("prepare")) + int(parser.isSet("list")) + int(parser.isSet("install")) != 1 ||
+            if (int(parser.isSet("run")) + int(parser.isSet("prepare")) + int(parser.isSet("list")) + int(parser.isSet("install")) + int(parser.isSet("sync-server-game")) != 1 ||
                 (parser.isSet("prefix-tool") && (!parser.isSet("run") || parser.value("prefix-tool").isEmpty())) ||
                 (parser.isSet("peer-checked") && !parser.isSet("run")))
-                throw std::runtime_error("Choose exactly one of --run, --prepare, --install or --list. --prefix-tool requires --run and a tool name.");
+                throw std::runtime_error("Choose exactly one of --run, --prepare, --install, --list or --sync-server-game. --prefix-tool requires --run and a tool name.");
             std::optional<novelty::ExtraLaunch> extra;
             if (parser.isSet("extra-exe") || parser.isSet("extra-cwd") || parser.isSet("extra-arg")) {
                 if (!parser.isSet("run") || !parser.isSet("extra-exe") || parser.value("extra-exe").isEmpty() || parser.isSet("prefix-tool"))
@@ -92,36 +94,16 @@ int main(int argc, char **argv) {
             if (parser.isSet("debug-wine") && (!parser.isSet("run") || parser.isSet("prefix-tool") || extra))
                 throw std::runtime_error("--debug-wine requires an ordinary --run game launch.");
             novelty::Library lib(parser.value("root"));
+            if (parser.isSet("sync-server-game")) {
+                const auto config = novelty::loadSaveServerConfig(lib);
+                if (!config.enabled) return 0;
+                const auto result = novelty::retryPendingServerSave(lib, parser.value("sync-server-game"), config);
+                return result.status == novelty::ServerSyncStatus::Synced ? 0 :
+                       result.status == novelty::ServerSyncStatus::Conflict ? 3 : 4;
+            }
             if (parser.isSet("list")) {
                 for (auto g : lib.games()) std::printf("%s\t%s\t%s\n", qPrintable(g.id), qPrintable(g.name), qPrintable(lib.status(g)));
                 return 0;
-            }
-            if (parser.isSet("run") && !parser.isSet("prefix-tool") && !extra && !parser.isSet("peer-checked") &&
-                lib.recoveryIssue(parser.value("run")).isEmpty() &&
-                !lib.supervisorActive(parser.value("run"))) {
-                const auto id = parser.value("run");
-                bool conflict = false;
-                try {
-                    const auto refresh = novelty::refreshLinkedPeerSaves(lib, id);
-                    for (const auto &issue : refresh.issues)
-                        std::fprintf(stderr, "Novelty peer sync: %s\n", qPrintable(issue));
-                    auto candidates = novelty::importedSaveCandidates(lib, id);
-                    if (!candidates.isEmpty()) {
-                        novelty::captureAvailableSaveSnapshot(lib, id, "before peer restore");
-                        candidates = novelty::importedSaveCandidates(lib, id);
-                    }
-                    QList<novelty::ImportedSaveCandidate> newer;
-                    for (const auto &candidate : candidates) {
-                        if (candidate.relation == "conflict") conflict = true;
-                        else if (candidate.relation == "ahead" || candidate.relation == "available") newer.append(candidate);
-                    }
-                    conflict = conflict || newer.size() > 1;
-                    if (!conflict && newer.size() == 1) novelty::restoreSaveSnapshot(lib, id, newer.first().snapshotId);
-                } catch (const std::exception &e) {
-                    std::fprintf(stderr, "Novelty peer sync failed; keeping local saves: %s\n", e.what());
-                }
-                if (conflict)
-                    throw std::runtime_error("Paired-device saves conflict. Open Novelty → Manage → Saves to choose a copy before Play.");
             }
             return novelty::supervise(lib, parser.value(parser.isSet("install") ? "install" : parser.isSet("prepare") ? "prepare" : "run"), parser.isSet("prepare"), parser.value("prefix-tool"), extra, parser.isSet("install"), parser.isSet("debug-wine"));
         }

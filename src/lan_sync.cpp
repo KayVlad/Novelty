@@ -12,7 +12,7 @@
 namespace novelty {
 
 PeerRefreshResult refreshLinkedPeerSaves(Library &library, const QString &gameId,
-                                         int connectTimeoutMs) {
+                                         int connectTimeoutMs, const QString &selectedFingerprint) {
     if (connectTimeoutMs < 100 || connectTimeoutMs > 30000)
         throw std::runtime_error("Invalid peer connection timeout.");
     if (library.busy(gameId)) throw std::runtime_error("Wait for the game to finish before checking peer saves.");
@@ -21,6 +21,7 @@ PeerRefreshResult refreshLinkedPeerSaves(Library &library, const QString &gameId
     if (config.mappings.isEmpty()) return result;
     const auto peers = trustedPeers(library);
     for (const auto &peer : peers) {
+        if (!selectedFingerprint.isEmpty() && peer.fingerprint != selectedFingerprint) continue;
         QString linkedId;
         for (const auto &link : config.peerLinks)
             if (link.fingerprint == peer.fingerprint) { linkedId = link.profileGameId; break; }
@@ -79,10 +80,24 @@ PeerRefreshResult refreshLinkedPeerSaves(Library &library, const QString &gameId
                         return;
                     }
                     const auto snapshotId = match["snapshot_id"].toString();
+                    if (!selectedFingerprint.isEmpty()) result.latestSnapshotId = snapshotId;
                     if (snapshotId.isEmpty() || snapshotId == appliedSaveSnapshotId(library, gameId)) {
                         finish(); return;
                     }
                     try {
+                        if (!selectedFingerprint.isEmpty()) {
+                            if (QUuid(snapshotId).isNull()) throw std::runtime_error("Peer save head is invalid.");
+                            const auto advertised = match["snapshot_ids"].toArray();
+                            if (!advertised.isEmpty() && advertised.last().toString() != snapshotId)
+                                throw std::runtime_error("Peer save head does not match its history.");
+                            bool known = false;
+                            for (const auto &snapshot : listSaveSnapshots(library, gameId))
+                                if (snapshot.id == snapshotId) { known = true; break; }
+                            if (known) { verifiedSaveSnapshotBundle(library, gameId, snapshotId); finish(); return; }
+                            remaining = {snapshotId};
+                            fetchNext();
+                            return;
+                        }
                         QStringList history;
                         const auto advertised = match["snapshot_ids"].toArray();
                         if (advertised.size() > 64) throw std::runtime_error("Peer save history is too long.");

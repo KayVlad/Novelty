@@ -133,21 +133,22 @@ with tempfile.TemporaryDirectory(prefix='novelty-process-tests-') as temporary:
         assert save_manifest['files'] == 1 and save_manifest['items'][0]['path'] == 'UserData', 'headless Play did not capture its save'
         assert (save_state / 'snapshots' / save_head / 'items' / '0' / 'slot.sav').read_bytes() == b'headless saved progress'
 
-        # The UI already asked whether to keep local saves when it passes --peer-checked.
+        # Imported peer history must never block or replace ordinary headless Play.
         conflict_id = str(uuid.uuid4())
         conflict_folder = save_state / 'snapshots' / conflict_id
         shutil.copytree(save_state / 'snapshots' / save_head, conflict_folder)
         conflict_manifest = dict(save_manifest, id=conflict_id, profile_id=str(uuid.uuid4()), parent_ids=[])
         (conflict_folder / 'manifest.json').write_text(json.dumps(conflict_manifest))
-        assert command(save_root, '--run', save_id).returncode == 1, 'headless conflict should require a choice'
-        # Changes made outside the launcher must become a local branch before automatic restore.
+        (save_prefix / 'write-game-save').unlink()
+        assert command(save_root, '--run', save_id).returncode == 0, 'headless Play must ignore imported peer history'
+        # Changes made outside the launcher stay local during ordinary Play.
         conflict_manifest['parent_ids'] = [save_head]
         (conflict_folder / 'manifest.json').write_text(json.dumps(conflict_manifest))
         live_save = save_root / 'Game' / 'UserData' / 'slot.sav'
         live_save.write_bytes(b'progress made outside Novelty')
-        assert command(save_root, '--run', save_id).returncode == 1, 'unrecorded local progress was silently replaced by an ahead peer'
+        assert command(save_root, '--run', save_id).returncode == 0, 'ordinary headless Play must not apply an ahead peer save'
         assert live_save.read_bytes() == b'progress made outside Novelty'
-        assert command(save_root, '--run', save_id, '--peer-checked').returncode == 0, 'supervisor ignored the UI choice to play local saves'
+        assert command(save_root, '--run', save_id, '--peer-checked').returncode == 0, 'legacy shortcut marker remains compatible'
 
         # Kill the supervisor during a real game invocation, leaving its descendant alive.
         (prefix / 'release').unlink()

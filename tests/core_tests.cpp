@@ -327,8 +327,8 @@ void testSyncQueue(const QString &base) {
             "repeat pending save work stays durable and idempotent");
     touch(game.folder + "/saves/slot.sav", "second");
     const auto second = createSaveSnapshot(lib, game.id);
-    require(pendingPeerSync(lib).size() == 1 && pendingPeerSync(lib).first().snapshotId == second.id,
-            "new local capture durably replaces the pending peer head");
+    require(pendingPeerSync(lib).size() == 1 && pendingPeerSync(lib).first().snapshotId == first.id,
+            "new local captures do not schedule automatic peer transfers");
     queuePeerSync(lib, game.id, second.id);
     acknowledgePeerSync(lib, fingerprint, game.id, first.id);
     require(pendingPeerSync(lib).size() == 1 && pendingPeerSync(lib).first().snapshotId == second.id,
@@ -463,10 +463,11 @@ void testSaveDiscovery(const QString &base) {
             "empty conventional UserData folder is detected after Play");
     queuePostExitSaveSnapshot(lib, game);
     finishPostExitSaveSnapshot(lib, game);
-    require(listSaveSnapshots(lib, game.id).isEmpty(), "empty detected folder produces no snapshot");
+    require(listSaveSnapshots(lib, game.id).size() == 1 && listSaveSnapshots(lib, game.id).first().files == 0,
+            "post-Play capture records a verified empty save state");
     touch(game.folder + "/UserData/slot1.sav", "first launch progress");
     const auto first = createSaveSnapshot(lib, game.id);
-    require(createSaveSnapshot(lib, game.id).id == first.id && listSaveSnapshots(lib, game.id).size() == 1,
+    require(createSaveSnapshot(lib, game.id).id == first.id && listSaveSnapshots(lib, game.id).size() == 2,
             "unchanged save creates no duplicate snapshot");
     auto otherEdition = loadSaveConfig(lib, game.id); otherEdition.releaseIdentity = "different-edition";
     saveSaveConfig(lib, game.id, otherEdition);
@@ -508,7 +509,9 @@ void testSaveDiscovery(const QString &base) {
     queuePostExitSaveSnapshot(recipes, recipeGame);
     finishPostExitSaveSnapshot(recipes, recipeGame);
     require(!QFileInfo::exists(recipes.gamePath(recipeGame.id, "save-pending.json")) &&
-            listSaveSnapshots(recipes, recipeGame.id).isEmpty(), "empty known root clears pending capture without false snapshot");
+            listSaveSnapshots(recipes, recipeGame.id).size() == 1 &&
+            listSaveSnapshots(recipes, recipeGame.id).first().files == 0,
+            "empty known root clears pending capture with a verified empty snapshot");
 
     const auto legacyRoot = base + "/Save schema migration";
     touch(legacyRoot + "/Game/game.exe");

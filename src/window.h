@@ -20,6 +20,7 @@ class QLineEdit;
 class QStackedWidget;
 class QDialog;
 class QAction;
+class QProcess;
 
 namespace novelty {
 class VndbClient;
@@ -66,7 +67,6 @@ public:
     void installFromPeer();
     void refreshPeerGames();
     void syncPendingPeers();
-    bool applyIncomingSavesBeforePlay(const QString &gameId);
     void addGame();
     void launch(bool prepareOnly = false, const QString &tool = {}, const std::optional<ExtraLaunch> &extra = {}, bool installing = false, bool debugWine = false);
 private:
@@ -82,6 +82,7 @@ private:
     bool prepareLaunchRuntime(Game &game);
     void queueAutomaticMetadata(const QString &id);
     void startNextAutomaticMetadata();
+    void retryPendingServerSaves();
     Game selected() const;
     void queryPeerGames(const TrustedPeer &);
     std::unique_ptr<Library> library_;
@@ -108,6 +109,9 @@ private:
     QLineEdit *search_;
     QFileSystemWatcher watcher_;
     QTimer scanDelay_, scanPoll_, launchPoll_, syncTimer_;
+    QProcess *serverRetryProcess_ = nullptr;
+    QHash<QString, qint64> serverNextRetry_;
+    QHash<QString, int> serverRetryFailures_;
     std::future<DiscoverySnapshot> pendingScan_;
     CopyTracker copyTracker_;
     QElapsedTimer discoveryClock_;
