@@ -95,7 +95,10 @@ Command launchCommand(const Library &lib, const Game &g, bool prepare) {
         c.environment.insert("XDG_CACHE_HOME", cache);
         c.environment.insert("TMPDIR", temporary);
     }
-    if (prepare) c.arguments = {""};
+    // umu's documented empty-executable prefix creation starts Proton but then
+    // returns a missing-file error. Run a harmless Wine command so preparation
+    // has a meaningful exit status without starting the game.
+    if (prepare) c.arguments = {"C:\\windows\\system32\\cmd.exe", "/c", "exit", "0"};
     else { c.arguments = {g.executable}; c.arguments.append(g.arguments); }
     return c;
 }

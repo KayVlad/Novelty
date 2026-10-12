@@ -56,6 +56,9 @@ QString appliedSaveSnapshotId(const Library &, const QString &gameId);
 QString verifiedSaveSnapshotBundle(const Library &, const QString &gameId, const QString &snapshotId);
 QStringList saveSnapshotLineage(const Library &, const QString &gameId, int maxSnapshots = 64);
 QList<ImportedSaveCandidate> importedSaveCandidates(const Library &, const QString &gameId);
+// Apply one verified incoming head when this installation has no local progress.
+// Existing mapped save data is captured and left untouched instead.
+bool adoptInitialPeerSave(Library &, const QString &gameId);
 void restoreSaveSnapshot(Library &, const QString &gameId, const QString &snapshotId);
 SaveImportResult importSaveSnapshot(Library &, const QString &gameId, const QString &bundleDirectory,
                                     const QString &authenticatedPeer = {});

@@ -64,9 +64,9 @@ int main(int argc, char **argv) {
              "  mkdir -p \"$UMU_FOLDERS_PATH/umu/steamrt4\"\n"
              "  touch \"$UMU_FOLDERS_PATH/umu/steamrt4/.installed.ok\" \"$UMU_FOLDERS_PATH/umu/steamrt4/_v2-entry-point\";;\n"
              "esac\nmkdir -p \"$WINEPREFIX\"\ntouch \"$WINEPREFIX/system.reg\"\n"
-             "if [ -n \"$1\" ]; then touch \"$WINEPREFIX/played\"; fi\n");
+             "if [ \"$2\" != \"/c\" ]; then touch \"$WINEPREFIX/played\"; fi\n");
         QFile::setPermissions(umu, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
-        target.setSettings({{"umu", umu}});
+        target.setSettings({{"umu", umu}, {"runner", temp.path() + "/missing-runner"}});
         for (const auto &name : {"First", "Second"}) {
             const auto folder = sourceRoot + '/' + name;
             file(folder + "/game.exe", "game asset"); file(folder + "/save/slot.dat", "private progress");
@@ -93,6 +93,8 @@ int main(int argc, char **argv) {
         const auto prepared = [&] {
             for (const auto &game : target.games())
                 if (game.runner != runner || !setupComplete(target, game) || target.busy(game.id) ||
+                    target.status(game) != "Ready" ||
+                    appliedSaveSnapshotId(target, game.id).isEmpty() ||
                     QFileInfo::exists(target.prefix(game.id) + "/played")) return false;
             auto play = receiver.findChild<QAction *>("listPlayAction");
             return play && play->isEnabled(); // The UI has observed the supervisor finishing.
@@ -124,9 +126,11 @@ int main(int argc, char **argv) {
         require(target.games().size() == 1, "context Install must transfer one game");
         require(table->model()->rowCount() == 2, "installation must replace its remote card, not duplicate it");
         require(QFileInfo::exists(metadataCoverPath(target.dataRoot(), target.games().first().id)), "installed cover persists");
-        require(!QFileInfo::exists(target.games().first().folder + "/save/slot.dat"), "installation must not copy progress as assets");
-        require(!listSaveSnapshots(target, target.games().first().id).isEmpty(), "progress arrives through the save mechanism");
         require(waitFor(prepared), "context Install must select a local runner and complete setup without playing");
+        require(QFileInfo::exists(target.games().first().folder + "/save/slot.dat"), "fresh install applies peer progress after setup");
+        require(!appliedSaveSnapshotId(target, target.games().first().id).isEmpty() &&
+                importedSaveCandidates(target, target.games().first().id).isEmpty(),
+                "installed peer progress is current without a manual sync choice");
         QModelIndex second;
         for (int row = 0; row < table->model()->rowCount(); ++row) {
             const auto index = table->model()->index(row, 0);

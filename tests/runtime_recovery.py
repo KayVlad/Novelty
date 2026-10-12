@@ -25,7 +25,7 @@ if sys.argv[1] == '--child':
     while not (p / 'release').exists() and time.monotonic() < deadline:
         time.sleep(.02)
     sys.exit(0)
-if sys.argv[1] == '':
+if len(sys.argv) > 2 and sys.argv[2] == '/c':
     (p / 'system.reg').touch()
     (p / 'drive_c/windows/system32').mkdir(parents=True, exist_ok=True)
     (p / 'drive_c/windows/system32/winecfg.exe').touch()

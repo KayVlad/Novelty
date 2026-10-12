@@ -958,6 +958,16 @@ QList<ImportedSaveCandidate> importedSaveCandidates(const Library &lib, const QS
     }
     return result;
 }
+bool adoptInitialPeerSave(Library &lib, const QString &gameId) {
+    if (!currentHead(lib, gameId).isEmpty()) return false;
+    const auto candidates = importedSaveCandidates(lib, gameId);
+    if (candidates.size() != 1 || candidates.first().relation != "available") return false;
+    // A newly registered game should have empty mapped roots. If files appeared
+    // locally, retain and snapshot them before leaving the peer head for review.
+    if (captureAvailableSaveSnapshot(lib, gameId, "local progress before peer sync")) return false;
+    restoreSaveSnapshot(lib, gameId, candidates.first().snapshotId);
+    return true;
+}
 void restoreSaveSnapshot(Library &lib, const QString &gameId, const QString &snapshotId) {
     SaveLocks locks(lib, gameId);
     if (!saveRestoreIssue(lib, gameId).isEmpty()) fail("Recover the interrupted save restore before restoring another snapshot.");

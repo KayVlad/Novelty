@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
         const QString root = t.path() + "/Games"; QDir().mkpath(root);
         file(root + "/Game/game.exe"); file(t.path() + "/runner/proton");
         const auto fake = t.path() + "/fake-umu";
-        file(fake, "#!/bin/sh\nif [ \"$1\" = \"\" ]; then mkdir -p \"$WINEPREFIX/drive_c/windows/system32\"; touch \"$WINEPREFIX/system.reg\" \"$WINEPREFIX/drive_c/windows/system32/winecfg.exe\" \"$WINEPREFIX/drive_c/windows/regedit.exe\"; exit 0; fi\nprintf '%s\\n' \"$1\" \"$PWD\" > \"$WINEPREFIX/launched-paths\"\ntouch \"$WINEPREFIX/started\"\nsleep 1\ntouch \"$WINEPREFIX/survived\"\n");
+        file(fake, "#!/bin/sh\nif [ \"$2\" = \"/c\" ]; then mkdir -p \"$WINEPREFIX/drive_c/windows/system32\"; touch \"$WINEPREFIX/system.reg\" \"$WINEPREFIX/drive_c/windows/system32/winecfg.exe\" \"$WINEPREFIX/drive_c/windows/regedit.exe\"; exit 0; fi\nprintf '%s\\n' \"$1\" \"$PWD\" > \"$WINEPREFIX/launched-paths\"\ntouch \"$WINEPREFIX/started\"\nsleep 1\ntouch \"$WINEPREFIX/survived\"\n");
         QFile::setPermissions(fake, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
         Library lib(root); lib.setSettings({{"umu", fake}, {"runner", t.path() + "/runner"}});
         lib.import(discover(root), t.path() + "/runner"); const auto game = lib.games().first();
@@ -175,7 +175,7 @@ int main(int argc, char **argv) {
             const auto external = t.path() + "/Existing game"; file(external + "/game.exe");
             const auto installer = t.path() + "/External media/setup.exe"; file(installer);
             const auto installUmu = t.path() + "/install-umu";
-            file(installUmu, "#!/bin/sh\nif [ \"$1\" = \"\" ]; then mkdir -p \"$WINEPREFIX/drive_c\"; touch \"$WINEPREFIX/system.reg\"; exit 0; fi\ntouch \"$WINEPREFIX/installer-started\"\nsleep 0.3\ntouch \"$WINEPREFIX/dosdevices/n:/Story.exe\"\n");
+            file(installUmu, "#!/bin/sh\nif [ \"$2\" = \"/c\" ]; then mkdir -p \"$WINEPREFIX/drive_c\"; touch \"$WINEPREFIX/system.reg\"; exit 0; fi\ntouch \"$WINEPREFIX/installer-started\"\nsleep 0.3\ntouch \"$WINEPREFIX/dosdevices/n:/Story.exe\"\n");
             QFile::setPermissions(installUmu, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
             Library addLib(addRoot); addLib.setSettings({{"umu", installUmu}, {"runner", t.path() + "/runner"}});
             QString error; QString installingId;

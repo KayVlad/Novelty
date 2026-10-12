@@ -289,7 +289,7 @@ bool provisionSteamRuntime(QWidget *parent, const Library &library, const Game &
             environment.remove("UMU_ZENITY");
             environment.insert("UMU_LOG", "1");
             dialog.process.setProcessEnvironment(environment);
-            dialog.process.setProgram(command.program); dialog.process.setArguments({""});
+            dialog.process.setProgram(command.program); dialog.process.setArguments(command.arguments);
             dialog.process.setWorkingDirectory(library.dataRoot());
             details->clear(); phase->setText("Preparing " + variant + "…");
             progress->setText("Working…"); retry->setEnabled(false); dialog.cancelled = false;
@@ -453,7 +453,7 @@ bool provisionFirstPlay(QWidget *parent, Library &library, Game &game, const QSt
                     probe = std::make_unique<QTemporaryDir>(data + "/runtime-probe-XXXXXX");
                     if (!probe->isValid()) throw std::runtime_error("Cannot create temporary runtime setup data inside Games.");
                     auto command = launchCommand(library, game, true);
-                    program = command.program; arguments = {""}; environment = command.environment;
+                    program = command.program; arguments = command.arguments; environment = command.environment;
                     environment.insert("WINEPREFIX", probe->path() + "/prefix");
                     environment.insert("UMU_NO_PROTON", "0");
                     environment.remove("UMU_ZENITY"); // Nonempty "0" disables both umu 1.4.4 download paths.

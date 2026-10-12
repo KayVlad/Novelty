@@ -385,7 +385,7 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
         try {
             if (!library_) return;
             if (!rootAvailable()) {
-                launchPoll_.stop(); pendingLaunch_.clear(); refresh();
+                launchPoll_.stop(); pendingLaunch_.clear(); pendingPrepare_ = false; refresh();
                 message("Games library unavailable. Reconnect it and press Rescan."); return;
             }
             const auto j = readJson(library_->gamePath(pendingLaunch_, "status.json"));
@@ -396,16 +396,39 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
             if (!active && (state != "Starting" || !recovery.isEmpty())) {
                 const auto completedId = pendingLaunch_;
                 const bool completedInstaller = pendingInstaller_;
-                launchPoll_.stop(); pendingLaunch_.clear(); pendingInstaller_ = false;
+                const bool completedPrepare = pendingPrepare_;
+                launchPoll_.stop(); pendingLaunch_.clear(); pendingInstaller_ = false; pendingPrepare_ = false;
                 refresh(); message(recovery.isEmpty() ? j["message"].toString(state) : recovery); scanDelay_.start();
+                if (completedPrepare && recovery.isEmpty() && state == "Ready" &&
+                    !importedSaveCandidates(*library_, completedId).isEmpty()) {
+                    try {
+                        const auto root = library_->root();
+                        auto work = std::async(std::launch::async, [root, completedId] {
+                            Library worker(root);
+                            return adoptInitialPeerSave(worker, completedId);
+                        });
+                        RemovalProgress progress(this); progress.setWindowTitle("Applying peer saves");
+                        auto layout = new QVBoxLayout(&progress);
+                        layout->addWidget(new QLabel("Applying verified peer progress…", &progress));
+                        progress.resize(420, 100);
+                        QTimer poll; poll.setInterval(60);
+                        connect(&poll, &QTimer::timeout, &progress, [&] {
+                            if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
+                        });
+                        poll.start(); progress.exec(); poll.stop();
+                        if (work.get()) { refresh(); message("Game ready with peer saves."); }
+                    } catch (const std::exception &e) {
+                        message("Game prepared. Peer saves still need attention: " + QString::fromUtf8(e.what()));
+                    }
+                }
                 if (completedInstaller && recovery.isEmpty() && (state == "Ready" || state == "Installation pending") &&
                     library_->game(completedId).executable.isEmpty()) chooseExecutable(completedId);
                 if (completedInstaller && recovery.isEmpty()) queueAutomaticMetadata(completedId);
             } else if (!active && QDateTime::currentMSecsSinceEpoch() - launchStarted_ > 10000) {
-                launchPoll_.stop(); pendingLaunch_.clear(); pendingInstaller_ = false;
+                launchPoll_.stop(); pendingLaunch_.clear(); pendingInstaller_ = false; pendingPrepare_ = false;
                 message("The launch supervisor did not start. Check the command-line output."); selectGame();
             }
-        } catch (const std::exception &e) { launchPoll_.stop(); pendingLaunch_.clear(); pendingInstaller_ = false; message(QString::fromUtf8(e.what())); }
+        } catch (const std::exception &e) { launchPoll_.stop(); pendingLaunch_.clear(); pendingInstaller_ = false; pendingPrepare_ = false; message(QString::fromUtf8(e.what())); }
     });
     syncTimer_.setInterval(30000);
     connect(&syncTimer_, &QTimer::timeout, this, [this] { syncPendingPeers(); refreshPeerGames(); selectGame(); });
@@ -1313,9 +1336,25 @@ void Window::installFromPeer() {
     }
     refresh();
     try {
-        const auto result = refreshLinkedPeerSaves(*library_, installedId);
-        message(result.issues.isEmpty() ? "Game installed. Save history checked; preparing local setup…" :
-            "Game installed. Peer saves will be checked again before Play: " + result.issues.join(" "));
+        const auto root = library_->root();
+        auto work = std::async(std::launch::async, [root, installedId] {
+            Library worker(root);
+            const auto result = refreshLinkedPeerSaves(worker, installedId);
+            return result;
+        });
+        RemovalProgress progress(this); progress.setWindowTitle("Syncing installed game saves");
+        auto layout = new QVBoxLayout(&progress);
+        layout->addWidget(new QLabel("Checking verified peer save history…", &progress));
+        progress.resize(440, 110);
+        QTimer poll; poll.setInterval(60);
+        connect(&poll, &QTimer::timeout, &progress, [&] {
+            if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
+        });
+        poll.start(); progress.exec(); poll.stop();
+        const auto result = work.get();
+        message(result.issues.isEmpty() ?
+            "Game installed. Save history checked; preparing local setup…" :
+            "Game installed. Some peer saves need a later check: " + result.issues.join(" "));
     } catch (const std::exception &e) { message("Game installed. " + QString::fromUtf8(e.what())); }
     for (int row = 0; row < model_->games.size(); ++row) if (model_->games[row].id == installedId) {
         table_->setCurrentIndex(proxy_->mapFromSource(model_->index(row, 0)));
@@ -1335,7 +1374,9 @@ void Window::syncSavesFromPeer(const QString &gameId, QWidget *parent) {
     }
     const auto root = library_->root();
     auto work = std::async(std::launch::async, [root, gameId] {
-        Library worker(root); return refreshLinkedPeerSaves(worker, gameId);
+        Library worker(root);
+        const auto result = refreshLinkedPeerSaves(worker, gameId);
+        return std::pair{result, adoptInitialPeerSave(worker, gameId)};
     });
     RemovalProgress progress(parent); progress.setWindowTitle("Syncing saves");
     auto progressLayout = new QVBoxLayout(&progress);
@@ -1346,7 +1387,8 @@ void Window::syncSavesFromPeer(const QString &gameId, QWidget *parent) {
         if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
     });
     poll.start(); progress.exec(); poll.stop();
-    const auto result = work.get();
+    const auto [result, adopted] = work.get();
+    if (adopted) { message("Verified peer saves are ready to play."); refresh(); return; }
     if (!result.issues.isEmpty())
         QMessageBox::information(parent, "Save sync", result.issues.join("\n"));
     if (result.peersChecked == 0) {
@@ -2177,7 +2219,7 @@ void Window::launch(bool prepareOnly, const QString &tool, const std::optional<E
         p.setArguments(arguments);
         p.setWorkingDirectory(g.workingDirectory);
         if (!p.startDetached()) throw std::runtime_error("Could not start the launch supervisor.");
-        pendingLaunch_ = g.id; pendingInstaller_ = installing; launchStarted_ = QDateTime::currentMSecsSinceEpoch();
+        pendingLaunch_ = g.id; pendingInstaller_ = installing; pendingPrepare_ = prepareOnly; launchStarted_ = QDateTime::currentMSecsSinceEpoch();
         launchPoll_.start(); selectGame(); message(debugWine ? "Launching once with Wine debug…" : installing ? "Opening installer… Choose N:\\ as the destination." : extra ? "Starting executable…" : !tool.isEmpty() ? "Opening " + tool + "…" : prepareOnly ? "Preparing game…" : "Starting game…");
     } catch (const std::exception &e) { message(QString::fromUtf8(e.what())); }
 }

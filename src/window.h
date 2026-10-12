@@ -113,6 +113,7 @@ private:
     QElapsedTimer discoveryClock_;
     QString rootPath_, scanRoot_, pendingLaunch_;
     bool pendingInstaller_ = false;
+    bool pendingPrepare_ = false;
     bool rootRequiresDatabase_ = false;
     bool removing_ = false;
     bool importing_ = false;

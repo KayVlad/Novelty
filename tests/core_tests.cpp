@@ -392,7 +392,7 @@ void testSaveSnapshots(const QString &base) {
             !QFileInfo::exists(lib.gamePath(game.id, "save-restore.json")), "interrupted restore rolls back to original saves");
     const auto runner = base + "/Save runner", fake = base + "/save-umu";
     touch(runner + "/proton");
-    touch(fake, "#!/bin/sh\nif [ \"$1\" = \"\" ]; then mkdir -p \"$WINEPREFIX\"; touch \"$WINEPREFIX/system.reg\"; exit 0; fi\nprintf 'played game save' > \"$(dirname \"$1\")/game/saves/slot1.dat\"\nprintf 'played prefix save' > \"$WINEPREFIX/drive_c/users/steamuser/AppData/Roaming/NoveltyTest/progress.dat\"\n");
+    touch(fake, "#!/bin/sh\nif [ \"$2\" = \"/c\" ]; then mkdir -p \"$WINEPREFIX\"; touch \"$WINEPREFIX/system.reg\"; exit 0; fi\nprintf 'played game save' > \"$(dirname \"$1\")/game/saves/slot1.dat\"\nprintf 'played prefix save' > \"$WINEPREFIX/drive_c/users/steamuser/AppData/Roaming/NoveltyTest/progress.dat\"\n");
     QFile::setPermissions(fake, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     auto configured = lib.game(game.id); configured.runner = runner; lib.save(configured); lib.setSettings({{"umu", fake}});
     require(supervise(lib, game.id, false) == 0 && contents(gameSave) == "played game save" &&
@@ -645,7 +645,9 @@ void testSaveDiscovery(const QString &base) {
     require(importedSaveCandidates(destination, targetGame.id).size() == 1 &&
             importedSaveCandidates(destination, targetGame.id).first().relation == "available",
             "new peer save is visible before first Play");
-    restoreSaveSnapshot(destination, targetGame.id, portableSnapshot.id);
+    require(adoptInitialPeerSave(destination, targetGame.id) &&
+            !adoptInitialPeerSave(destination, targetGame.id),
+            "an empty fresh installation applies its one verified peer head once");
     require(importedSaveCandidates(destination, targetGame.id).isEmpty(),
             "applied peer save no longer appears as pending");
     require(contents(saveMappingRoot(destination, targetGame, "appdata") + "/Example/progress.sav") == "portable progress" &&
@@ -653,6 +655,23 @@ void testSaveDiscovery(const QString &base) {
             "verified snapshot restores under a different install folder and prefix");
     require(importSaveSnapshot(destination, targetGame.id, sourceSnapshotDir, sourceFingerprint).relation == "current",
             "repeated import recognizes the current snapshot without duplication");
+    const auto guardedRoot = base + "/Local progress before peer sync";
+    touch(guardedRoot + "/Game/game.exe");
+    Library guarded(guardedRoot); guarded.import({inspect(guardedRoot + "/Game")}, {});
+    const auto guardedGame = guarded.games().first();
+    auto guardedConfig = portable;
+    guardedConfig.profileId = guarded.profileId();
+    guardedConfig.profileGameId = loadSaveConfig(guarded, guardedGame.id).profileGameId;
+    saveSaveConfig(guarded, guardedGame.id, guardedConfig);
+    approvePairedPeer(guarded, sourceFingerprint, "Source Deck");
+    linkPeerSaveGame(guarded, guardedGame.id, sourceFingerprint, portable.profileGameId);
+    touch(saveMappingRoot(guarded, guardedGame, "appdata") + "/Example/progress.sav", "local progress");
+    importSaveSnapshot(guarded, guardedGame.id, sourceSnapshotDir, sourceFingerprint);
+    require(!adoptInitialPeerSave(guarded, guardedGame.id) &&
+            contents(saveMappingRoot(guarded, guardedGame, "appdata") + "/Example/progress.sav") == "local progress" &&
+            !appliedSaveSnapshotId(guarded, guardedGame.id).isEmpty() &&
+            importedSaveCandidates(guarded, guardedGame.id).first().relation == "conflict",
+            "initial peer adoption preserves and snapshots unexpected local progress");
     touch(saveMappingRoot(source, sourceGame, "appdata") + "/Example/progress.sav", "source branch");
     const auto sourceBranch = createSaveSnapshot(source, sourceGame.id);
     const auto sourceBranchManifest = readJson(QFileInfo(source.gamePath(sourceGame.id, "saves.json")).absolutePath() +
@@ -843,7 +862,7 @@ void testOneLaunchDiagnostics(const QString &base) {
     const auto runner = base + "/diagnostic-runner"; touch(runner + "/proton");
     const auto fake = base + "/diagnostic-umu";
     touch(fake, R"SH(#!/bin/sh
-if [ "$1" = "" ]; then mkdir -p "$WINEPREFIX/drive_c"; touch "$WINEPREFIX/system.reg"; exit 0; fi
+if [ "$2" = "/c" ]; then mkdir -p "$WINEPREFIX/drive_c"; touch "$WINEPREFIX/system.reg"; exit 0; fi
 printf '%s\n' "$WINEDEBUG" > "$WINEPREFIX/observed-debug"
 printf 'Synthetic Wine loader output\n'
 )SH");
@@ -880,7 +899,7 @@ void testGameInstallation(const QString &base) {
     const auto source = base + "/Installer media 日本語/setup.exe"; touch(source); touch(QFileInfo(source).absolutePath() + "/data.bin", "media");
     const auto fake = base + "/installer-umu";
     touch(fake, R"SH(#!/bin/sh
-if [ "$1" = "" ]; then mkdir -p "$WINEPREFIX/drive_c"; touch "$WINEPREFIX/system.reg"; exit 0; fi
+if [ "$2" = "/c" ]; then mkdir -p "$WINEPREFIX/drive_c"; touch "$WINEPREFIX/system.reg"; exit 0; fi
 printf '%s\n' "$1" "$PWD" >> "$WINEPREFIX/installer-invocations"
 printf '%s\n' "$HOST_LC_ALL" "$LANG" > "$WINEPREFIX/installer-locale"
 [ -f data.bin ] || exit 42
@@ -1059,7 +1078,7 @@ void testExtraLaunch(const QString &base) {
     const auto patch = base + "/Patches 日本語/patch.EXE";
     touch(root + "/Game/game.exe"); touch(runner + "/proton"); touch(patch);
     touch(fake, R"SH(#!/bin/sh
-if [ "$1" = "" ]; then
+if [ "$2" = "/c" ]; then
     mkdir -p "$WINEPREFIX"; touch "$WINEPREFIX/system.reg"
 else
     printf '%s\n' "$PWD" "$@" > "$WINEPREFIX/invocation"
@@ -1120,7 +1139,7 @@ void testPrefixTools(const QString &base) {
     const auto root = base + "/Prefix tools", runner = base + "/Tool runner", fake = base + "/tool-umu";
     touch(root + "/Game/game.exe"); touch(root + "/Game/winecfg.exe", "must not run"); touch(runner + "/proton");
     touch(fake, R"SH(#!/bin/sh
-if [ "$1" = "" ]; then
+if [ "$2" = "/c" ]; then
     mkdir -p "$WINEPREFIX/drive_c/windows/system32"
     touch "$WINEPREFIX/system.reg" "$WINEPREFIX/drive_c/windows/system32/winecfg.exe" "$WINEPREFIX/drive_c/windows/regedit.exe"
 else
@@ -1163,7 +1182,7 @@ void testSetupRecovery(const QString &base) {
     const auto fake = base + "/recovery-umu";
     touch(root + "/Game/game.exe"); touch(runner + "/proton"); touch(runner + "/version", "one");
     touch(fake, R"SH(#!/bin/sh
-if [ "$1" = "" ]; then
+if [ "$2" = "/c" ]; then
     mkdir -p "$WINEPREFIX"
     echo attempt >> "$WINEPREFIX/attempts"
     touch "$WINEPREFIX/system.reg"
@@ -1548,7 +1567,7 @@ int main(int argc, char **argv) {
         }
         auto runner = temp.path() + "/Proton Test"; touch(runner + "/proton"); touch(runner + "/version", "test-1\n");
         auto fake = temp.path() + "/fake umu";
-        touch(fake, "#!/bin/sh\nif [ \"$1\" = \"\" ]; then mkdir -p \"$WINEPREFIX\"; touch \"$WINEPREFIX/system.reg\"; exit 0; fi\nprintf '%s\\n' \"$PWD\" \"$PROTONPATH\" \"$WINEPREFIX\" \"$HOST_LC_ALL\" \"$@\" > \"$WINEPREFIX/invocation\"\nexit 0\n");
+        touch(fake, "#!/bin/sh\nif [ \"$2\" = \"/c\" ]; then mkdir -p \"$WINEPREFIX\"; touch \"$WINEPREFIX/system.reg\"; exit 0; fi\nprintf '%s\\n' \"$PWD\" \"$PROTONPATH\" \"$WINEPREFIX\" \"$HOST_LC_ALL\" \"$@\" > \"$WINEPREFIX/invocation\"\nexit 0\n");
         QFile::setPermissions(fake, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
         QString id;
         {
@@ -1568,6 +1587,9 @@ int main(int argc, char **argv) {
             g.environment.insert("WINEDLLOVERRIDES", "example=b"); lib.save(g);
             auto cmd = launchCommand(lib, g);
             require(cmd.arguments[1] == "argument with spaces", "no shell splitting");
+            require(launchCommand(lib, g, true).arguments ==
+                    QStringList({"C:\\windows\\system32\\cmd.exe", "/c", "exit", "0"}),
+                    "prefix preparation runs a harmless command instead of an empty executable");
             require(cmd.environment.value("WINEPREFIX") == lib.prefix(id), "dedicated prefix");
             require(cmd.environment.value("HOST_LC_ALL") == "ja_JP.UTF-8", "Proton locale override");
             require(lib.prefix(id) != lib.prefix(list[0].id), "isolated prefixes");
