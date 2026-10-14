@@ -1,5 +1,6 @@
 #include "core.h"
 #include "profiles.h"
+#include "recipes.h"
 #include "runtime.h"
 #include <QtCore/qdir.h>
 #include <QtCore/qdiriterator.h>
@@ -65,10 +66,16 @@ bool sameDevice(const QString &a, const QString &b) {
 }
 }
 
-FolderImportResult Library::addFolder(const QString &chosen) {
+FolderImportResult Library::addFolder(const QString &chosen, const QString &nativeLauncher) {
     if (chosen.trimmed().isEmpty() || !QFileInfo(chosen).isDir()) fail("Choose an existing game folder.");
     if (QFileInfo(chosen).isSymLink()) fail("Select the actual game folder, not a symbolic link.");
     const auto source = canonicalPath(chosen), destination = QDir(root()).filePath(QFileInfo(source).fileName());
+    QString selectedNative;
+    if (!nativeLauncher.isEmpty()) {
+        selectedNative = canonicalPath(nativeLauncher);
+        if (!selectedNative.startsWith(source + '/') || !nativeExecutable(nativeLauncher))
+            fail("Choose an executable Linux game inside the selected folder.");
+    }
     if (source == root() || within(root(), source) || source == dataRoot() || within(source, dataRoot()))
         fail("Select a game's own folder, outside Novelty's library data.");
     if (source != destination && within(source, root()))
@@ -102,10 +109,13 @@ FolderImportResult Library::addFolder(const QString &chosen) {
             fail("This folder overlaps files used by " + g.name);
     }
     if (source == destination) {
-        if (!previous.id.isEmpty()) return {previous, {}, false};
+        if (!previous.id.isEmpty()) {
+            if (!selectedNative.isEmpty()) fail("This game is already registered. Change its executable in Manage → Launch.");
+            return {previous, {}, false};
+        }
     } else {
         if (exists(destination)) fail("A folder with this name already exists in Games: " + destination);
-        if (!previous.id.isEmpty() && (previous.backend != "umu" || busy(previous.id)))
+        if (!previous.id.isEmpty() && (previous.backend == "steam" || busy(previous.id)))
             fail("This registered game is running or uses Steam; move it with Manage after it is idle.");
     }
     std::unique_ptr<QLockFile> gameLock;
@@ -153,13 +163,34 @@ FolderImportResult Library::addFolder(const QString &chosen) {
         if (!QFileInfo(path).isDir()) fail("The game folder disappeared before it could be scanned.");
         Game g;
         if (previous.id.isEmpty()) {
-            const auto candidate = inspect(path);
+            const auto candidate = inspect(path, root());
             g.id = QUuid::createUuid().toString(QUuid::WithoutBraces); g.name = candidate.name; g.folder = path;
-            g.engine = candidate.engine; g.evidence = candidate.evidence; g.setupProfile = defaultSetupProfile(candidate.engine);
-            g.runner = settings()["runner"].toString(); g.backend = settings()["backend"].toString("umu");
+            g.runner = settings()["runner"].toString(); g.backend = candidate.native ? "native" : settings()["backend"].toString("umu");
             g.runnerRevision = runnerVersion(g.runner); g.source = "discovered";
-            if (candidate.executables.size() == 1) g.executable = candidate.executables.first();
+            const auto choice = selectRecipe(root(), path, candidate.executables,
+                settings()["default_recipe"].toString("generic-game-v1"));
+            auto executables = candidate.executables;
+            if (choice.ambiguous()) {
+                for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
+            } else {
+                applyRecipeToGame(g, choice.selected());
+                if (choice.selected().settings.contains("runner") &&
+                    ((choice.selected().tier != "default" && choice.selected().runnerExplicit) ||
+                     !QFileInfo(QDir(g.runner).filePath("proton")).isFile())) {
+                    g.runner.clear(); g.runnerRevision.clear();
+                }
+                executables = recipeExecutables(choice.selected(), path, executables);
+            }
+            if (executables.size() == 1) g.executable = executables.first();
             g.workingDirectory = g.executable.isEmpty() ? path : QFileInfo(g.executable).absolutePath();
+            if (!choice.ambiguous() && !choice.selected().settings["working_directory"].toString().isEmpty())
+                g.workingDirectory = canonicalPath(QDir(path).filePath(choice.selected().settings["working_directory"].toString()));
+            if (!selectedNative.isEmpty()) {
+                g.executable = movedPath(selectedNative, source, path);
+                if (!nativeExecutable(g.executable)) fail("The selected Linux executable changed during import.");
+                g.workingDirectory = QFileInfo(g.executable).absolutePath();
+                g.backend = "native"; g.runner.clear(); g.runnerRevision.clear();
+            }
         } else {
             g = previous; g.folder = path; g.executable = movedPath(g.executable, source, path);
             g.workingDirectory = movedPath(g.workingDirectory, source, path);

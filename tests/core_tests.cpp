@@ -1,6 +1,7 @@
 #include "core.h"
 #include "setup.h"
 #include "profiles.h"
+#include "recipes.h"
 #include "saves.h"
 #include "steam_shortcut.h"
 #include "devices.h"
@@ -125,10 +126,58 @@ void testSetupRecipePrecedence() {
     require(engine.profileId == "generic-proton-v1" && engine.source.contains("engine"),
             "different release falls back to verified engine recipe");
     require(recommendSetupProfile("Generic").profileId == "generic-game-v1" &&
-            recommendSetupProfile("Ren'Py").profileId == "renpy-bundled-v1",
-            "generic and bundled engine baselines remain stable");
+            recommendSetupProfile("Ren'Py").profileId == "generic-game-v1",
+            "unverified engines do not select a compiled recipe");
     rejects([&] { recommendSetupProfile("Ren'Py", {}, {}, {{"fixture:story", {}, {}, "renpy-bundled-v1"}}); },
             "incomplete game recipe is rejected");
+}
+void testEditableRecipes(const QString &base) {
+    const auto root = base + "/recipe-library";
+    const auto game = root + "/Yosuga no Sora";
+    touch(game + "/Folder/Story.exe", "exe");
+    touch(game + "/Folder/renpy/__init__.py", "renpy");
+    QDir().mkpath(game + "/Folder/game");
+    Library library(root);
+    const QStringList executables{game + "/Folder/Story.exe"};
+    auto selected = selectRecipe(root, game, executables, "generic-vn-v1");
+    require(!selected.ambiguous() && selected.selected().id == "renpy-bundled-v1",
+            "nested Ren'Py structure matches an engine recipe");
+    touch(game + "/Folder/game/saves/slot.sav", "progress");
+    library.import({inspect(game, root)}, {});
+    const auto nestedGame = library.games().first();
+    const auto suggested = suggestedSaveMappings(library, nestedGame.id);
+    require(std::any_of(suggested.begin(), suggested.end(), [](const SaveMapping &mapping) {
+        return mapping.scope == "game" && mapping.path == "Folder/game/saves";
+    }),
+            "nested Ren'Py saves remain relative to the imported game folder");
+    const auto specific = [](const QString &id, const QJsonArray &conditions) {
+        return QJsonDocument(QJsonObject{{"schema", 1}, {"id", id}, {"name", "Story settings"},
+            {"match", QJsonObject{{"all", conditions}}},
+            {"settings", QJsonObject{{"executable", "Folder/Story.exe"}, {"runner", "proton-experimental"},
+                {"saves", QJsonArray{QJsonObject{{"scope", "game"}, {"path", "Folder/game/saves"}}}}}}}).toJson();
+    };
+    const QJsonArray exact{QJsonObject{{"file", "Folder/Story.exe"}}, QJsonObject{{"file_glob", "Folder/*.dat"}},
+        QJsonObject{{"file", "marker.txt"}}};
+    touch(game + "/Folder/assets.dat", "archive");
+    saveRecipe(root, "games", specific("story", exact));
+    selected = selectRecipe(root, game, executables, "generic-vn-v1");
+    require(selected.selected().id == "renpy-bundled-v1", "every game recipe condition is required");
+    touch(game + "/marker.txt");
+    selected = selectRecipe(root, game, executables, "generic-vn-v1");
+    require(!selected.ambiguous() && selected.selected().id == "story", "specific game recipe precedes engine");
+    Game configured; configured.folder = game;
+    applyRecipeToGame(configured, selected.selected());
+    require(configured.executable == game + "/Folder/Story.exe" && configured.runnerSelector == "proton-experimental" &&
+            configured.recipeSaves.size() == 1, "recipe settings use paths relative to the top-level game folder");
+    saveRecipe(root, "games", specific("story-alternative", exact));
+    selected = selectRecipe(root, game, executables, "generic-vn-v1");
+    require(selected.ambiguous() && selected.matches.size() == 2, "equal-tier complete matches require a choice");
+    QFile::remove(game + "/marker.txt");
+    QFile::remove(game + "/Folder/renpy/__init__.py");
+    selected = selectRecipe(root, game, executables, "generic-vn-v1");
+    require(selected.selected().id == "generic-vn-v1", "selected default is the final fallback");
+    rejects([&] { saveRecipe(root, "games", specific("bad", QJsonArray{QJsonObject{{"file", "../escape"}}})); },
+            "recipe paths cannot escape the game folder");
 }
 void testLegacyRuntimeMigration(const QString &base) {
     const auto root = base + "/legacy-runtime-library";
@@ -255,6 +304,190 @@ void testDeviceIdentity(const QString &base) {
         QFile::setPermissions(identity.privateKeyPath, QFile::ReadOwner | QFile::WriteOwner | QFile::ReadOther);
         rejects([&] { ensureDeviceIdentity(lib); }, "exposed private key fails closed");
     }
+}
+void testMovedLibrary(const QString &base) {
+    const auto oldRoot = base + "/Moved library old";
+    const auto newRoot = base + "/Moved library new";
+    touch(oldRoot + "/Story/play.exe", "game");
+    QString id, profile;
+    {
+        Library library(oldRoot);
+        library.import(discover(oldRoot), {});
+        auto game = library.games().first();
+        id = game.id; profile = library.profileId();
+        game.name = "Edited title";
+        game.runner = oldRoot + "/.novelty/runners/GE-Test";
+        touch(game.runner + "/proton", "runner");
+        library.save(game);
+        library.setSettings({{"runner", game.runner}, {"umu", "umu-run"}});
+        touch(library.prefix(id) + "/save.dat", "retained progress");
+    }
+    require(QDir().rename(oldRoot, newRoot), "move populated Games library");
+    {
+        Library library(newRoot);
+        const auto games = library.games();
+        require(games.size() == 1 && games.first().id == id && games.first().name == "Edited title",
+                "moved library retains its original game and installation identity");
+        require(games.first().folder == newRoot + "/Story" &&
+                games.first().executable == newRoot + "/Story/play.exe" &&
+                games.first().workingDirectory == newRoot + "/Story" &&
+                games.first().runner == newRoot + "/.novelty/runners/GE-Test" &&
+                library.settings()["runner"] == games.first().runner &&
+                library.settings()["umu"] == "umu-run",
+                "moved library rebases managed paths while retaining command names");
+        require(contents(library.prefix(id) + "/save.dat") == "retained progress" &&
+                library.profileId() == profile && library.import(discover(newRoot), {}) == 0,
+                "moved library retains saves/profile and does not discover duplicate games");
+    }
+    Library reopened(newRoot);
+    require(reopened.games().size() == 1 && reopened.game(id).folder == newRoot + "/Story",
+            "moved library remains stable after reopening");
+    {
+        auto db = QSqlDatabase::addDatabase("QSQLITE", "relative-path-fixture");
+        db.setDatabaseName(newRoot + "/.novelty/library.sqlite");
+        require(db.open(), "inspect moved library storage");
+        QSqlQuery query(db);
+        require(query.exec("SELECT folder,config FROM games") && query.next(), "inspect stored game paths");
+        const auto data = QJsonDocument::fromJson(query.value(1).toByteArray()).object();
+        require(query.value(0).toString() == "Story" && data["folder"] == "Story" &&
+                data["executable"] == "Story/play.exe" &&
+                data["runner"] == ".novelty/runners/GE-Test",
+                "database stores library-owned game paths relative to Games");
+        query.finish();
+        require(query.exec("SELECT value FROM settings WHERE key='app'") && query.next(),
+                "inspect stored library defaults");
+        const auto defaults = QJsonDocument::fromJson(query.value(0).toByteArray()).object();
+        require(defaults["runner"] == ".novelty/runners/GE-Test" && defaults["umu"] == "umu-run",
+                "database stores managed defaults relatively and keeps command names intact");
+        query.finish();
+        db.close(); db = QSqlDatabase(); QSqlDatabase::removeDatabase("relative-path-fixture");
+    }
+
+    const auto legacyRoot = base + "/Legacy move old";
+    const auto recoveredRoot = base + "/Legacy move new";
+    touch(legacyRoot + "/Classic/game.exe");
+    Game original;
+    {
+        Library library(legacyRoot);
+        library.import(discover(legacyRoot), {});
+        original = library.games().first();
+    }
+    {
+        auto db = QSqlDatabase::addDatabase("QSQLITE", "legacy-move-fixture");
+        db.setDatabaseName(legacyRoot + "/.novelty/library.sqlite");
+        require(db.open(), "open legacy moved library fixture");
+        QSqlQuery query(db);
+        require(query.exec("DELETE FROM settings WHERE key='path_format'"), "restore legacy absolute-path format");
+        query.prepare("UPDATE games SET folder=?, config=? WHERE id=?");
+        query.addBindValue(original.folder);
+        query.addBindValue(QString::fromUtf8(QJsonDocument(original.json()).toJson(QJsonDocument::Compact)));
+        query.addBindValue(original.id);
+        require(query.exec(), "restore legacy absolute game record");
+        db.close(); db = QSqlDatabase(); QSqlDatabase::removeDatabase("legacy-move-fixture");
+    }
+    require(QDir().rename(legacyRoot, recoveredRoot), "move legacy Games folder");
+    {
+        auto db = QSqlDatabase::addDatabase("QSQLITE", "duplicate-move-fixture");
+        db.setDatabaseName(recoveredRoot + "/.novelty/library.sqlite");
+        require(db.open(), "open moved legacy library before repair");
+        Game duplicate = original;
+        duplicate.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        duplicate.folder = recoveredRoot + "/Classic";
+        duplicate.executable = duplicate.folder + "/game.exe";
+        duplicate.workingDirectory = duplicate.folder;
+        duplicate.source = "discovered";
+        QSqlQuery query(db);
+        query.prepare("INSERT INTO games(id,folder,config) VALUES(?,?,?)");
+        query.addBindValue(duplicate.id); query.addBindValue(duplicate.folder);
+        query.addBindValue(QString::fromUtf8(QJsonDocument(duplicate.json()).toJson(QJsonDocument::Compact)));
+        require(query.exec(), "simulate duplicate discovered after library move");
+        db.close(); db = QSqlDatabase(); QSqlDatabase::removeDatabase("duplicate-move-fixture");
+    }
+    Library recovered(recoveredRoot);
+    require(recovered.games().size() == 1 && recovered.game(original.id).folder == recoveredRoot + "/Classic" &&
+            recovered.import(discover(recoveredRoot), {}) == 0,
+            "legacy copied library rebases its original record and removes an unused duplicate");
+}
+void testNestedGameDiscovery(const QString &base) {
+    const auto root = base + "/Nested game discovery";
+    const auto title = root + "/Title";
+    const auto executable = title + "/Game/Release/bin/Play.exe";
+    touch(executable, "game");
+    touch(title + "/OST/player.exe", "soundtrack utility");
+    touch(title + "/OST/track.flac", "music");
+    touch(title + "/Game/renpy/__init__.py");
+    touch(title + "/Game/game/options.rpy");
+    touch(root + "/.novelty/tools/Managed.exe", "managed tool");
+    touch(title + "/.novelty/tools/Hidden.exe", "managed tool");
+    const auto found = discover(root);
+    require(found.size() == 1 && found.first().folder == title && found.first().name == "Title" &&
+            found.first().executables == QStringList{executable} && found.first().engine == "Ren'Py",
+            "nested Game executable and engine belong to top-level Title; OST utility is secondary");
+    const auto scanned = scanDiscovery(root, {});
+    require(scanned.candidates.size() == 1 && scanned.candidates.first().folder == title &&
+            !scanned.folderIdentities.contains(root + "/.novelty") &&
+            !scanned.watchDirectories.contains(root + "/.novelty") &&
+            !scanned.watchDirectories.contains(title + "/.novelty"),
+            "background discovery treats a deep nested executable as one Title game and skips .novelty");
+    Library library(root);
+    require(library.import(found, {}) == 1, "nested game imports once");
+    const auto game = library.games().first();
+    require(game.folder == title && game.name == "Title" && game.executable == executable &&
+            game.workingDirectory == QFileInfo(executable).absolutePath() && game.engine == "Ren'Py" &&
+            library.import(discover(root), {}) == 0,
+            "nested game keeps the top-level folder and correct launch directory without duplicates");
+}
+void testNativeGameDiscovery(const QString &base) {
+    const auto root = base + "/Native game discovery";
+    const auto title = root + "/Yosuga no Sora";
+    const auto executable = title + "/ヨスガノソラRE/yosuga.x86_64";
+    const auto marker = title + "/launched.txt";
+    touch(executable, "#!/bin/sh\nprintf '%s' \"$PWD\" > ../launched.txt\n");
+    require(QFile::setPermissions(executable, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner),
+            "native fixture is executable");
+    touch(title + "/OST/player.exe", "soundtrack utility");
+    touch(root + "/.novelty/tools/Managed.x86_64", "managed tool");
+    const auto found = discover(root);
+    require(found.size() == 1 && found.first().name == "Yosuga no Sora" && found.first().folder == title &&
+            found.first().native && found.first().executables == QStringList{executable},
+            "nested Linux launcher identifies its top-level game ahead of an OST utility");
+    const auto scanned = scanDiscovery(root, {});
+    require(scanned.candidates.size() == 1 && scanned.candidates.first().native &&
+            scanned.candidates.first().folder == title && !scanned.folderIdentities.contains(root + "/.novelty"),
+            "background discovery finds the native game and excludes Novelty state");
+    Library library(root);
+    require(library.import(found, {}) == 1 && library.import(found, {}) == 0,
+            "native game imports once");
+    const auto game = library.games().first();
+    require(game.backend == "native" && game.executable == executable &&
+            game.workingDirectory == QFileInfo(executable).absolutePath() && library.status(game) == "Ready",
+            "native game keeps its executable, working directory, and ready status");
+    const auto command = launchCommand(library, game);
+    require(command.program == executable && command.arguments.isEmpty() &&
+            command.cwd == QFileInfo(executable).absolutePath(),
+            "native launcher runs directly without Proton");
+    require(supervise(library, game.id, false) == 0, "native Play completes without Proton setup");
+    QFile launched(marker);
+    require(launched.open(QIODevice::ReadOnly) && launched.readAll() == command.cwd.toUtf8(),
+            "native Play uses the launcher's directory");
+    const auto source = base + "/Native launcher without extension";
+    const auto chosen = source + "/start";
+    touch(chosen, "#!/bin/sh\nexit 0\n");
+    require(QFile::setPermissions(chosen, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner),
+            "extensionless Linux fixture is executable");
+    touch(source + "/play.exe", "Windows version");
+    touch(source + "/lib/libhelper.so", "\177ELF");
+    require(nativeExecutable(chosen) && !nativeExecutable(source + "/lib/libhelper.so") &&
+            !nativeExecutable(source + "/play.exe"),
+            "native selection recognizes scripts and excludes non-executable files");
+    rejects([&] { library.addFolder(source, source + "/play.exe"); },
+            "explicit native option rejects a Windows executable");
+    const auto added = library.addFolder(source, chosen).game;
+    require(added.backend == "native" && added.executable == root + "/Native launcher without extension/start" &&
+            added.workingDirectory == added.folder && nativeExecutable(added.executable),
+            "explicit native option moves and selects an extensionless Linux launcher");
+    require(launchCommand(library, added).program == added.executable,
+            "explicit native choice runs directly even beside a Windows executable");
 }
 void testPairingProtocol() {
     const auto sessionId = newDiscoverySessionId();
@@ -424,7 +657,8 @@ void testSaveSnapshots(const QString &base) {
     const auto recoveredPartial = recoverSaveRestores(lib);
     if (recoveredPartial.size() != 1 || QFileInfo::exists(partial) || contents(gameSave) != "progress after interrupted supervisor")
         throw std::runtime_error(("interrupted staged copy is removed without changing original saves: " + recoveredPartial.join(" | ")).toStdString());
-    configured = lib.game(game.id); configured.engine = "Ren'Py"; lib.save(configured);
+    touch(game.folder + "/renpy/__init__.py");
+    configured = lib.game(game.id); configured.saveStrategy = "renpy"; lib.save(configured);
     const auto suggestions = suggestedSaveMappings(lib, game.id);
     require(!suggestions.isEmpty() && suggestions.first().scope == "game" && suggestions.first().path == "game/saves",
             "populated Ren'Py save folder can be suggested for confirmation");
@@ -610,7 +844,7 @@ void testSaveDiscovery(const QString &base) {
     touch(renpyRoot + "/Game/renpy/__init__.py");
     touch(renpyRoot + "/Game/game/options.rpy", "define config.save_directory = 'Example-123'\n");
     Library renpy(renpyRoot); renpy.import({inspect(renpyRoot + "/Game")}, {});
-    auto renpyGame = renpy.games().first(); renpyGame.engine = "Ren'Py"; renpy.save(renpyGame);
+    auto renpyGame = renpy.games().first(); renpyGame.saveStrategy = "renpy"; renpy.save(renpyGame);
     beginSaveObservation(renpy, renpyGame);
     const auto engine = loadSaveConfig(renpy, renpyGame.id);
     require(engine.discoveryState == "identified" && engine.discoverySource == "engine" && engine.mappings.size() == 2 &&
@@ -1285,6 +1519,146 @@ exit 0
     require(supervise(lib, id, false) == 0, "replacement prefix can be prepared");
     QFile save(held + "/save.dat"); require(save.open(QIODevice::ReadOnly) && save.readAll() == "keep my save", "held original prefix saves untouched");
 }
+void testRecipeWinetricks(const QString &base) {
+    const auto root = base + "/Recipe Winetricks";
+    const auto runner = base + "/GE-Proton11-7";
+    const auto newerRunner = base + "/GE-Proton11-8";
+    const auto fake = base + "/winetricks-umu";
+    touch(root + "/Game/game.exe"); touch(runner + "/proton"); touch(runner + "/version", "11-7");
+    touch(newerRunner + "/proton"); touch(newerRunner + "/version", "11-8");
+    touch(runner + "/protonfixes/winetricks", "#!/bin/sh\nexit 0\n");
+    touch(newerRunner + "/protonfixes/winetricks", "#!/bin/sh\nexit 0\n");
+    QFile::setPermissions(runner + "/protonfixes/winetricks", QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    QFile::setPermissions(newerRunner + "/protonfixes/winetricks", QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    touch(fake, R"SH(#!/bin/sh
+if [ "$1" = "winetricks" ]; then
+    if [ -e "$WINEPREFIX/fail-$2" ]; then echo 'download failed' >&2; exit 23; fi
+    echo "$2:$PROTONPATH:$WINEPREFIX" >> "$WINEPREFIX/winetricks-calls"
+    exit 0
+fi
+if [ "$2" = "/c" ]; then mkdir -p "$WINEPREFIX"; touch "$WINEPREFIX/system.reg"; exit 0; fi
+touch "$WINEPREFIX/played"; exit 0
+)SH");
+    QFile::setPermissions(fake, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    Library lib(root); lib.setSettings({{"umu", fake}, {"runner", runner}});
+    const auto recipes = loadRecipes(root);
+    for (const auto &recipe : recipes) if (recipe.tier == "default")
+        require(recipe.settings["winetricks"].toArray().isEmpty() &&
+                recipe.settings["runner"] == "GE-Proton11-7", "general recipes start clean with the tested GE pin");
+    lib.import(discover(root), runner);
+    auto g = lib.games().first(); const auto id = g.id; const auto prefix = lib.prefix(id);
+    require(g.runner == runner && g.runnerSelector == "GE-Proton11-7",
+            "a valid library runner takes precedence over the general recipe recommendation");
+    require(pendingWinetricks(lib, g).isEmpty() && supervise(lib, id, false) == 0 &&
+            !QFileInfo::exists(prefix + "/winetricks-calls"), "clean general game never runs Winetricks");
+    auto legacyReceipt = readJson(lib.gamePath(id, "recipe.lock.json"));
+    legacyReceipt.remove("winetricks_requested");
+    writeJson(lib.gamePath(id, "recipe.lock.json"), legacyReceipt);
+    require(setupComplete(lib, g) && pendingWinetricks(lib, g).isEmpty(),
+            "existing schema 2 receipts without component fields remain valid");
+    lib.setSettings({{"umu", fake}, {"default_recipe", "generic-vn-v1"}});
+    lib.applyRecipe(id, "generic-vn-v1"); g = lib.game(id); g.runner = runner; lib.save(g); g = lib.game(id);
+    require(g.winetricks.isEmpty() && supervise(lib, id, true) == 0 &&
+            !QFileInfo::exists(prefix + "/winetricks-calls"), "clean General VN Prepare has no component install");
+    touch(prefix + "/save.dat", "keep save");
+    const auto parent = QJsonObject{{"schema", 1}, {"id", "media-base"}, {"name", "Media base"},
+        {"inherits", "generic-game-v1"}, {"match", QJsonObject{}},
+        {"settings", QJsonObject{{"winetricks", QJsonArray{"quartz", "wmp11", "quartz"}},
+            {"environment", QJsonObject{{"TZ", "Asia/Tokyo"}}}}}};
+    saveRecipe(root, "default", QJsonDocument(parent).toJson());
+    const auto writeGame = [&](const QJsonArray &verbs) {
+        saveRecipe(root, "games", QJsonDocument(QJsonObject{{"schema", 1}, {"id", "media-game"},
+            {"name", "Media game"}, {"inherits", "media-base"},
+            {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"file", "game.exe"}}}}}},
+            {"settings", QJsonObject{{"winetricks", verbs},
+                {"environment", QJsonObject{{"CUSTOM", "value"}}}}}}).toJson());
+    };
+    writeGame(QJsonArray{"wmp11", "qasf"});
+    auto effective = loadRecipes(root);
+    for (const auto &recipe : effective) if (recipe.id == "media-game") {
+        require(recipe.settings["winetricks"].toArray() == QJsonArray({"quartz", "wmp11", "qasf"}) &&
+                recipe.settings["environment"].toObject()["TZ"] == "Asia/Tokyo" &&
+                recipe.settings["environment"].toObject()["CUSTOM"] == "value",
+                "inheritance merges environment and deduplicates components in parent-first order");
+    }
+    auto invalid = parent; invalid["id"] = "bad-verb";
+    invalid["settings"] = QJsonObject{{"winetricks", QJsonArray{"quartz; rm -rf /"}}};
+    rejects([&] { saveRecipe(root, "default", QJsonDocument(invalid).toJson()); }, "recipe cannot inject a command");
+    invalid["settings"] = QJsonObject{{"winetricks", QJsonArray{"-q"}}};
+    rejects([&] { saveRecipe(root, "default", QJsonDocument(invalid).toJson()); }, "recipe cannot pass Winetricks options");
+    invalid["settings"] = QJsonObject{{"winetricks", QJsonArray{"quartz2"}}};
+    rejects([&] { saveRecipe(root, "default", QJsonDocument(invalid).toJson()); }, "recipe cannot request a verb absent from the bundled version");
+    invalid["settings"] = QJsonObject{{"command", "sh -c true"}};
+    rejects([&] { saveRecipe(root, "default", QJsonDocument(invalid).toJson()); }, "recipe cannot add an executable command field");
+    invalid["settings"] = QJsonObject{{"winetricks", QJsonArray{QJsonObject{{"url", "https://example.invalid/install.exe"}}}}};
+    rejects([&] { saveRecipe(root, "default", QJsonDocument(invalid).toJson()); }, "recipe cannot add an installer URL in a component entry");
+    invalid["id"] = "missing-parent"; invalid["inherits"] = "absent-recipe"; invalid["settings"] = QJsonObject{};
+    saveRecipe(root, "default", QJsonDocument(invalid).toJson());
+    rejects([&] { loadRecipes(root); }, "missing recipe parent is rejected");
+    removeRecipe(root, "default", "missing-parent");
+    auto cycleA = invalid, cycleB = invalid;
+    cycleA["id"] = "cycle-a"; cycleA["inherits"] = "cycle-b";
+    cycleB["id"] = "cycle-b"; cycleB["inherits"] = "cycle-a";
+    saveRecipe(root, "default", QJsonDocument(cycleA).toJson());
+    saveRecipe(root, "default", QJsonDocument(cycleB).toJson());
+    rejects([&] { loadRecipes(root); }, "recipe inheritance cycle is rejected");
+    removeRecipe(root, "default", "cycle-a"); removeRecipe(root, "default", "cycle-b");
+    lib.applyRecipe(id, "media-game"); g = lib.game(id); g.runner = runner; lib.save(g); g = lib.game(id);
+    require(g.winetricks == QStringList({"quartz", "wmp11", "qasf"}), "resolved verbs persist with the game");
+    require(supervise(lib, id, false) == 1 && !QFileInfo::exists(prefix + "/winetricks-calls") &&
+            contents(prefix + "/save.dat") == "keep save", "unapproved headless Play leaves prefix and save unchanged");
+    auto approval = winetricksApproval(lib, g);
+    QFile::remove(runner + "/protonfixes/winetricks");
+    require(supervise(lib, id, false, {}, {}, false, false, approval) == 1 &&
+            pendingWinetricks(lib, g) == QStringList({"quartz", "wmp11", "qasf"}) &&
+            contents(lib.gamePath(id, "status.json")).contains("does not include executable Winetricks integration"),
+            "missing bundled Winetricks integration is reported without a success receipt");
+    touch(runner + "/protonfixes/winetricks", "#!/bin/sh\nexit 0\n");
+    QFile::setPermissions(runner + "/protonfixes/winetricks", QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    require(supervise(lib, id, false, {}, {}, false, false, approval) == 0 &&
+            readJson(lib.gamePath(id, "recipe.lock.json"))["winetricks_applied"].toArray().size() == 3,
+            "approved Play applies and records each requested component");
+    const auto calls = contents(prefix + "/winetricks-calls");
+    require(calls.contains("quartz:" + runner.toUtf8()) && calls.contains("qasf:" + runner.toUtf8()) &&
+            calls.contains(prefix.toUtf8()), "Winetricks uses this game's runner and prefix");
+    require(supervise(lib, id, false) == 0 && contents(prefix + "/winetricks-calls") == calls,
+            "subsequent Play skips completed components");
+    require(supervise(lib, id, true) == 0 && contents(prefix + "/winetricks-calls") == calls,
+            "explicit Prepare does not reinstall completed components");
+    writeGame(QJsonArray{"wmp11", "qasf", "corefonts", "cjkfonts"});
+    lib.applyRecipe(id, "media-game"); g = lib.game(id); g.runner = runner; lib.save(g); g = lib.game(id);
+    touch(prefix + "/fail-cjkfonts"); approval = winetricksApproval(lib, g);
+    require(supervise(lib, id, false, {}, {}, false, false, approval) == 1 &&
+            pendingWinetricks(lib, g) == QStringList{"cjkfonts"} &&
+            contents(prefix + "/winetricks-calls").contains("corefonts:" + runner.toUtf8()) &&
+            readJson(lib.gamePath(id, "setup.json"))["winetricks_state"] == "failed" &&
+            contents(lib.gamePath(id, "launch.log")).contains("download failed"),
+            "partial failure records completed components and leaves only the failed one pending");
+    QFile::remove(prefix + "/fail-cjkfonts");
+    require(supervise(lib, id, false, {}, {}, false, false, winetricksApproval(lib, g)) == 0 &&
+            pendingWinetricks(lib, g).isEmpty(), "retry installs only the failed component");
+    g.runner = newerRunner; lib.save(g); g = lib.game(id);
+    require(!setupComplete(lib, g) && pendingWinetricks(lib, g).isEmpty() && supervise(lib, id, false) == 0 &&
+            contents(prefix + "/save.dat") == "keep save", "runner change rechecks prefix without erasing saved data or reinstalling verbs");
+    writeGame(QJsonArray{});
+    lib.applyRecipe(id, "media-game"); g = lib.game(id); g.runner = newerRunner; lib.save(g); g = lib.game(id);
+    require(pendingWinetricks(lib, g).isEmpty() &&
+            readJson(lib.gamePath(id, "recipe.lock.json"))["winetricks_applied"].toArray().size() == 5,
+            "removing requested components does not erase their applied record or prefix");
+    writeGame(QJsonArray{"wmp11", "qasf", "cjkfonts", "corefonts"});
+    lib.applyRecipe(id, "media-game"); g = lib.game(id); g.runner = newerRunner; lib.save(g); g = lib.game(id);
+    auto interruptedReceipt = readJson(lib.gamePath(id, "recipe.lock.json"));
+    auto interruptedApplied = interruptedReceipt["winetricks_applied"].toArray();
+    interruptedApplied.removeAt(interruptedApplied.size() - 1);
+    interruptedReceipt["winetricks_applied"] = interruptedApplied;
+    writeJson(lib.gamePath(id, "recipe.lock.json"), interruptedReceipt);
+    auto state = readJson(lib.gamePath(id, "setup.json")); state["winetricks_state"] = "running";
+    writeJson(lib.gamePath(id, "setup.json"), state);
+    writeJson(lib.gamePath(id, "status.json"), {{"state", "Preparing"}});
+    require(lib.status(g) == "Interrupted" && pendingWinetricks(lib, g) == QStringList{"cjkfonts"} &&
+            supervise(lib, id, false, {}, {}, false, false, winetricksApproval(lib, g)) == 0 &&
+            pendingWinetricks(lib, g).isEmpty(), "interrupted component preparation remains visible and can retry");
+}
 void testSteamRemovalGuard(const QString &base, const QString &runner) {
     const auto root = base + "/Steam removal guard"; touch(root + "/Game/game.exe");
     const auto fake = base + "/fake-steam"; touch(fake, "#!/bin/sh\nexec touch steam-received\n");
@@ -1531,11 +1905,11 @@ int main(int argc, char **argv) {
         for (const auto &engine : {"Generic", "Unknown"})
             require(defaultSetupProfile(engine) == "generic-game-v1", "unidentified games use the general-game fallback");
         for (const auto &engine : {"Kirikiri candidate", "Siglus candidate"})
-            require(defaultSetupProfile(engine) == "generic-proton-v1", "advisory VN engines use the conservative VN fallback");
-        require(preferredProtonVersion("generic-proton-v1") == "GE-Proton11-7" &&
-                preferredProtonVersion("generic-game-v1") == "GE-Proton11-7" &&
+            require(defaultSetupProfile(engine) == "generic-game-v1", "unverified engines use the general fallback");
+        require(preferredProtonVersion("generic-proton-v1").isEmpty() &&
+                preferredProtonVersion("generic-game-v1").isEmpty() &&
                 preferredProtonVersion("renpy-bundled-v1").isEmpty(),
-                "generic profiles pin GE while the Ren'Py profile preserves its own runner fallback");
+                "setup profiles do not pin a runner version");
         require(found.size() == 1, "ignore managed folder");
         require(found[0].engine == "Ren'Py", "RPA must not be misidentified as XP3");
         require(found[0].executables == QStringList{folder + "/Tenpure.exe"}, "exclude helpers/uninstallers");
@@ -1635,6 +2009,7 @@ int main(int argc, char **argv) {
         testRelinking(temp.path(), runner, fake);
         testRemoval(temp.path(), runner);
         testSetupRecovery(temp.path());
+        testRecipeWinetricks(temp.path());
         testSteamRemovalGuard(temp.path(), runner);
         testRuntimeBarrier(temp.path(), runner, fake);
         testPrefixTools(temp.path());
@@ -1647,10 +2022,14 @@ int main(int argc, char **argv) {
         testSaveDiscovery(temp.path());
         testSteamShortcut(temp.path());
         testDeviceIdentity(temp.path());
+        testMovedLibrary(temp.path());
+        testNestedGameDiscovery(temp.path());
+        testNativeGameDiscovery(temp.path());
         testPairingProtocol();
         testSyncQueue(temp.path());
         testLanGameManifest();
         testSetupRecipePrecedence();
+        testEditableRecipes(temp.path());
         testLegacyRuntimeMigration(temp.path());
         std::printf("PASS: %d assertions\n", assertions); return 0;
     } catch (const std::exception &e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }

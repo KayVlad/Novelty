@@ -56,6 +56,18 @@ def provider(data, version=VERSION, legacy=False, checksum=None, size=None):
 
 
 class GEInstallerTests(unittest.TestCase):
+    def test_latest_selector_resolves_release_before_install(self):
+        data = archive()
+        upstream = provider(data)
+        def open_url(request, timeout=30):
+            url = request.full_url if hasattr(request, 'full_url') else request
+            if url == ge.LATEST_API:
+                return io.BytesIO(json.dumps(dict(tag_name=VERSION, draft=False, prerelease=False)).encode())
+            return upstream(request, timeout)
+        with tempfile.TemporaryDirectory() as directory, patch.object(ge.urllib.request, 'urlopen', side_effect=open_url):
+            self.assertEqual(ge.resolve(directory, dict(CONFIG, version='ge-proton-latest')),
+                             Path(directory) / '.novelty/runners' / VERSION)
+
     def test_current_and_legacy_release_assets_select_x86_64(self):
         for version, legacy in [(VERSION, False), ('GE-Proton7-18', True)]:
             data = archive(version)

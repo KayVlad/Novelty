@@ -7,9 +7,9 @@ const QList<SetupProfile> &setupProfiles() {
     // Both baselines currently share the same preparation and preserve generic receipts.
     static const QList<SetupProfile> profiles{
         {"generic-proton-v1", "Generic VN · v1", "generic-proton-v1",
-         "Prepare a dedicated Proton prefix with GE-Proton11-7 as the default runner. No extra dependencies or compatibility overrides. Your locale and environment settings are kept.", "GE-Proton11-7"},
+         "Prepare a dedicated Proton prefix. No extra dependencies or compatibility overrides. Your locale and environment settings are kept.", {}},
         {"generic-game-v1", "Generic game · v1", "generic-proton-v1",
-         "Prepare a dedicated Proton prefix for a general Windows game with GE-Proton11-7 as the default runner. No extra dependencies or compatibility overrides. Your locale and environment settings are kept.", "GE-Proton11-7"},
+         "Prepare a dedicated Proton prefix for a general Windows game. No extra dependencies or compatibility overrides. Your locale and environment settings are kept.", {}},
         {"renpy-bundled-v1", "Ren’Py bundled runtime · v1", "generic-proton-v1",
          "Use the game's bundled Ren’Py runtime with generic Proton preparation. No extra fonts, codecs or renderer overrides. GE-Proton gameplay validation is still pending.", {}}
     };
@@ -44,10 +44,7 @@ SetupRecommendation recommendSetupProfile(const QString &engine, const QString &
         if (rule.gameIdentity.isEmpty() && !rule.engine.isEmpty() && rule.engine == engine) {
             return {rule.profileId, "verified engine recipe"};
         }
-    if (engine == "Ren'Py") return {"renpy-bundled-v1", "bundled Ren'Py engine baseline"};
-    if (engine == "Generic" || engine == "Unknown" || engine.isEmpty())
-        return {"generic-game-v1", "generic game baseline"};
-    return {"generic-proton-v1", "generic VN baseline"};
+    return {"generic-game-v1", "generic game baseline"};
 }
 QString preferredProtonVersion(const QString &profileId) {
     if (const auto profile = findSetupProfile(profileId)) return profile->preferredProtonVersion;

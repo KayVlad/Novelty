@@ -1,4 +1,5 @@
 #include "provisioning.h"
+#include "recipes.h"
 #include "core.h"
 #include <QtCore/qcoreapplication.h>
 #include <QtCore/qdir.h>
@@ -197,7 +198,7 @@ QString provisionUmu(QWidget *parent, const QString &libraryRoot, const QString 
         QMessageBox::warning(parent, "Cannot get umu", QString::fromUtf8(e.what())); return {};
     }
 }
-QString requiredSteamRuntime(const QString &runner) {
+QString requiredSteamRuntime(const QString &runner, const QString &libraryRoot) {
     QFile manifest(QDir(runner).filePath("toolmanifest.vdf"));
     if (!manifest.open(QIODevice::ReadOnly)) return {};
     const auto bytes = manifest.read(64 * 1024 + 1);
@@ -205,16 +206,14 @@ QString requiredSteamRuntime(const QString &runner) {
     static const QRegularExpression appId("\\\"require_tool_appid\\\"\\s+\\\"([0-9]+)\\\"");
     const auto match = appId.match(QString::fromUtf8(bytes));
     if (!match.hasMatch()) return {};
-    const auto id = match.captured(1);
-    if (id == "1391110") return "steamrt2";
-    if (id == "1628350") return "steamrt3";
-    if (id == "4183110") return "steamrt4";
-    if (id == "4185400") return "steamrt4-arm64";
-    return {};
+    const auto value = readJson(libraryRoot + "/.novelty/runtime-appids.json")[match.captured(1)];
+    const auto variant = value.toString();
+    static const QRegularExpression valid("^[a-z0-9][a-z0-9-]{0,39}$");
+    return valid.match(variant).hasMatch() ? variant : QString();
 }
 bool provisionSteamRuntime(QWidget *parent, const Library &library, const Game &game) {
     if (!library.managedRuntimeStorage()) return true; // Legacy libraries keep their existing umu storage until migration.
-    const auto variant = requiredSteamRuntime(game.runner);
+    const auto variant = requiredSteamRuntime(game.runner, library.root());
     if (variant.isEmpty()) return true; // Let umu handle an unfamiliar custom compatibility tool.
     const auto runtimeRoot = library.dataRoot() + "/runtime";
     const auto cacheRoot = library.dataRoot() + "/cache";
@@ -311,13 +310,16 @@ bool provisionFirstPlay(QWidget *parent, Library &library, Game &game, const QSt
         QMessageBox::warning(parent, "Cannot prepare game", "The pinned GE-Proton version is invalid."); return false;
     }
     const auto data = library.dataRoot();
-    const auto gePath = geVersion.isEmpty() ? QString() : data + "/runners/" + geVersion;
-    const bool needGe = !geVersion.isEmpty() && !QFileInfo(gePath + "/proton").isFile();
-    const auto selectedUmu = library.settings()["umu"].toString("umu-run");
-    const bool needUmu = selectedUmu == "umu-run" && resolveProgram(selectedUmu).isEmpty() &&
-                         resolveProgram(data + "/tools/umu-run").isEmpty() &&
-                         resolveProgram(managedUmuPath(library.root())).isEmpty();
-    const auto runtimeVariant = [&] { return library.managedRuntimeStorage() ? requiredSteamRuntime(game.runner) : QString(); };
+    const bool latestGe = geVersion == "ge-proton-latest";
+    const auto gePath = geVersion.isEmpty() || latestGe ? QString() : data + "/runners/" + geVersion;
+    const bool needGe = latestGe || (!geVersion.isEmpty() && !QFileInfo(gePath + "/proton").isFile());
+    const auto selectedUmu = game.umuLauncher.isEmpty() ? library.settings()["umu"].toString("umu-run") :
+                             game.umuResolved;
+    const bool needUmu = game.umuLauncher.isEmpty() ?
+        selectedUmu == "umu-run" && resolveProgram(selectedUmu).isEmpty() &&
+        resolveProgram(data + "/tools/umu-run").isEmpty() &&
+        resolveProgram(managedUmuPath(library.root())).isEmpty() : resolveProgram(selectedUmu).isEmpty();
+    const auto runtimeVariant = [&] { return library.managedRuntimeStorage() ? requiredSteamRuntime(game.runner, library.root()) : QString(); };
     const auto runtimePath = [&](const QString &variant) { return data + "/runtime/umu/" + variant; };
     const auto runtimeReady = [&](const QString &variant) {
         const auto path = runtimePath(variant);
@@ -412,12 +414,18 @@ bool provisionFirstPlay(QWidget *parent, Library &library, Game &game, const QSt
             bool complete = code == 0 && exit == QProcess::NormalExit;
             try {
                 if (current == Step::Ge) {
-                    complete = complete && QString::fromUtf8(output).trimmed() == gePath && QFileInfo(gePath + "/proton").isFile();
-                    if (complete) game.runner = gePath;
+                    const auto installed = QString::fromUtf8(output).trimmed();
+                    complete = complete && (latestGe ?
+                        installed.startsWith(data + "/runners/GE-Proton") : installed == gePath) &&
+                        QFileInfo(installed + "/proton").isFile();
+                    if (complete) game.runner = installed;
                 } else if (current == Step::Umu) {
-                    const auto installed = managedUmuPath(library.root());
-                    complete = complete && QString::fromUtf8(output).trimmed() == installed && !resolveProgram(installed).isEmpty();
-                    if (complete) {
+                    const auto installed = QString::fromUtf8(output).trimmed();
+                    complete = complete && !resolveProgram(installed).isEmpty() &&
+                        (game.umuLauncher.isEmpty() ? installed == managedUmuPath(library.root()) :
+                         installed == resolveUmuSelector(library.root(), game.umuLauncher));
+                    if (complete && !game.umuLauncher.isEmpty()) game.umuResolved = installed;
+                    if (complete && game.umuLauncher.isEmpty()) {
                         auto settings = library.settings(); settings["umu"] = installed; library.setSettings(settings);
                     }
                 } else complete = runtimeReady(variant); // umu may complete the runtime before a disposable prefix fails.
@@ -443,12 +451,13 @@ bool provisionFirstPlay(QWidget *parent, Library &library, Game &game, const QSt
                     const auto saved = readJson(data + "/ge-proton.json");
                     QJsonObject config{{"schema", 1}, {"version", geVersion}, {"architecture", "x86_64"}, {"auto_download", true}};
                     if (saved["version"] == geVersion && saved.contains("sha512")) config["sha512"] = saved["sha512"];
-                    writeJson(data + "/ge-proton.json", config);
+                    if (game.runnerSelector.isEmpty()) writeJson(data + "/ge-proton.json", config);
                     requestConfig = data + "/ge-request-" + QUuid::createUuid().toString(QUuid::WithoutBraces) + ".json";
                     writeJson(requestConfig, config);
                     program = installerPython(); arguments = {installerHelper("install-ge.py", geHelper), library.root(), "--config", requestConfig};
                 } else if (current == Step::Umu) {
                     program = installerPython(); arguments = {installerHelper("install-umu.py", umuHelper), library.root()};
+                    if (!game.umuLauncher.isEmpty()) arguments.append({"--version", game.umuLauncher});
                 } else {
                     probe = std::make_unique<QTemporaryDir>(data + "/runtime-probe-XXXXXX");
                     if (!probe->isValid()) throw std::runtime_error("Cannot create temporary runtime setup data inside Games.");

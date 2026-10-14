@@ -146,7 +146,7 @@ exec "$novelty_app_dir/bin/novelty-save-server" "$@"
         server_launcher.chmod(0o755)
         (stage / "bin" / "qt.conf").write_text("[Paths]\nPlugins=../plugins\n")
         (stage / "README.txt").write_text(
-            "Run ./Novelty from this folder. Keep the folder writable for data/bin settings.\n"
+            "Run ./Novelty from this folder. Keep it writable for bin/data/settings.json.\n"
             "This is a native test package, not clean-device acceptance. It uses the host\n"
             "glibc, graphics drivers and certificate store. Python for installers is bundled.\n"
             "GE-Proton, umu and Steam Linux Runtime are managed in the Games folder.\n"

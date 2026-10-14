@@ -1,5 +1,6 @@
 #include "core.h"
 #include "profiles.h"
+#include "recipes.h"
 #include <QtCore/qcoreapplication.h>
 #include <QtCore/qdir.h>
 #include <QtCore/qfileinfo.h>
@@ -46,18 +47,27 @@ QString Library::finishInstallation(const QString &id) {
     if (!g.installPending) return {};
     if (!QFileInfo(g.folder).isDir() || (!g.folderIdentity.isEmpty() && folderIdentity(g.folder) != g.folderIdentity))
         fail("The installation folder is missing or changed. Relink it before detecting files.");
-    auto candidate = inspect(g.folder);
+    auto candidate = inspect(g.folder, root());
     if (candidate.executables.isEmpty()) {
         const QString message = "No game executable found in " + g.folder + ". In the installer choose N:\\ as the destination, then use Detect installed files in Manage. Detection checks two subfolder levels.";
         recordStatus(id, "Installation pending", message); return message;
     }
     if (candidate.executables.size() == 1) {
         g.executable = candidate.executables.first();
-        const auto nested = inspect(QFileInfo(g.executable).absolutePath());
+        const auto nested = inspect(QFileInfo(g.executable).absolutePath(), root());
         if (nested.engine != "Generic") { candidate.engine = nested.engine; candidate.evidence = nested.evidence; }
     }
     g.workingDirectory = g.executable.isEmpty() ? g.folder : QFileInfo(g.executable).absolutePath();
-    g.engine = candidate.engine; g.evidence = candidate.evidence; g.setupProfile = defaultSetupProfile(g.engine);
+    const auto choice = selectRecipe(root(), g.folder, candidate.executables,
+        settings()["default_recipe"].toString("generic-game-v1"));
+    if (choice.ambiguous()) {
+        for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
+    } else {
+        applyRecipeToGame(g, choice.selected());
+        if (choice.selected().tier != "default" && choice.selected().runnerExplicit &&
+            g.runner == settings()["runner"].toString())
+            { g.runner.clear(); g.runnerRevision.clear(); }
+    }
     g.installPending = false; g.installer.clear(); store(g);
     const QString message = g.executable.isEmpty() ? "Installation detected. Choose the game's executable in Manage → Launch." : "Installation detected. Your game is ready to launch.";
     recordStatus(id, "Ready", message); return message;

@@ -114,7 +114,7 @@ void finishJob(const Library &lib, QSqlDatabase db, const QString &id, const QSt
     checkFolder(lib, g.folder);
     QSqlQuery current(db); current.prepare("SELECT config FROM games WHERE id=?"); current.addBindValue(id); check(current);
     const bool exists = current.next();
-    if ((phase == "staging" && (!exists || Game::fromJson(decode(current.value(0).toString())).json() != g.json())) ||
+    if ((phase == "staging" && (!exists || lib.game(id).json() != g.json())) ||
         (phase == "committed" && exists)) fail("The library entry conflicts with removal recovery. Files were kept.");
     current.finish();
     const auto moves = manifest["moves"].toArray();

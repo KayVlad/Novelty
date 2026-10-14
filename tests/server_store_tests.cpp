@@ -27,6 +27,21 @@ void rejects(const std::function<void()> &action) {
     try { action(); } catch (const std::exception &) { return; }
     throw std::runtime_error("operation unexpectedly succeeded");
 }
+QString storageRoot(const ServerSaveRevision &revision) {
+    return QDir::cleanPath(QFileInfo(revision.bundleDirectory).absolutePath() + "/..");
+}
+QString storageId(const ServerSaveRevision &revision) {
+    const auto prefix = QString::number(revision.revision) + '-';
+    const auto name = QFileInfo(revision.bundleDirectory).fileName();
+    require(name.startsWith(prefix), "revision folder has the expected name");
+    return name.mid(prefix.size());
+}
+void writePublicationIntent(const QString &key, const ServerSaveRevision &revision) {
+    writeJson(storageRoot(revision) + "/.inProgress",
+              {{"schema", 1}, {"game_key", key}, {"server_id", revision.serverId},
+               {"expected_revision", revision.revision - 1}, {"revision", revision.revision},
+               {"snapshot_id", revision.snapshotId}, {"storage_id", storageId(revision)}});
+}
 void revisionStore() {
     SaveServerClient local(QUrl("http://127.0.0.1:42428"), "fixture-token");
     SaveServerClient secure(QUrl("https://saves.example.invalid"), "fixture-token");
@@ -54,8 +69,9 @@ void revisionStore() {
             "first populated client conditionally publishes to an empty server");
     require(chooseServerSaveAction({}, {syntheticId, 1, first.id, 1}, live) == ServerSaveAction::Conflict,
             "two populated states need an explicit first-connection choice");
-    require(chooseServerSaveAction({}, {syntheticId, 1, first.id, 0}, live) == ServerSaveAction::Upload,
-            "populated local saves conditionally publish over a verified empty server state");
+    require(chooseServerSaveAction({}, {syntheticId, 15, first.id, 0}, live) == ServerSaveAction::Conflict,
+            "a committed empty server state must not be overwritten by a newly linked client");
+    rejects([&] { chooseServerSaveAction({}, {syntheticId, 0, first.id, 0}, live); });
     AcceptedServerSave baseline{true, defaultServerGameKey(library, game.id), syntheticId,
                                 1, first.id, live};
     saveAcceptedServerSave(library, game.id, baseline);
@@ -158,6 +174,43 @@ void revisionStore() {
     SaveServerStore reopened(serverRoot);
     require(reopened.serverId() == identity && reopened.current(key).revision == 1,
             "server identity and committed revision survive restart");
+    const auto firstCrashKey = QString("replay-first-upload");
+    const auto firstCrash = reopened.put(firstCrashKey, 0, bundle(first.id));
+    writePublicationIntent(firstCrashKey, firstCrash);
+    require(QFile::remove(storageRoot(firstCrash) + "/current.json"), "fixture interrupts first pointer publish");
+    SaveServerStore afterFirstCrash(serverRoot);
+    require(afterFirstCrash.current(firstCrashKey).revision == 1 &&
+            afterFirstCrash.current(firstCrashKey).snapshotId == first.id &&
+            !QFileInfo::exists(storageRoot(firstCrash) + "/.inProgress"),
+            "restart finishes a verified first revision after payload rename");
+    writePublicationIntent(firstCrashKey, firstCrash);
+    SaveServerStore afterPointerCrash(serverRoot);
+    require(afterPointerCrash.current(firstCrashKey).revision == 1 &&
+            !QFileInfo::exists(storageRoot(firstCrash) + "/.inProgress"),
+            "restart clears an intent left after the pointer was published");
+    const auto stagedCrashKey = QString("replay-staged-upload");
+    const auto stagedCrash = reopened.put(stagedCrashKey, 0, bundle(first.id));
+    writePublicationIntent(stagedCrashKey, stagedCrash);
+    require(QFile::remove(storageRoot(stagedCrash) + "/current.json") &&
+            QDir().rename(stagedCrash.bundleDirectory,
+                          storageRoot(stagedCrash) + "/.stage-" + storageId(stagedCrash)),
+            "fixture interrupts before payload rename");
+    SaveServerStore afterStageCrash(serverRoot);
+    require(afterStageCrash.current(stagedCrashKey).revision == 1 &&
+            QFileInfo(stagedCrash.bundleDirectory).isDir() &&
+            !QFileInfo::exists(storageRoot(stagedCrash) + "/.inProgress"),
+            "restart verifies the staged bundle before finishing both renames");
+    const auto ambiguousCrashKey = QString("replay-ambiguous-first-upload");
+    const auto ambiguous = reopened.put(ambiguousCrashKey, 0, bundle(first.id));
+    writePublicationIntent(ambiguousCrashKey, ambiguous);
+    require(QFile::remove(storageRoot(ambiguous) + "/current.json") &&
+            QDir().mkpath(storageRoot(ambiguous) + "/revisions/1-unrelated"),
+            "fixture adds an unrelated orphan to an interrupted first upload");
+    SaveServerStore afterAmbiguousCrash(serverRoot);
+    rejects([&] { afterAmbiguousCrash.current(ambiguousCrashKey); });
+    require(!QFileInfo::exists(storageRoot(ambiguous) + "/current.json") &&
+            QFileInfo::exists(storageRoot(ambiguous) + "/.inProgress"),
+            "ambiguous replay keeps the intent and does not publish either payload");
     touch(game.folder + "/save/slot.dat", "second progress");
     const auto second = createSaveSnapshot(library, game.id);
     bool staleRevisionReported = false;
@@ -170,9 +223,17 @@ void revisionStore() {
     rejects([&] { reopened.put(key, 1, bundle(second.id)); });
     require(reopened.current(key).revision == 1, "bad payload cannot advance the current revision");
     touch(bundle(second.id) + "/items/0/slot.dat", "second progress");
-    const auto gameStorage = QFileInfo(reopened.current(key).bundleDirectory).absolutePath() + "/..";
+    const auto gameStorage = storageRoot(reopened.current(key));
     require(QDir().mkpath(gameStorage + "/.stage-abandoned"), "fixture interrupted upload stage");
+    const auto previousPointer = readJson(gameStorage + "/current.json");
     const auto next = reopened.put(key, 1, bundle(second.id));
+    writePublicationIntent(key, next);
+    writeJson(gameStorage + "/current.json", previousPointer);
+    SaveServerStore afterLaterCrash(serverRoot);
+    require(afterLaterCrash.current(key).revision == 2 &&
+            afterLaterCrash.current(key).snapshotId == second.id &&
+            !QFileInfo::exists(gameStorage + "/.inProgress"),
+            "restart advances an existing pointer after the next payload rename");
     require(next.revision == 2 && next.snapshotId == second.id &&
             reopened.current(key).snapshotId == second.id,
             "an abandoned stage cannot hide or replace a committed revision");
@@ -182,8 +243,9 @@ void revisionStore() {
     const auto emptyLive = inspectVerifiedLiveSaveState(library, game.id);
     require(emptyLive["files"].toInt(-1) == 0 &&
             chooseServerSaveAction({}, {syntheticId, 0, {}, 0}, emptyLive) == ServerSaveAction::AcceptEmpty &&
-            chooseServerSaveAction({}, {syntheticId, 1, first.id, 1}, emptyLive) == ServerSaveAction::Download,
-            "verified empty local saves can accept an empty server or adopt a populated one");
+            chooseServerSaveAction({}, {syntheticId, 1, first.id, 1}, emptyLive) == ServerSaveAction::Download &&
+            chooseServerSaveAction({}, {syntheticId, 15, first.id, 0}, emptyLive) == ServerSaveAction::Download,
+            "verified empty local saves accept a new server or adopt any committed server state");
     writePortableSaveArchive(bundle(empty.id), archive);
     extractPortableSaveArchive(archive, temporary.path() + "/Empty");
     require(verifyPortableSaveBundle(temporary.path() + "/Empty")["files"].toInt(-1) == 0,

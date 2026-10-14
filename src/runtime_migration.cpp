@@ -5,6 +5,8 @@
 #include <QtCore/qfile.h>
 #include <QtCore/qfileinfo.h>
 #include <QtCore/qjsonobject.h>
+#include <QtCore/qregularexpression.h>
+#include <QtCore/qset.h>
 #include <QtCore/qstandardpaths.h>
 #include <QtCore/quuid.h>
 #include <algorithm>
@@ -145,7 +147,12 @@ void migrateLegacyUmuRuntime(Library &lib, const QString &source, std::stop_toke
         if (!QDir().mkdir(stage + "/umu"))
             throw std::runtime_error("Cannot stage umu runtime directory inside Games.");
         int entries = 0, runtimes = 0; qint64 bytes = 0;
-        for (const auto &name : {"steamrt2", "steamrt3", "steamrt4"}) {
+        QSet<QString> knownRuntimes;
+        static const QRegularExpression validRuntime("^[a-z0-9][a-z0-9-]{0,39}$");
+        const auto appIds = readJson(lib.dataRoot() + "/runtime-appids.json");
+        for (auto it = appIds.begin(); it != appIds.end(); ++it)
+            if (validRuntime.match(it.value().toString()).hasMatch()) knownRuntimes.insert(it.value().toString());
+        for (const auto &name : knownRuntimes) {
             checkStop(stop);
             const auto path = absoluteSource + '/' + name;
             if (!QFileInfo(path).exists()) continue;

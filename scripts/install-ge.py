@@ -15,6 +15,7 @@ import urllib.request
 
 REPOSITORY = 'https://github.com/GloriousEggroll/proton-ge-custom'
 API = 'https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/tags/'
+LATEST_API = 'https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest'
 MAX_ARCHIVE = 4 * 1024**3
 MAX_EXPANDED = 16 * 1024**3
 RESERVE = 64 * 1024**2
@@ -72,10 +73,19 @@ def release_info(version):
     return dict(version=version, architecture='x86_64', asset=name, url=prefix + name, size=size, sha512=expected[0])
 
 
+def latest_tag():
+    release = json.loads(small_download(LATEST_API, 2 * 1024**2))
+    if release.get('draft') or release.get('prerelease'):
+        raise RuntimeError('The latest GE release is not stable')
+    return tag(release.get('tag_name'))
+
+
 def configuration(value):
     if not isinstance(value, dict) or type(value.get('schema')) is not int or value['schema'] != 1:
         raise ValueError('Unsupported GE configuration schema')
-    version = tag(value.get('version'))
+    version = value.get('version')
+    if version != 'ge-proton-latest':
+        version = tag(version)
     if type(value.get('auto_download')) is not bool:
         raise ValueError('auto_download must be true or false')
     if value.get('architecture', 'x86_64') != 'x86_64':
@@ -161,6 +171,10 @@ def extract_archive(archive, payload, version):
 
 def resolve(games_folder, config):
     version, auto_download, pinned = configuration(config)
+    if version == 'ge-proton-latest':
+        if not auto_download or pinned:
+            raise ValueError('A latest GE selector needs downloads enabled and cannot use a fixed checksum pin')
+        version = latest_tag()
     if platform.machine() not in ('x86_64', 'AMD64'):
         raise RuntimeError('This installer currently supports x86-64 hosts only')
     root = Path(games_folder).resolve(strict=True)

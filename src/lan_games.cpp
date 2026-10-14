@@ -666,7 +666,7 @@ void LanGameExchange::finalize() {
     if (local.id.isEmpty()) {
         const auto preferred = library_.settings()["runner"].toString();
         const auto localRunner = QFileInfo(QDir(preferred).filePath("proton")).isFile() ? preferred : QString();
-        if (library_.import({inspect(destination)}, localRunner) != 1)
+        if (library_.import({inspect(destination, library_.root())}, localRunner) != 1)
             throw std::runtime_error("Game files arrived, but registration failed. Retry the LAN installation.");
         for (const auto &game : library_.games()) if (game.folder == destination) local = game;
     }

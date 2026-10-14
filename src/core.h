@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QtCore/qjsonobject.h>
+#include <QtCore/qjsonarray.h>
 #include <QtCore/qprocess.h>
 #include <QtCore/qstringlist.h>
 #include <QtSql/qsqldatabase.h>
@@ -19,6 +20,9 @@ struct Game {
     QString folderIdentity, source = "manual";
     QString engine = "Generic", evidence;
     QString setupProfile = "generic-proton-v1";
+    QString recipeId, recipeRevision, runnerSelector, umuLauncher, umuResolved, umuGameId, store, saveStrategy;
+    QStringList recipeCandidates, winetricks;
+    QJsonArray recipeSaves;
     QJsonObject metadata; // Automatically or manually linked VNDB record, cached for offline display.
     QStringList arguments;
     QMap<QString, QString> environment;
@@ -29,6 +33,7 @@ struct Game {
 struct Candidate {
     QString folder, name, engine = "Generic", evidence;
     QStringList executables;
+    bool native = false;
     QStringList watchDirectories;
     QByteArray fingerprint;
 };
@@ -69,6 +74,7 @@ private:
 class Library;
 struct SaveConfig;
 QString canonicalPath(const QString &path);
+bool nativeExecutable(const QString &path);
 QString folderIdentity(const QString &path);
 QString launchPathIssue(const Game &);
 QString resolveProgram(const QString &program);
@@ -76,7 +82,7 @@ QString managedUmuPath(const QString &libraryRoot);
 QProcessEnvironment externalToolEnvironment();
 QList<Candidate> discover(const QString &root);
 DiscoverySnapshot scanDiscovery(const QString &root, const QStringList &knownFolders);
-Candidate inspect(const QString &folder);
+Candidate inspect(const QString &folder, const QString &libraryRoot = {});
 QStringList installedRunners(const QString &libraryRoot = {});
 QString runnerVersion(const QString &runner);
 QJsonObject readJson(const QString &path);
@@ -109,9 +115,10 @@ public:
     bool removalReservedFolder(const QString &folder) const;
     int reconcileFolders(const DiscoverySnapshot &);
     int import(const QList<Candidate> &candidates, const QString &runner);
-    FolderImportResult addFolder(const QString &source);
+    FolderImportResult addFolder(const QString &source, const QString &nativeLauncher = {});
     QStringList recoverFolderImports();
     Game selectExecutable(const QString &id, const QString &executable);
+    Game applyRecipe(const QString &id, const QString &recipeId);
     Game createInstallation(const QString &name, const QString &installer, const QString &runner, const QString &locale = {});
     QString detectInstallation(const QString &id);
     QString finishInstallation(const QString &id); // Requires the caller's launch lock.
@@ -126,6 +133,7 @@ public:
     void enableManagedRuntimeStorage();
     void setSettings(const QJsonObject &settings);
 private:
+    void rebaseMovedLibrary();
     void store(const Game &);
     void stageSaveConfig(const Game &before, const Game &after, const QJsonObject &config);
     void recoverSettingsChange(const QString &id);
@@ -148,6 +156,7 @@ Command prefixToolCommand(const Library &, const Game &, const QString &tool);
 Command extraLaunchCommand(const Library &, const Game &, const ExtraLaunch &);
 QStringList activeExtraPaths(const Library &, const Game &);
 int supervise(Library &, const QString &gameId, bool prepareOnly, const QString &tool = {},
-              const std::optional<ExtraLaunch> &extra = {}, bool installing = false, bool debugWine = false);
+              const std::optional<ExtraLaunch> &extra = {}, bool installing = false, bool debugWine = false,
+              const QString &winetricksApproval = {});
 
 } // namespace novelty

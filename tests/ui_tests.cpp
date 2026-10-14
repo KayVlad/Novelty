@@ -1,4 +1,5 @@
 #include "window.h"
+#include "app_settings.h"
 #include "provisioning.h"
 #include "metadata.h"
 #include <QtWidgets/qapplication.h>
@@ -103,6 +104,7 @@ int main(int argc, char **argv) {
     QTemporaryDir t;
     QSettings::setDefaultFormat(QSettings::IniFormat); QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, t.path());
     QCoreApplication::setOrganizationName("NoveltyTests"); QCoreApplication::setApplicationName("NoveltyTests");
+    qputenv("NOVELTY_TEST_APP_DATA_DIR", QFile::encodeName(t.path()));
     try {
         const QString root = t.path() + "/Games"; QDir().mkpath(root);
         file(root + "/Game/game.exe"); file(t.path() + "/runner/proton");
@@ -574,7 +576,7 @@ int main(int argc, char **argv) {
             // An unmounted drive can leave an empty directory at the mount point.
             const auto mount = t.path() + "/MountPoint";
             QDir().mkpath(mount);
-            QSettings().setValue("gamesRoot", mount);
+            setAppSetting("gamesRoot", mount);
             Window window({}, launcher); window.show(); window.scan();
             if (QFileInfo::exists(mount + "/.novelty")) throw std::runtime_error("Missing remembered library was recreated at empty mount point");
             { Library restored(mount); }

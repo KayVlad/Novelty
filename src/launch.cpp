@@ -1,6 +1,7 @@
 #include "core.h"
 #include "setup.h"
 #include "profiles.h"
+#include "recipes.h"
 #include "runtime.h"
 #include "saves.h"
 #include "save_server_config.h"
@@ -35,6 +36,7 @@ QProcessEnvironment externalToolEnvironment() {
     return environment;
 }
 Command launchCommand(const Library &lib, const Game &g, bool prepare) {
+    if (!g.recipeCandidates.isEmpty()) fail("Several recipes match this game. Choose one in Manage → Runtime before Play.");
     if (QFileInfo::exists(g.folder + "/.novelty-transfer.json")) fail("This LAN installation is incomplete. Retry its transfer before Play.");
     if (g.installPending && !prepare) fail("Finish installation in Manage before using Play.");
     const auto pathIssue = launchPathIssue(g);
@@ -53,9 +55,26 @@ Command launchCommand(const Library &lib, const Game &g, bool prepare) {
         c.arguments = {"steam://rungameid/" + g.steamId};
         return c;
     }
+    if (g.backend == "native") {
+        if (prepare) fail("Native Linux games do not need Proton preparation.");
+        if (!nativeExecutable(g.executable) ||
+            !canonicalPath(g.executable).startsWith(canonicalPath(g.folder) + '/'))
+            fail("Choose an executable Linux game inside this game's folder.");
+        if (!QFileInfo(c.cwd).isDir()) fail("The working directory is unavailable.");
+        for (auto it = g.environment.begin(); it != g.environment.end(); ++it) {
+            if (it.key().isEmpty() || it.key().contains('=') || it.key().contains(QChar::Null) || it.value().contains(QChar::Null))
+                fail("Invalid environment variable.");
+            c.environment.insert(it.key(), it.value());
+        }
+        if (!g.locale.isEmpty()) { c.environment.insert("LC_ALL", g.locale); c.environment.insert("LANG", g.locale); }
+        c.program = canonicalPath(g.executable);
+        c.arguments = g.arguments;
+        return c;
+    }
     if (g.backend != "umu") fail("Unsupported launch backend.");
     resolveSetupProfile(g); // Reject unavailable versions before starting a backend or changing a prefix.
-    auto umu = lib.settings()["umu"].toString("umu-run");
+    auto umu = g.umuLauncher.isEmpty() ? lib.settings()["umu"].toString("umu-run") :
+               g.umuResolved;
     if (umu == "umu-run" && resolveProgram(umu).isEmpty()) {
         umu = lib.dataRoot() + "/tools/umu-run";
         if (resolveProgram(umu).isEmpty()) umu = managedUmuPath(lib.root());
@@ -81,7 +100,8 @@ Command launchCommand(const Library &lib, const Game &g, bool prepare) {
     }
     c.environment.insert("WINEPREFIX", lib.prefix(g.id));
     c.environment.insert("PROTONPATH", canonicalPath(g.runner));
-    c.environment.insert("GAMEID", "umu-default");
+    c.environment.insert("GAMEID", g.umuGameId.isEmpty() ? "umu-default" : g.umuGameId);
+    c.environment.insert("STORE", g.store.isEmpty() ? "none" : g.store);
     c.environment.insert("PROTON_VERB", "waitforexitandrun");
     c.environment.insert("UMU_RUNTIME_UPDATE", "0");
     // Pinned umu 1.4.4 honors these locations for its Steam Linux Runtime and downloads.
@@ -111,6 +131,21 @@ Command prefixToolCommand(const Library &lib, const Game &g, const QString &tool
     // Use the prefix's own utility explicitly, never a same-named file in the game folder.
     // The file may not exist until supervised preparation completes.
     command.arguments = {lib.prefix(g.id) + "/drive_c/windows/" + (tool == "winecfg" ? "system32/winecfg.exe" : "regedit.exe")};
+    return command;
+}
+Command winetricksCommand(const Library &lib, const Game &g, const QString &verb) {
+    validateWinetricks({verb});
+    if (g.backend != "umu") fail("Winetricks components require an umu game and a selected GE-Proton or UMU-Proton runner.");
+    const auto runnerName = QFileInfo(g.runner).fileName();
+    if (!runnerName.startsWith("GE-Proton", Qt::CaseInsensitive) &&
+        !runnerName.startsWith("UMU-Proton", Qt::CaseInsensitive))
+        fail("Winetricks integration requires a GE-Proton or UMU-Proton runner. Choose one in Manage → Runtime.");
+    const auto bundledWinetricks = QDir(g.runner).filePath("protonfixes/winetricks");
+    if (!QFileInfo(bundledWinetricks).isExecutable())
+        fail("The selected Proton runner does not include executable Winetricks integration. "
+             "Choose a complete GE-Proton or UMU-Proton installation; no system Wine or Protontricks is required.");
+    auto command = launchCommand(lib, g, true);
+    command.arguments = {"winetricks", verb};
     return command;
 }
 Command extraLaunchCommand(const Library &lib, const Game &g, const ExtraLaunch &extra) {
@@ -150,7 +185,8 @@ QStringList activeExtraPaths(const Library &lib, const Game &g) {
     if (record["state"] != "complete" && record["state"] != "failed" && record["state"] != "interrupted") fail("An active executable operation has an unknown state; removal was blocked.");
     return {};
 }
-int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &tool, const std::optional<ExtraLaunch> &request, bool installing, bool debugWine) {
+int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &tool, const std::optional<ExtraLaunch> &request,
+              bool installing, bool debugWine, const QString &winetricksApprovalToken) {
     auto extra = request;
     if (!lib.recoveryIssue(id).isEmpty()) return 2;
     QDir().mkpath(QFileInfo(lib.gamePath(id, "launch.lock")).absolutePath());
@@ -160,6 +196,10 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
     const auto operationPath = lib.gamePath(id, "extra-launch.json");
     try {
         const auto g = lib.game(id);
+        const auto requiredApproval = winetricksApproval(lib, g);
+        if (!requiredApproval.isEmpty() && requiredApproval != winetricksApprovalToken)
+            fail("Winetricks components need approval before preparation: " + pendingWinetricks(lib, g).join(", ") +
+                 ". Open this game in Novelty and choose Play or Prepare to review the changes.");
         if (debugWine && (installing || prepareOnly || !tool.isEmpty() || extra || g.backend != "umu"))
             fail("Wine debug is available for a single umu game launch only.");
         if (installing) {
@@ -206,11 +246,18 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
             lib.recordStatus(id, "Requested in Steam", "Steam owns the game process. This prototype cannot confirm shortcut startup/exit.");
             return 0;
         }
-        // Explicit Prepare also repairs an already-completed prefix without deleting it.
-        log.write(("Setup profile: " + g.setupProfile + "\n").toUtf8());
-        if (prepareOnly || !setupComplete(lib, g)) {
+        // Explicit Prepare also repairs an already-completed Proton prefix without deleting it.
+        if (g.backend == "umu") log.write(("Setup profile: " + g.setupProfile + "\n").toUtf8());
+        if (g.backend == "umu" && (prepareOnly || !setupComplete(lib, g))) {
             lib.recordStatus(id, "Preparing");
             preparePrefix(lib, g, [&] { return executeTracked(lib, id, launchCommand(lib, g, true), log); });
+        }
+        if (g.backend == "umu" && !pendingWinetricks(lib, g).isEmpty()) {
+            lib.recordStatus(id, "Preparing", "Installing approved Winetricks components.");
+            prepareWinetricks(lib, g, [&](const QString &verb) {
+                log.write(("Winetricks: " + verb + "\n").toUtf8()); log.flush();
+                return executeTracked(lib, id, winetricksCommand(lib, g, verb), log);
+            });
         }
         SaveServerConfig saveServer;
         bool serverMode = false;

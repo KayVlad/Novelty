@@ -2,6 +2,7 @@ import fcntl
 import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import tarfile
 import tempfile
@@ -14,6 +15,19 @@ spec.loader.exec_module(installer)
 
 
 class InstallerTests(unittest.TestCase):
+    def test_latest_release_selector_uses_verified_metadata(self):
+        version = '9.8.7'
+        name = f'umu-launcher-{version}-zipapp.tar'
+        url = f'https://github.com/Open-Wine-Components/umu-launcher/releases/download/{version}/{name}'
+        release = dict(tag_name=version, draft=False, prerelease=False, assets=[dict(
+            name=name, browser_download_url=url, size=123, digest='sha256:' + 'a' * 64)])
+        with patch.object(installer.urllib.request, 'urlopen', return_value=io.BytesIO(json.dumps(release).encode())):
+            self.assertEqual(installer.release_spec('umu-latest'), (version, url, 'a' * 64, None))
+        release['assets'][0]['digest'] = ''
+        with patch.object(installer.urllib.request, 'urlopen', return_value=io.BytesIO(json.dumps(release).encode())):
+            with self.assertRaisesRegex(RuntimeError, 'SHA-256'):
+                installer.release_spec('umu-latest')
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

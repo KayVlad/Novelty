@@ -248,11 +248,21 @@ QList<SaveMapping> recipeMappings(const Library &lib, const SaveConfig &config) 
     if (mappings.isEmpty()) fail("Save recipe declares no locations.");
     return mappings;
 }
+QString renpyRoot(const Game &game) {
+    if (game.saveStrategy != "renpy" && !(game.recipeId.isEmpty() && game.engine == "Ren'Py")) return {};
+    auto path = game.executable.isEmpty() ? game.folder : QFileInfo(game.executable).absolutePath();
+    while (path == game.folder || path.startsWith(game.folder + '/')) {
+        if (QFileInfo(path + "/renpy/__init__.py").isFile() && QFileInfo(path + "/game").isDir()) return path;
+        if (path == game.folder) break;
+        path = QFileInfo(path).absolutePath();
+    }
+    return {};
+}
 QList<SaveMapping> renpyMappings(const Game &game) {
-    if (game.engine != "Ren'Py" || !QFileInfo(game.folder + "/renpy/__init__.py").isFile() ||
-        !QFileInfo(game.folder + "/game").isDir()) return {};
+    const auto root = renpyRoot(game);
+    if (root.isEmpty()) return {};
     for (const auto &argument : game.arguments) if (argument.contains("--savedir")) return {};
-    QFile options(game.folder + "/game/options.rpy");
+    QFile options(root + "/game/options.rpy");
     if (!options.open(QIODevice::ReadOnly) || options.size() > 256 * 1024) return {};
     const auto source = QString::fromUtf8(options.readAll());
     QStringList active;
@@ -261,13 +271,24 @@ QList<SaveMapping> renpyMappings(const Game &game) {
     if (text.contains(QRegularExpression(R"(\bconfig\.(?:savedir|extra_savedirs)\s*=)"))) return {};
     static const QRegularExpression literal(R"(\bconfig\.save_directory\s*=\s*['\"]([^'\"\r\n]{1,120})['\"])");
     const auto match = literal.match(text);
-    if (match.hasMatch()) return {{"appdata", "RenPy/" + match.captured(1)}, {"game", "game/saves"}};
+    const auto gameSaves = QDir(game.folder).relativeFilePath(root + "/game/saves");
+    if (match.hasMatch()) return {{"appdata", "RenPy/" + match.captured(1)}, {"game", gameSaves}};
     if (text.contains(QRegularExpression(R"(\bconfig\.save_directory\s*=\s*None\b)")))
-        return {{"game", "game/saves"}};
+        return {{"game", gameSaves}};
     return {};
 }
 void resolveDeclaredSavePaths(Library &lib, const Game &game, SaveConfig &config) {
     if (config.discoveryState != "searching" || !config.mappings.isEmpty()) return;
+    if (!game.recipeSaves.isEmpty()) {
+        for (const auto &value : game.recipeSaves) {
+            const auto item = value.toObject();
+            config.mappings.append({item["scope"].toString(), item["path"].toString()});
+        }
+        config.discoveryState = "identified"; config.discoverySource = "recipe";
+        validate(lib, game, config);
+        writeJson(configPath(lib, game.id), configJson(config));
+        return;
+    }
     auto recipe = recipeMappings(lib, config);
     if (!recipe.isEmpty()) {
         config.mappings = recipe; config.discoveryState = "identified"; config.discoverySource = "recipe";
@@ -824,13 +845,14 @@ QStringList recoverSaveObservations(Library &lib) {
 QList<SaveMapping> suggestedSaveMappings(const Library &lib, const QString &gameId) {
     const auto game = lib.game(gameId);
     QList<SaveMapping> suggestions;
-    if (game.engine != "Ren'Py" && game.setupProfile != "renpy-bundled-v1") return suggestions;
+    const auto root = renpyRoot(game);
+    if (root.isEmpty()) return suggestions;
     const auto populated = [](const QString &path) {
         const QFileInfo info(path);
         return info.isDir() && !info.isSymbolicLink() &&
             !QDir(path).entryList(QDir::Files | QDir::NoSymLinks | QDir::Hidden).isEmpty();
     };
-    if (populated(game.folder + "/game/saves")) suggestions.append(SaveMapping{"game", "game/saves"});
+    if (populated(root + "/game/saves")) suggestions.append(SaveMapping{"game", QDir(game.folder).relativeFilePath(root + "/game/saves")});
     const auto users = lib.prefix(gameId) + "/drive_c/users";
     if (QFileInfo(users).isDir() && !QFileInfo(users).isSymbolicLink()) {
         for (const auto &user : QDir(users).entryInfoList(QDir::Dirs | QDir::NoSymLinks | QDir::NoDotAndDotDot, QDir::Name)) {

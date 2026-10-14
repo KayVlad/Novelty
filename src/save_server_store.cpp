@@ -53,14 +53,14 @@ void copyTree(const QString &source, const QString &destination, qint64 &bytes, 
     } else fail("Save bundle contains an unsupported entry.");
 }
 ServerSaveRevision readCurrent(const QString &root, const QString &serverId, const QString &key,
-                               bool verifyContents) {
+                               bool verifyContents, bool allowPendingPayload = false) {
     const auto game = gameRoot(root, key);
     noLinks(game);
     const auto path = game + "/current.json";
     if (!exists(path)) {
         const QDir revisions(game + "/revisions");
-        if (!revisions.entryList(QDir::AllEntries | QDir::Hidden | QDir::System |
-                                 QDir::NoDotAndDotDot).isEmpty())
+        if (!allowPendingPayload && !revisions.entryList(QDir::AllEntries | QDir::Hidden | QDir::System |
+                                                         QDir::NoDotAndDotDot).isEmpty())
             fail("Server save pointer is missing while revision payloads exist. Reconcile the store before uploading.");
         return {serverId, 0, {}, {}, 0};
     }
@@ -83,6 +83,68 @@ ServerSaveRevision readCurrent(const QString &root, const QString &serverId, con
         files = manifest["files"].toInt(-1);
     }
     return {serverId, revision, id, bundle, files};
+}
+QJsonObject pointerRecord(const QString &key, const QString &serverId, int revision,
+                          const QString &snapshotId, const QString &storageId) {
+    return {{"schema", 1}, {"game_key", key}, {"server_id", serverId},
+            {"revision", revision}, {"snapshot_id", snapshotId}, {"storage_id", storageId}};
+}
+void recoverPending(const QString &root, const QString &serverId, const QString &key) {
+    const auto game = gameRoot(root, key);
+    const auto intent = game + "/.inProgress";
+    if (!exists(intent)) return;
+    noLinks(intent);
+    if (QFileInfo(intent).size() < 1 || QFileInfo(intent).size() > 4096)
+        fail("Server save publication intent is invalid.");
+    const auto record = readJson(intent);
+    const auto expected = record["expected_revision"].toInt(-1);
+    const auto revision = record["revision"].toInt(-1);
+    const auto snapshotId = record["snapshot_id"].toString();
+    const auto storageId = record["storage_id"].toString();
+    if (record["schema"].toInt() != 1 || record["game_key"].toString() != key ||
+        record["server_id"].toString() != serverId || expected < 0 || expected >= INT_MAX ||
+        revision != expected + 1 || QUuid(snapshotId).isNull() ||
+        QUuid(storageId).isNull() || QUuid(storageId).toString(QUuid::WithoutBraces) != storageId)
+        fail("Server save publication intent is invalid.");
+    const auto stage = game + "/.stage-" + storageId;
+    const auto final = revisionFolder(game, revision, storageId);
+    noLinks(stage); noLinks(final);
+    // A first-upload replay must not turn an unrelated orphan into hidden history.
+    // For later uploads, only older revisions and this intent's target may exist.
+    const QDir revisions(game + "/revisions");
+    for (const auto &name : revisions.entryList(QDir::AllEntries | QDir::Hidden | QDir::System |
+                                                 QDir::NoDotAndDotDot)) {
+        if (name == QFileInfo(final).fileName()) continue;
+        bool numeric = false;
+        const auto foundRevision = name.section('-', 0, 0).toInt(&numeric);
+        if (!numeric || foundRevision <= 0 || foundRevision >= revision)
+            fail("Server save publication intent conflicts with another revision payload.");
+    }
+    const auto current = readCurrent(root, serverId, key, true, true);
+    if (current.revision == revision) {
+        if (current.snapshotId != snapshotId || current.bundleDirectory != final || exists(stage))
+            fail("Server save publication intent disagrees with the current revision.");
+        if (!QFile::remove(intent)) fail("Cannot clear completed server save publication intent.");
+        return;
+    }
+    if (current.revision != expected || (exists(stage) && exists(final)))
+        fail("Server save publication intent disagrees with the current revision.");
+    const auto source = exists(final) ? final : stage;
+    if (!exists(source)) {
+        // Publication did not start. Keep the previously committed pointer.
+        if (!QFile::remove(intent)) fail("Cannot clear abandoned server save publication intent.");
+        return;
+    }
+    const auto manifest = verifyPortableSaveBundle(source);
+    if (manifest["id"].toString() != snapshotId)
+        fail("Server save publication payload does not match its intent.");
+    if (source == stage && !QDir().rename(stage, final))
+        fail("Cannot finish publishing verified server save payload.");
+    writeJson(game + "/current.json", pointerRecord(key, serverId, revision, snapshotId, storageId));
+    const auto published = readCurrent(root, serverId, key, true);
+    if (published.revision != revision || published.snapshotId != snapshotId || published.bundleDirectory != final)
+        fail("Cannot verify recovered server save publication.");
+    if (!QFile::remove(intent)) fail("Cannot clear completed server save publication intent.");
 }
 }
 
@@ -115,6 +177,10 @@ SaveServerStore::SaveServerStore(const QString &root) : root_(QDir::cleanPath(QF
 }
 
 ServerSaveRevision SaveServerStore::current(const QString &gameKey) const {
+    noLinks(root_ + "/store.lock");
+    QLockFile lock(root_ + "/store.lock"); lock.setStaleLockTime(0);
+    if (!lock.tryLock(5000)) fail("Save server storage is busy.");
+    recoverPending(root_, serverId_, gameKey);
     return readCurrent(root_, serverId_, gameKey, true);
 }
 
@@ -124,7 +190,8 @@ ServerSaveRevision SaveServerStore::put(const QString &gameKey, int expectedRevi
     noLinks(root_ + "/store.lock");
     QLockFile lock(root_ + "/store.lock"); lock.setStaleLockTime(0);
     if (!lock.tryLock(5000)) fail("Save server storage is busy.");
-    const auto previous = current(gameKey);
+    recoverPending(root_, serverId_, gameKey);
+    const auto previous = readCurrent(root_, serverId_, gameKey, true);
     if (previous.revision != expectedRevision) throw ServerRevisionConflict(previous.revision);
     if (previous.revision == INT_MAX) fail("Server revision limit reached.");
     const auto source = verifyPortableSaveBundle(bundleDirectory);
@@ -153,15 +220,25 @@ ServerSaveRevision SaveServerStore::put(const QString &gameKey, int expectedRevi
         copyTree(bundleDirectory, stage, bytes, entries);
         const auto staged = verifyPortableSaveBundle(stage);
         if (staged != source) fail("Save bundle changed while staging the server revision.");
-        if (!QDir().rename(stage, final)) fail("Cannot publish verified server save payload.");
-        writeJson(game + "/current.json", {{"schema", 1}, {"game_key", gameKey},
-            {"server_id", serverId_}, {"revision", previous.revision + 1},
+        const auto intent = game + "/.inProgress";
+        noLinks(intent);
+        if (exists(intent)) fail("A server save publication is already in progress.");
+        writeJson(intent, {{"schema", 1}, {"game_key", gameKey}, {"server_id", serverId_},
+            {"expected_revision", previous.revision}, {"revision", previous.revision + 1},
             {"snapshot_id", source["id"].toString()}, {"storage_id", nonce}});
+        if (!QDir().rename(stage, final)) fail("Cannot publish verified server save payload.");
+        writeJson(game + "/current.json", pointerRecord(gameKey, serverId_, previous.revision + 1,
+                                                       source["id"].toString(), nonce));
+        const auto published = readCurrent(root_, serverId_, gameKey, true);
+        if (published.revision != previous.revision + 1 ||
+            published.snapshotId != source["id"].toString() || published.bundleDirectory != final)
+            fail("Cannot verify published server save revision.");
+        if (!QFile::remove(intent)) fail("Cannot clear completed server save publication intent.");
     } catch (...) {
-        if (QFileInfo(stage).isDir()) QDir(stage).removeRecursively();
+        if (!exists(game + "/.inProgress") && QFileInfo(stage).isDir()) QDir(stage).removeRecursively();
         throw;
     }
-    return current(gameKey);
+    return readCurrent(root_, serverId_, gameKey, true);
 }
 
 } // namespace novelty

@@ -73,12 +73,13 @@ ServerSaveAction chooseServerSaveAction(const AcceptedServerSave &accepted,
                                         const QJsonObject &live) {
     if (QUuid(remote.serverId).isNull() || remote.revision < 0 || remote.files < 0 ||
         (remote.revision > 0 && QUuid(remote.snapshotId).isNull()) ||
-        (remote.revision == 0 && remote.files != 0) || !validFingerprint(live))
+        (remote.revision == 0 && (!remote.snapshotId.isEmpty() || remote.files != 0)) ||
+        !validFingerprint(live))
         fail("Cannot compare an invalid server or live save state.");
     if (!accepted.present) {
         if (live["files"].toInt(-1) == 0)
             return remote.revision == 0 ? ServerSaveAction::AcceptEmpty : ServerSaveAction::Download;
-        return remote.files == 0 ? ServerSaveAction::Upload : ServerSaveAction::Conflict;
+        return remote.revision == 0 ? ServerSaveAction::Upload : ServerSaveAction::Conflict;
     }
     if (accepted.serverId != remote.serverId || remote.revision < accepted.revision ||
         (remote.revision == accepted.revision && remote.snapshotId != accepted.snapshotId) ||

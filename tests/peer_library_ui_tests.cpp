@@ -1,4 +1,5 @@
 #include "window.h"
+#include "app_settings.h"
 #include "lan_connection.h"
 #include "metadata.h"
 #include "saves.h"
@@ -41,6 +42,7 @@ int main(int argc, char **argv) {
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, temp.path() + "/settings");
     QCoreApplication::setOrganizationName("NoveltyPeerTests"); QCoreApplication::setApplicationName("NoveltyPeerTests");
+    qputenv("NOVELTY_TEST_APP_DATA_DIR", QFile::encodeName(temp.path()));
     QTimer watchdog; watchdog.setSingleShot(true);
     QObject::connect(&watchdog, &QTimer::timeout, &app, [&] {
         for (auto widget : QApplication::topLevelWidgets()) if (widget->isVisible())

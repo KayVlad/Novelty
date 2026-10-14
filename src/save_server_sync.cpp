@@ -33,8 +33,12 @@ ServerSyncResult operate(Library &library, const QString &gameId, const SaveServ
         if (remote.serverId != config.serverId)
             return {ServerSyncStatus::Conflict, "Save server identity changed. Reconcile before syncing."};
         const auto action = chooseServerSaveAction(accepted, remote, live);
-        if (action == ServerSaveAction::Conflict)
+        if (action == ServerSaveAction::Conflict) {
+            if (!accepted.present && remote.revision > 0 && remote.files == 0 && live["files"].toInt() > 0)
+                return {ServerSyncStatus::Conflict,
+                        "The server has a committed empty save state. Choose which saves to keep in Manage → Saves."};
             return {ServerSyncStatus::Conflict, "Local saves and the server revision both need review."};
+        }
         if (action == ServerSaveAction::Play)
             return {ServerSyncStatus::Synced, {}};
         if (action == ServerSaveAction::AcceptEmpty) {

@@ -8,7 +8,7 @@ struct Game;
 QString provisionGe(QWidget *parent, const QString &libraryRoot, const QString &helper = {}, bool startImmediately = false,
                     const QString &suggestedVersion = {});
 QString provisionUmu(QWidget *parent, const QString &libraryRoot, const QString &helper = {}, bool startImmediately = false);
-QString requiredSteamRuntime(const QString &runner);
+QString requiredSteamRuntime(const QString &runner, const QString &libraryRoot);
 bool provisionSteamRuntime(QWidget *parent, const Library &library, const Game &game);
 // The automatic first-Play path uses one cancellable dialog for missing GE, umu and runtime steps.
 bool provisionFirstPlay(QWidget *parent, Library &library, Game &game, const QString &geVersion = {},

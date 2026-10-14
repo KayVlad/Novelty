@@ -1,5 +1,7 @@
 #include "window.h"
+#include "app_settings.h"
 #include "provisioning.h"
+#include "recipes.h"
 #include "metadata.h"
 #include "saves.h"
 #include "devices.h"
@@ -7,13 +9,16 @@
 #include <QtWidgets/qapplication.h>
 #include <QtWidgets/qdialog.h>
 #include <QtWidgets/qdialogbuttonbox.h>
+#include <QtWidgets/qdialogbuttonbox.h>
 #include <QtWidgets/qlabel.h>
 #include <QtWidgets/qmessagebox.h>
 #include <QtWidgets/qlineedit.h>
 #include <QtWidgets/qlistwidget.h>
 #include <QtWidgets/qlistview.h>
 #include <QtWidgets/qcombobox.h>
+#include <QtWidgets/qcheckbox.h>
 #include <QtWidgets/qpushbutton.h>
+#include <QtWidgets/qplaintextedit.h>
 #include <QtWidgets/qtabwidget.h>
 #include <QtWidgets/qtableview.h>
 #include <QtGui/qpainter.h>
@@ -21,6 +26,7 @@
 #include <QtCore/qelapsedtimer.h>
 #include <QtCore/qfile.h>
 #include <QtCore/qfileinfo.h>
+#include <QtCore/qjsondocument.h>
 #include <QtCore/qsettings.h>
 #include <QtCore/qtemporarydir.h>
 #include <QtCore/qthread.h>
@@ -37,6 +43,15 @@ static void require(bool condition, const char *message) {
 static void touch(const QString &path, const QByteArray &contents = {}) {
     QDir().mkpath(QFileInfo(path).absolutePath());
     QFile file(path); require(file.open(QIODevice::WriteOnly), "Cannot create executable fixture"); file.write(contents);
+}
+static bool waitFor(const std::function<bool()> &check, int limit = 7000) {
+    QElapsedTimer clock; clock.start();
+    while (clock.elapsed() < limit) {
+        QCoreApplication::processEvents();
+        if (check()) return true;
+        QThread::msleep(10);
+    }
+    return false;
 }
 static void addFolder(Window &window, const QString &folder, const QString &chosen, bool later = false) {
     bool submitted = false, answered = false;
@@ -77,6 +92,8 @@ int main(int argc, char **argv) {
                      modal ? modal->windowTitle().toUtf8().constData() : "");
         if (modal) for (const auto label : modal->findChildren<QLabel *>())
             std::fprintf(stderr, "  %s\n", label->text().toUtf8().constData());
+        if (modal) for (const auto detail : modal->findChildren<QPlainTextEdit *>())
+            std::fprintf(stderr, "  Details: %s\n", detail->toPlainText().toUtf8().constData());
         std::_Exit(2);
     });
     fixtureWatchdog.start(20000);
@@ -85,6 +102,7 @@ int main(int argc, char **argv) {
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, temporary.path());
     QCoreApplication::setOrganizationName("NoveltyExecutableTests");
     QCoreApplication::setApplicationName("NoveltyExecutableTests");
+    qputenv("NOVELTY_TEST_APP_DATA_DIR", QFile::encodeName(temporary.path()));
     try {
         const auto root = temporary.path() + "/Games";
         QDir().mkpath(root);
@@ -234,6 +252,10 @@ int main(int argc, char **argv) {
         auto settings = library.settings(); settings["runner"] = ""; library.setSettings(settings);
         const auto firstPlayFolder = root + "/First Play";
         touch(firstPlayFolder + "/play.exe");
+        touch(firstPlayFolder + "/first-play.recipe");
+        saveRecipe(root, "games", QJsonDocument(QJsonObject{{"schema", 1}, {"id", "first-play"},
+            {"name", "First Play"}, {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"file", "first-play.recipe"}}}}}},
+            {"settings", QJsonObject{{"runner", "GE-Proton11-7"}, {"setup_profile", "generic-game-v1"}}}}).toJson());
         const auto firstPlayGame = library.addFolder(firstPlayFolder).game;
         require(firstPlayGame.runner.isEmpty(), "First Play fixture unexpectedly selected a runner");
         Window firstPlay(root, argv[1], QUrl("http://127.0.0.1:1/kana/")); firstPlay.show();
@@ -308,7 +330,8 @@ int main(int argc, char **argv) {
             if (!candidates || !location || !status || !tabs || !buttons || candidates->count() != 2) {
                 if (dialog) dialog->reject(); return;
             }
-            tabs->setCurrentWidget(candidates->parentWidget());
+            for (auto page = static_cast<QWidget *>(candidates); page && page != tabs; page = page->parentWidget())
+                if (tabs->indexOf(page) >= 0) { tabs->setCurrentWidget(page); break; }
             candidatesShown = candidates->item(0)->text().endsWith("/Aokana/SaveData") &&
                               candidates->item(1)->text().endsWith("/NekoNyanSoft/Aokana") &&
                               status->text().contains("Multiple possible save folders") && candidates->isVisible();
@@ -360,7 +383,12 @@ int main(int argc, char **argv) {
         const auto runtimeRunner = temporary.path() + "/Runtime runner";
         touch(runtimeRoot + "/Game/play.exe"); touch(runtimeRunner + "/proton");
         touch(runtimeRunner + "/toolmanifest.vdf", "\"manifest\"\n{\n\"require_tool_appid\" \"4183110\"\n}\n");
-        require(requiredSteamRuntime(runtimeRunner) == "steamrt4", "Selected Proton runtime was not identified");
+        Library runtimeMapLibrary(runtimeRoot);
+        require(requiredSteamRuntime(runtimeRunner, runtimeMapLibrary.root()) == "steamrt4", "Selected Proton runtime was not identified");
+        writeJson(runtimeMapLibrary.dataRoot() + "/runtime-appids.json", {{"4183110", "steamrt3"}});
+        require(requiredSteamRuntime(runtimeRunner, runtimeMapLibrary.root()) == "steamrt3",
+                "An edited runtime app ID map should change the selected runtime");
+        writeJson(runtimeMapLibrary.dataRoot() + "/runtime-appids.json", {{"4183110", "steamrt4"}});
         const auto fakeRuntimeUmu = temporary.path() + "/fake-runtime-umu";
         touch(fakeRuntimeUmu, "#!/bin/sh\n[ -z \"$UMU_ZENITY\" ] || { echo 'UMU_ZENITY must be unset for the Python downloader' >&2; exit 1; }\nmkdir -p \"$UMU_FOLDERS_PATH/umu/steamrt4\"\ntouch \"$UMU_FOLDERS_PATH/invoked\"\nif [ -e \"$UMU_FOLDERS_PATH/fail\" ]; then echo 'Fixture runtime download failed' >&2; exit 1; fi\nif [ -e \"$UMU_FOLDERS_PATH/cancel\" ]; then touch \"$UMU_FOLDERS_PATH/waiting\"; exec sleep 20; fi\ntouch \"$UMU_FOLDERS_PATH/umu/steamrt4/.installed.ok\" \"$UMU_FOLDERS_PATH/umu/steamrt4/_v2-entry-point\"\nexit 0\n");
         QFile::setPermissions(fakeRuntimeUmu, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
@@ -513,6 +541,72 @@ int main(int argc, char **argv) {
                 reopened.game(pending.id).executable == pending.folder + "/Manual.EXE" &&
                 reopened.game(installedId).executable == root + "/Installed Ambiguous/Second.exe",
                 "Executable choice did not persist after reopening");
+        {
+            const auto oldGames = temporary.path() + "/Settings move old";
+            const auto newGames = temporary.path() + "/Settings move new";
+            touch(oldGames + "/Story/play.exe");
+            QString movedId;
+            {
+                Library source(oldGames);
+                source.import(discover(oldGames), {});
+                movedId = source.games().first().id;
+            }
+            {
+                Window moving(oldGames, argv[1]); moving.show();
+                require(QDir().rename(oldGames, newGames), "move Games folder while Settings is open");
+                bool submitted = false;
+                QTimer::singleShot(0, &moving, [&] {
+                    auto dialog = moving.findChild<QDialog *>("settingsDialog");
+                    auto field = moving.findChild<QLineEdit *>("settingsGamesFolder");
+                    if (!dialog || !field) return;
+                    field->setText(newGames);
+                    dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Save)->click();
+                    submitted = true;
+                });
+                moving.settings();
+                require(submitted, "Games folder setting exists and can be saved");
+                require(loadAppSettings()["gamesRoot"].toString() == newGames,
+                        "Settings saves the moved Games path immediately");
+                auto grid = moving.findChild<QListView *>("gameGrid");
+                require(waitFor([&] { return grid->model()->rowCount() == 1; }) &&
+                        grid->model()->index(0, 0).data(Qt::DisplayRole).toString() == "Story",
+                        "switching Games folders does not show old and new cards together");
+            }
+            Window restored({}, argv[1]); restored.show();
+            auto grid = restored.findChild<QListView *>("gameGrid");
+            require(restored.findChild<QLabel *>("gamesFolderLink")->toolTip() == newGames &&
+                    waitFor([&] { return grid->model()->rowCount() == 1; }),
+                    "restarting reopens the chosen Games folder without duplicate cards");
+            Library moved(newGames);
+            require(moved.games().size() == 1 && moved.game(movedId).folder == newGames + "/Story",
+                    "switching preserves the original installation ID");
+        }
+        {
+            const auto nativeRoot = temporary.path() + "/Native UI Games";
+            const auto nativeSource = temporary.path() + "/Native UI source";
+            const auto nativeExecutable = nativeSource + "/start";
+            QDir().mkpath(nativeRoot);
+            touch(nativeExecutable, "#!/bin/sh\nexit 0\n");
+            require(QFile::setPermissions(nativeExecutable, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner),
+                    "native UI fixture is executable");
+            Window nativeWindow(nativeRoot, argv[1]); nativeWindow.show();
+            bool submitted = false;
+            QTimer::singleShot(0, &nativeWindow, [&] {
+                auto dialog = nativeWindow.findChild<QDialog *>("addGameDialog");
+                auto folder = nativeWindow.findChild<QLineEdit *>("addGameFolder");
+                auto mode = nativeWindow.findChild<QCheckBox *>("addGameNativeMode");
+                auto executable = nativeWindow.findChild<QLineEdit *>("addGameNativeExecutable");
+                if (!dialog || !folder || !mode || !executable) return;
+                folder->setText(nativeSource); mode->setChecked(true); executable->setText(nativeExecutable);
+                dialog->findChild<QPushButton *>("addGameSubmit")->click(); submitted = true;
+            });
+            nativeWindow.addGame();
+            Library nativeLibrary(nativeRoot);
+            const auto added = nativeLibrary.games();
+            require(submitted && added.size() == 1 && added.first().backend == "native" &&
+                    added.first().executable == nativeRoot + "/Native UI source/start",
+                    "Add game offers and saves an explicit native executable choice");
+        }
         std::printf("Executable UI flow passed\n");
     } catch (const std::exception &error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1;

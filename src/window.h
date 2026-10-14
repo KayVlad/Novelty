@@ -62,6 +62,7 @@ public:
     void manage();
     void relinkGame();
     void settings();
+    void recipes();
     void devices();
     void syncSavesFromPeer(const QString &gameId, QWidget *parent);
     void installFromPeer();
