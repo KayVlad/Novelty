@@ -6,6 +6,7 @@
 #include <QtCore/qfile.h>
 #include <QtCore/qfileinfo.h>
 #include <QtCore/qjsondocument.h>
+#include <QtCore/qlockfile.h>
 #include <QtCore/qtemporarydir.h>
 #include <functional>
 #include <stdexcept>
@@ -151,6 +152,19 @@ int main(int argc, char **argv) {
         writeJson(runner + "/novelty-install.json", {{"schema", 1}, {"version", version}, {"architecture", "x86_64"},
             {"sha512", QString(128, QLatin1Char('a'))}});
         check(managedGeRunners(library).size() == 1 && managedGeRunners(library).first().verified, "managed receipt checked");
+        {
+            QLockFile maintenance(root + "/.novelty/mutation.lock"); maintenance.setStaleLockTime(0);
+            check(maintenance.tryLock(), "maintenance lock fixture");
+            const auto before = library.settings();
+            rejects([&] { saveRecipe(root, "games", recipe("during-maintenance", {}, {{"runner", version}})); });
+            rejects([&] { removeRecipe(root, "general", "legacy"); });
+            rejects([&] { library.setSettings({{"runner", runner}}); });
+            rejects([&] { syncGeProvisioningPolicy(library, runner); });
+            check(library.settings() == before && !QFileInfo::exists(recipePath(root, "games", "during-maintenance")) &&
+                  QFileInfo::exists(recipePath(root, "general", "legacy")) &&
+                  !QFileInfo::exists(root + "/.novelty/ge-proton.json"),
+                  "maintenance lock leaves recipes, Settings and GE policy unchanged");
+        }
         syncGeProvisioningPolicy(library, runner);
         check(readJson(root + "/.novelty/ge-proton.json")["version"] == version,
               "Settings pin updates the provisioning policy");
@@ -160,6 +174,10 @@ int main(int argc, char **argv) {
         check(!readJson(root + "/.novelty/ge-proton.json").contains("version"),
               "changing the default clears the old GE pin");
         library.setSettings({{"default_recipe", "general-game"}});
+        saveRecipe(root, "games", recipe("pinned-runner", {}, {{"runner", version}}));
+        check(!managedRunnerRemovalIssue(library, version).isEmpty(), "recipe pin blocks runner removal");
+        rejects([&] { removeManagedRunner(library, version); });
+        removeRecipe(root, "games", "pinned-runner");
         removeManagedRunner(library, version);
         check(!QFileInfo::exists(runner) && QFileInfo::exists(folder + "/Story.exe"), "unused build removed without game data loss");
         std::printf("PASS: %d configuration assertions\n", checks); return 0;

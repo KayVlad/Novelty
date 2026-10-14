@@ -241,7 +241,7 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
             writeJson(lib.gamePath(id, "steam-request.json"), {{"state", "untracked"}, {"updated", now()}});
             QProcess p; p.setProgram(cmd.program); p.setArguments(cmd.arguments); p.setWorkingDirectory(cmd.cwd);
             if (!p.startDetached()) fail("Steam could not receive the launch request.");
-            lib.recordStatus(id, "Requested in Steam", "Steam owns the game process. This prototype cannot confirm shortcut startup/exit.");
+            lib.recordStatus(id, "Requested in Steam", "Steam owns the game process. Novelty cannot confirm shortcut startup or exit.");
             return 0;
         }
         // Explicit Prepare also repairs an already-completed Proton prefix without deleting it.

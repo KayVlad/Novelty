@@ -6,6 +6,7 @@
 #include <QtCore/qfileinfo.h>
 #include <QtCore/qjsonarray.h>
 #include <QtCore/qjsondocument.h>
+#include <QtCore/qlockfile.h>
 #include <QtCore/qmap.h>
 #include <QtCore/qregularexpression.h>
 #include <QtCore/qsavefile.h>
@@ -607,6 +608,8 @@ void saveRecipe(const QString &libraryRoot, const QString &tier, const QByteArra
     if (QJsonDocument::fromJson(json).object()["settings"].toObject().contains("setup_profile"))
         fail("setup_profile is obsolete; remove it and use the recipe settings directly.");
     const auto recipe = parseRecipe(json, {}, tier);
+    QLockFile mutation(libraryRoot + "/.novelty/mutation.lock"); mutation.setStaleLockTime(0);
+    if (!mutation.tryLock()) fail("Library maintenance is in progress. Retry saving the recipe shortly.");
     const auto path = recipePath(libraryRoot, tier, recipe.id);
     if (QFileInfo(path).isSymbolicLink()) fail("A recipe cannot be a symbolic link.");
     const bool existed = QFileInfo::exists(path);
@@ -630,6 +633,8 @@ void saveRecipe(const QString &libraryRoot, const QString &tier, const QByteArra
     }
 }
 void removeRecipe(const QString &libraryRoot, const QString &tier, const QString &id) {
+    QLockFile mutation(libraryRoot + "/.novelty/mutation.lock"); mutation.setStaleLockTime(0);
+    if (!mutation.tryLock()) fail("Library maintenance is in progress. Retry removing the recipe shortly.");
     const auto path = recipePath(libraryRoot, tier, id);
     for (const auto &recipe : loadRecipes(libraryRoot))
         if (recipe.inherits == id) fail("Recipe " + recipe.id + " inherits this preset. Change it first.");

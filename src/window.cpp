@@ -891,6 +891,7 @@ void Window::settings() {
     form->addRow("Games folder", pathField(folderField, &dialog, true, "Choose your main Games folder"));
     auto s = library_ ? library_->settings() : QJsonObject(); auto backend = backendBox(&dialog, s["backend"].toString("umu"), false);
     auto runner = runnerBox(&dialog, s["runner"].toString(), library_ ? library_->root() : QString());
+    runner->setObjectName("settingsRunner");
     auto umu = new QLineEdit(s["umu"].toString("umu-run"), &dialog);
     auto steam = new QLineEdit(s["steam"].toString("steam"), &dialog);
     form->addRow("Default backend", backend); form->addRow("Default Proton directory", runner);
@@ -966,13 +967,15 @@ void Window::settings() {
         auto available = new QListWidget(&manager); available->setObjectName("availableGeList");
         managerLayout->addWidget(new QLabel("Installed managed GE-Proton builds", &manager)); managerLayout->addWidget(installed);
         managerLayout->addWidget(new QLabel("Official available builds (refresh to fetch)", &manager)); managerLayout->addWidget(available);
-        auto status = new QLabel(&manager); status->setWordWrap(true); status->setTextFormat(Qt::PlainText); managerLayout->addWidget(status);
+        auto status = new QLabel(&manager); status->setObjectName("protonManagerStatus");
+        status->setWordWrap(true); status->setTextFormat(Qt::PlainText); managerLayout->addWidget(status);
         auto row = new QHBoxLayout; managerLayout->addLayout(row);
         auto refresh = new QPushButton("Refresh catalog", &manager);
         auto install = new QPushButton("Install selected / exact…", &manager);
         install->setObjectName("installManagedGe");
         auto pin = new QPushButton("Use selected as default", &manager);
         auto remove = new QPushButton("Remove selected…", &manager);
+        remove->setObjectName("removeManagedGe");
         row->addWidget(refresh); row->addWidget(install); row->addWidget(pin); row->addWidget(remove);
         auto close = new QPushButton("Close", &manager); managerLayout->addWidget(close, 0, Qt::AlignRight);
         connect(close, &QPushButton::clicked, &manager, &QDialog::accept);
@@ -1025,6 +1028,10 @@ void Window::settings() {
         connect(remove, &QPushButton::clicked, &manager, [&] {
             if (!installed->currentItem()) { status->setText("Choose an installed build."); return; }
             const auto version = installed->currentItem()->data(Qt::UserRole).toString();
+            if (runner->currentText().trimmed() == library_->dataRoot() + "/runners/" + version) {
+                status->setText("This build is selected in Settings. Choose another default and save Settings before removing it.");
+                return;
+            }
             if (const auto reason = managedRunnerRemovalIssue(*library_, version); !reason.isEmpty())
                 { status->setText(reason); return; }
             if (QMessageBox::question(&manager, "Remove GE-Proton?", "Remove managed " + version + "? Installed games and prefixes are kept.",

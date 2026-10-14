@@ -367,7 +367,7 @@ QString runnerVersion(const QString &runner) {
 
 Library::Library(QString root) : root_(canonicalPath(root)), connection_(QUuid::createUuid().toString()) {
     if (!QFileInfo(root_).isDir()) fail("Games folder is unavailable: " + root_);
-    if (!QDir().mkpath(dataRoot())) fail("Games folder is not writable. Choose a writable folder for this prototype.");
+    if (!QDir().mkpath(dataRoot())) fail("Games folder is not writable. Choose a writable folder.");
     ensureRecipeCatalog(root_);
     const bool newDatabase = !QFileInfo::exists(dataRoot() + "/library.sqlite");
     db_ = QSqlDatabase::addDatabase("QSQLITE", connection_);
@@ -901,6 +901,8 @@ void Library::enableManagedRuntimeStorage() {
     check(q);
 }
 void Library::setSettings(const QJsonObject &s) {
+    QLockFile mutation(dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
+    if (!mutation.tryLock()) fail("Library maintenance is in progress. Retry saving Settings shortly.");
     QSqlQuery q(db_); q.prepare("INSERT INTO settings(key,value) VALUES('app',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
     q.addBindValue(QString::fromUtf8(QJsonDocument(storedLibrarySettings(root_, s)).toJson(QJsonDocument::Compact))); check(q);
 }

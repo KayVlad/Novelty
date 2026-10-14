@@ -143,6 +143,8 @@ QList<ManagedRunner> managedGeRunners(const Library &lib) {
     return entries;
 }
 void syncGeProvisioningPolicy(const Library &lib, const QString &selectedRunner) {
+    QLockFile mutation(lib.dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
+    if (!mutation.tryLock()) fail("Library maintenance is in progress. Retry saving Settings shortly.");
     const auto policyPath = lib.dataRoot() + "/ge-proton.json";
     auto policy = readJson(policyPath);
     QString version;

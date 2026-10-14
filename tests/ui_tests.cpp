@@ -462,12 +462,25 @@ int main(int argc, char **argv) {
             QFile save(prefix + "/save.dat"); if (!save.open(QIODevice::ReadOnly) || save.readAll() != "keep save") throw std::runtime_error("Extra UI orchestration changed saves");
         }
         {
+            const auto managedVersion = QString("GE-Proton99-2");
+            const auto managedPath = lib.dataRoot() + "/runners/" + managedVersion;
+            file(managedPath + "/proton", "#!/bin/sh\n");
+            QFile::setPermissions(managedPath + "/proton", QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+            file(managedPath + "/version", "test");
+            writeJson(managedPath + "/novelty-install.json", {{"schema", 1}, {"version", managedVersion},
+                {"architecture", "x86_64"}, {"sha512", QString(128, QLatin1Char('a'))}});
             Window window(root, launcher); window.show();
             QString settingsError;
             QTimer::singleShot(0, &window, [&] {
                 auto dialog = window.findChild<QDialog *>("settingsDialog");
                 auto folder = window.findChild<QLineEdit *>("settingsGamesFolder");
                 if (!dialog || !folder || folder->text() != root) settingsError = "Games folder is missing from Settings";
+                auto selectedRunner = dialog ? dialog->findChild<QComboBox *>("settingsRunner") : nullptr;
+                if (!selectedRunner) settingsError = "Settings runner selector is missing";
+                else {
+                    selectedRunner->setCurrentText(managedPath); // Deliberately leave this selection unsaved.
+                    if (selectedRunner->currentText() != managedPath) settingsError = "Settings runner selection did not update";
+                }
                 auto manager = window.findChild<QPushButton *>("protonManager");
                 if (!manager) settingsError = "Proton Manager action missing from Settings";
                 else {
@@ -475,6 +488,31 @@ int main(int argc, char **argv) {
                         auto managerDialog = window.findChild<QDialog *>("protonManagerDialog");
                         auto install = window.findChild<QPushButton *>("installManagedGe");
                         if (!managerDialog || !install) { settingsError = "Settings did not open Proton Manager"; return; }
+                        auto managedList = managerDialog->findChild<QListWidget *>("managedGeList");
+                        auto removeManaged = managerDialog->findChild<QPushButton *>("removeManagedGe");
+                        auto managerStatus = managerDialog->findChild<QLabel *>("protonManagerStatus");
+                        QListWidgetItem *managedItem = nullptr;
+                        if (managedList) for (int row = 0; row < managedList->count(); ++row)
+                            if (managedList->item(row)->data(Qt::UserRole).toString() == managedVersion)
+                                managedItem = managedList->item(row);
+                        if (!managedItem || !removeManaged || !managerStatus)
+                            settingsError = "Managed GE fixture is missing from Proton Manager";
+                        else {
+                            managedList->setCurrentItem(managedItem);
+                            QTimer approvalWatchdog(managerDialog); approvalWatchdog.setSingleShot(true);
+                            bool removalPromptOpened = false;
+                            QObject::connect(&approvalWatchdog, &QTimer::timeout, managerDialog, [&] {
+                                if (auto prompt = managerDialog->findChild<QMessageBox *>()) {
+                                    removalPromptOpened = true; prompt->reject();
+                                }
+                            });
+                            approvalWatchdog.start(200);
+                            removeManaged->click();
+                            approvalWatchdog.stop();
+                            if (removalPromptOpened || !QFileInfo::exists(managedPath) ||
+                                !managerStatus->text().contains("selected in Settings"))
+                                settingsError = "Unsaved Settings selection did not protect its GE build";
+                        }
                         QTimer::singleShot(0, &window, [&] {
                             auto geDialog = window.findChild<QDialog *>("geInstallerDialog");
                             if (!geDialog) settingsError = "Proton Manager did not open the GE installer";
