@@ -1,7 +1,6 @@
 #include "window.h"
 #include "app_settings.h"
 #include "provisioning.h"
-#include "profiles.h"
 #include "recipes.h"
 #include "runner_manager.h"
 #include "setup.h"
@@ -17,7 +16,6 @@
 #include "lan_sync.h"
 #include "lan_games.h"
 #include "lan_discovery.h"
-#include "sync_queue.h"
 #include "runtime_migration.h"
 #include "pairing.h"
 #include <QtCore/qcoreapplication.h>
@@ -598,10 +596,6 @@ void Window::openRoot(const QString &root, bool allowCreation) {
     if (!saveRecovery.isEmpty()) message(saveRecovery.join("\n"));
     QTimer::singleShot(0, this, [this] { scan(); });
 }
-void Window::syncPendingPeers() {
-    // Retained as a harmless legacy entry point. Old queue records stay on disk
-    // for migration/recovery reference checks and are never sent automatically.
-}
 void Window::chooseRoot() {
     if (!pendingLaunch_.isEmpty()) { message("Wait until this launch finishes before switching libraries."); return; }
     const auto path = QFileDialog::getExistingDirectory(this, "Choose your main Games folder", library_ ? library_->root() : QDir::homePath());
@@ -733,10 +727,11 @@ void Window::addGame() {
     installerLanguage->addItem("System default", QString()); installerLanguage->addItem("Japanese text (legacy installer)", "ja_JP.UTF-8");
     installerLanguage->setToolTip("Use Japanese locale for old non-Unicode installers. This locale also stays selected for the installed game; change it later in Manage → Runtime.");
     form->addRow("Installer text", installerLanguage);
-    auto getGe = new QPushButton("Get GE-Proton…", &dialog); form->addRow(getGe);
-    connect(getGe, &QPushButton::clicked, &dialog, [&, runner] {
-        const auto installed = provisionGe(&dialog, library_->root());
-        if (!installed.isEmpty()) { runner->addItem(installed); runner->setCurrentText(installed); }
+    auto manageGe = new QPushButton("Open Proton Manager in Settings…", &dialog); form->addRow(manageGe);
+    connect(manageGe, &QPushButton::clicked, &dialog, [&, runner] {
+        settings();
+        for (const auto &path : installedRunners(library_->root()))
+            if (runner->findText(path) < 0) runner->addItem(path);
     });
     auto destination = new QLabel(&dialog); destination->setObjectName("installerDestination"); destination->setTextFormat(Qt::PlainText);
     destination->setWordWrap(true); destination->setTextInteractionFlags(Qt::TextSelectableByMouse); form->addRow(destination);
@@ -1777,9 +1772,7 @@ void Window::manage() {
     auto overviewExecutable = overviewRow("Executable", g.executable);
     auto overviewCwd = overviewRow("Working directory", g.workingDirectory);
     overviewRow("Backend", g.backend == "steam" ? "Steam shortcut" : g.backend == "native" ? "Native Linux" : "umu / Proton");
-    const auto savedProfile = findSetupProfile(g.setupProfile);
-    overviewRow("Setup profile", g.backend == "native" ? "Not needed" : g.backend == "steam" ? "Managed by Steam" :
-        (savedProfile ? savedProfile->title : "Unavailable: " + g.setupProfile));
+    overviewRow("Preset", g.recipeId.isEmpty() ? "Legacy/manual" : g.recipeId);
     overviewRow("Proton directory", g.backend == "native" ? "Not needed" : g.backend == "steam" ? "Managed by Steam" : g.runner);
     overviewRow("Prefix", g.backend == "native" ? "Not needed" : g.backend == "steam" ? "Managed by Steam" : library_->prefix(g.id));
     overviewRow("Accepted runner", g.runnerRevision); overviewRow("Locale", g.locale.isEmpty() ? "System default" : g.locale);
@@ -1932,15 +1925,6 @@ void Window::manage() {
     tabs->addTab(launchTab, "Launch");
     auto runtimeScroll = new QScrollArea(&d); runtimeScroll->setWidgetResizable(true); runtimeScroll->setFrameShape(QFrame::NoFrame);
     auto runtimeTab = new QWidget(runtimeScroll); auto runtimeForm = new QFormLayout(runtimeTab);
-    auto profile = new QComboBox(&d); profile->setObjectName("setupProfile");
-    for (const auto &entry : setupProfiles()) profile->addItem(entry.title, entry.id);
-    if (profile->findData(g.setupProfile) < 0) profile->addItem("Unavailable: " + g.setupProfile, g.setupProfile);
-    profile->setCurrentIndex(profile->findData(g.setupProfile));
-    auto profileNote = new QLabel(&d); profileNote->setObjectName("setupProfileNote");
-    profileNote->setWordWrap(true); profileNote->setTextFormat(Qt::PlainText);
-    auto resetProfile = new QPushButton("Use detected default", &d); resetProfile->setObjectName("resetSetupProfile");
-    resetProfile->setToolTip("Change only the setup profile. Save to apply; other settings and existing prefix files are kept.");
-    runtimeForm->addRow("Setup profile", profile); runtimeForm->addRow(profileNote); runtimeForm->addRow(resetProfile);
     auto recipeChoice = new QComboBox(&d); recipeChoice->setObjectName("matchingRecipes");
     auto applyMatchedRecipe = new QPushButton("Preview and apply preset…", &d); applyMatchedRecipe->setObjectName("applyMatchedRecipe");
     auto recipeState = new QLabel("Current: " + (g.recipeId.isEmpty() ? "Legacy/manual" : g.recipeId) +
@@ -2003,22 +1987,6 @@ void Window::manage() {
             QMessageBox::information(&d, "Preset exported", "Saved a manual game preset for review.\n" + omissions.join("\n"));
         } catch (const std::exception &e) { QMessageBox::warning(&d, "Cannot export preset", QString::fromUtf8(e.what())); }
     });
-    auto updateProfile = [=] {
-        const bool umu = backend->currentData() == "umu";
-        profile->setEnabled(umu); resetProfile->setEnabled(umu);
-        const auto selected = findSetupProfile(profile->currentData().toString());
-        profileNote->setText(!umu ? backend->currentData() == "native" ? "Native Linux games do not use Proton setup." :
-            "Steam manages this shortcut's setup." : selected ? selected->description :
-            "This profile version is unavailable. Choose a supported profile before launching.");
-    };
-    connect(profile, &QComboBox::currentIndexChanged, &d, updateProfile);
-    connect(backend, &QComboBox::currentIndexChanged, &d, updateProfile); updateProfile();
-    connect(resetProfile, &QPushButton::clicked, &d, [&, profile] {
-        auto suggested = recommendSetupProfile(g.engine).profileId; // Legacy installations keep their old baseline.
-        for (const auto &recipe : loadRecipes(library_->root())) if (recipe.id == g.recipeId)
-            suggested = recipe.settings["setup_profile"].toString("generic-proton-v1");
-        profile->setCurrentIndex(profile->findData(suggested));
-    });
     auto runner = runnerBox(&d, g.runner, library_->root()); auto locale = new QComboBox(&d); locale->setEditable(true);
     locale->addItems({"", "ja_JP.UTF-8", "en_US.UTF-8"}); locale->setCurrentText(g.locale);
     auto requestedWinetricks = new QLineEdit(g.winetricks.join(", "), &d);
@@ -2033,13 +2001,6 @@ void Window::manage() {
                 "Native Linux game: no Proton runner or Wine prefix is used." :
                 "Steam manages this shortcut's runner and prefix."); return;
         }
-        const auto selected = findSetupProfile(profile->currentData().toString());
-        auto recommendation = recommendSetupProfile(g.engine);
-        for (const auto &recipe : loadRecipes(library_->root())) if (recipe.id == g.recipeId)
-            recommendation = {recipe.settings["setup_profile"].toString("generic-proton-v1"), "recipe " + recipe.name};
-        const auto profileName = selected ? selected->title : "Unavailable profile";
-        const auto profileSource = profile->currentData().toString() == recommendation.profileId ?
-            recommendation.source : "selected for this game";
         QString runnerSource, runnerValue = runner->currentText().trimmed();
         if (!runnerValue.isEmpty()) runnerSource = "Per-game Proton";
         else {
@@ -2048,12 +2009,13 @@ void Window::manage() {
                 runnerSource = "Library default Proton"; runnerValue = libraryRunner;
             } else {
                 const auto pin = readJson(library_->dataRoot() + "/ge-proton.json")["version"].toString();
-                runnerValue = pin.isEmpty() ? preferredProtonVersion(profile->currentData().toString()) : pin;
-                runnerSource = pin.isEmpty() ? "Profile Proton default" : "Library GE pin";
+                runnerValue = pin;
+                runnerSource = pin.isEmpty() ? "Proton" : "Library GE pin";
             }
         }
         if (runnerValue.isEmpty()) { runnerSource = "Proton"; runnerValue = "choose at first Play"; }
-        effective->setText("Setup: " + profileName + " (" + profileSource + ")\n" + runnerSource + ": " + runnerValue +
+        effective->setText("Saved preset: " + (g.recipeId.isEmpty() ? "Legacy/manual" : g.recipeId) +
+                           "\n" + runnerSource + ": " + runnerValue +
                            "\nLocale: " + (locale->currentText().isEmpty() ? "inherit system" : locale->currentText()) +
                            "\nArguments and environment overrides are editable in Launch and Advanced.");
     };
@@ -2063,7 +2025,6 @@ void Window::manage() {
     runtimeForm->addRow("Proton directory", runner); runtimeForm->addRow("Windows language / locale (blank = inherit)", locale);
     runtimeForm->addRow("Winetricks components", requestedWinetricks);
     runtimeForm->addRow("Effective setup", effective);
-    connect(profile, &QComboBox::currentIndexChanged, &d, updateEffective);
     connect(runner, &QComboBox::currentTextChanged, &d, updateEffective);
     connect(locale, &QComboBox::currentTextChanged, &d, updateEffective);
     connect(backend, &QComboBox::currentIndexChanged, &d, updateEffective);
@@ -2442,7 +2403,6 @@ void Window::manage() {
         try {
             g.name = name->text().trimmed(); g.executable = exe->text(); g.workingDirectory = cwd->text();
             g.runner = runner->currentText(); g.locale = locale->currentText(); g.backend = backend->currentData().toString(); g.steamId = steamId->text().trimmed();
-            g.setupProfile = profile->currentData().toString();
             g.winetricks.clear();
             for (const auto &entry : requestedWinetricks->text().split(',', Qt::SkipEmptyParts)) {
                 const auto verb = entry.trimmed();
@@ -2606,9 +2566,6 @@ void Window::runExecutable(QDialog *manageDialog) {
 }
 bool Window::prepareLaunchRuntime(Game &g) {
     if (g.backend != "umu") return true;
-    if (!findSetupProfile(g.setupProfile)) {
-        message("Choose a supported setup profile in Manage → Runtime before playing."); return false;
-    }
     const auto originalRunner = g.runner;
     const auto originalUmu = g.umuResolved;
     if (!g.umuLauncher.isEmpty() && g.umuResolved.isEmpty())
@@ -2630,9 +2587,8 @@ bool Window::prepareLaunchRuntime(Game &g) {
             g.runner = chosen;
         } else {
         const auto preferred = library_->settings()["runner"].toString();
-        const auto profileVersion = preferredProtonVersion(g.setupProfile);
         const auto pin = readJson(library_->dataRoot() + "/ge-proton.json")["version"].toString();
-        const auto version = pin.isEmpty() ? profileVersion : pin;
+        const auto version = pin;
         const auto available = installedRunners(library_->root());
         chosen = !preferred.isEmpty() && QFileInfo(QDir(preferred).filePath("proton")).isFile() ? preferred : QString();
         if (chosen.isEmpty() && !version.isEmpty()) {

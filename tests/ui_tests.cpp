@@ -315,7 +315,7 @@ int main(int argc, char **argv) {
             if (!paths.open(QIODevice::ReadOnly) || paths.readAll() != (external + "/game.exe\n" + external + "\n").toUtf8()) throw std::runtime_error("Relinked launch used incorrect executable or working directory");
         }
         {
-            const auto profileRoot = t.path() + "/Profile UI"; file(profileRoot + "/RenPy/game.exe");
+            const auto profileRoot = t.path() + "/Runtime UI"; file(profileRoot + "/RenPy/game.exe");
             Library profiles(profileRoot); profiles.import(discover(profileRoot), t.path() + "/runner");
             profiles.setSettings({{"umu", fake}});
             auto g = profiles.games().first(); g.engine = "Ren'Py"; g.locale = "ja_JP.UTF-8";
@@ -327,18 +327,19 @@ int main(int argc, char **argv) {
                 QString error;
                 QTimer::singleShot(0, &window, [&] {
                     auto dialog = window.findChild<QDialog *>("manageDialog");
-                    auto choice = window.findChild<QComboBox *>("setupProfile");
-                    auto reset = window.findChild<QPushButton *>("resetSetupProfile");
+                    auto components = window.findChild<QLineEdit *>("requestedWinetricks");
                     auto tabs = window.findChild<QTabWidget *>("manageTabs");
-                    if (!dialog || !choice || !reset || !tabs) {
-                        error = "Profile controls missing"; if (dialog) dialog->reject(); return;
+                    if (!dialog || !components || !tabs || window.findChild<QComboBox *>("setupProfile") ||
+                        window.findChild<QPushButton *>("resetSetupProfile")) {
+                        error = "Runtime controls are missing or obsolete profile controls remain";
+                        if (dialog) dialog->reject(); return;
                     }
                     tabs->setCurrentIndex(3);
                     if (pass == 0) {
                         auto debug = window.findChild<QPushButton *>("debugLaunchButton");
                         auto exportButton = window.findChild<QPushButton *>("exportDiagnosticButton");
                         if (!debug || !debug->isEnabled() || !exportButton) error = "Diagnostic actions missing";
-                        const auto reportPath = t.path() + "/profile-diagnostic.json";
+                        const auto reportPath = t.path() + "/runtime-diagnostic.json";
                         QTimer::singleShot(0, &window, [&] {
                             auto picker = window.findChild<QFileDialog *>();
                             if (!picker) { error = "Diagnostic save dialog missing"; return; }
@@ -348,8 +349,7 @@ int main(int argc, char **argv) {
                         const auto report = readJson(reportPath);
                         if (report["game"].toObject()["id"] != g.id) error = "Diagnostic export did not save the selected game";
                     }
-                    if (pass < 2) reset->click(); else choice->setCurrentIndex(choice->findData("generic-proton-v1"));
-                    if (choice->currentData() != (pass < 2 ? "generic-game-v1" : "generic-proton-v1")) error = "Profile selection did not apply";
+                    components->setText(pass < 2 ? "quartz" : "");
                     const auto preview = qEnvironmentVariable("NOVELTY_UI_PREVIEW_DIR");
                     if (pass == 1 && !preview.isEmpty()) dialog->grab().save(preview + "/manage-runtime.png");
                     if (pass == 0) dialog->reject();
@@ -357,21 +357,17 @@ int main(int argc, char **argv) {
                 });
                 window.manage(); if (!error.isEmpty()) throw std::runtime_error(error.toStdString());
                 auto expected = original;
-                if (pass == 1) expected["setup_profile"] = "generic-game-v1";
-                if (pass == 2) {
-                    expected["setup_profile"] = "generic-proton-v1";
+                if (pass == 1) {
+                    expected["winetricks"] = QJsonArray{"quartz"};
                     auto overrides = expected["recipe_overrides"].toObject();
-                    overrides["setup_profile"] = "generic-proton-v1";
+                    overrides["winetricks"] = QJsonArray{"quartz"};
                     expected["recipe_overrides"] = overrides;
                 }
-                if (profiles.game(g.id).json() != expected) throw std::runtime_error(("Profile cancel/save changed unrelated settings or failed to persist (pass " +
+                if (profiles.game(g.id).json() != expected) throw std::runtime_error(("Runtime cancel/save changed unrelated settings or failed to persist (pass " +
                     QString::number(pass) + "): actual=" + QString::fromUtf8(QJsonDocument(profiles.game(g.id).json()).toJson(QJsonDocument::Compact)) +
                     " expected=" + QString::fromUtf8(QJsonDocument(expected).toJson(QJsonDocument::Compact))).toStdString());
             }
-            auto afterProfileChoice = original; afterProfileChoice["setup_profile"] = "generic-proton-v1";
-            auto profileOverrides = afterProfileChoice["recipe_overrides"].toObject();
-            profileOverrides["setup_profile"] = "generic-proton-v1";
-            afterProfileChoice["recipe_overrides"] = profileOverrides;
+            const auto afterRuntimeChoice = original;
             QString toolError;
             QTimer::singleShot(0, &window, [&] {
                 auto action = window.findChild<QPushButton *>("winecfgButton");
@@ -394,9 +390,9 @@ int main(int argc, char **argv) {
             if (!paths.open(QIODevice::ReadOnly) || paths.readAll() !=
                 (profiles.prefix(g.id) + "/drive_c/windows/system32/winecfg.exe\n" + g.workingDirectory + "\n").toUtf8())
                 throw std::runtime_error("Prefix tool launched the game or used the wrong prefix");
-            if (profiles.game(g.id).json() != afterProfileChoice) throw std::runtime_error("Tool action changed saved game settings");
+            if (profiles.game(g.id).json() != afterRuntimeChoice) throw std::runtime_error("Tool action changed saved game settings");
             QFile saved(profiles.prefix(g.id) + "/save.dat");
-            if (!saved.open(QIODevice::ReadOnly) || saved.readAll() != "keep save") throw std::runtime_error("Profile selection changed existing saves");
+            if (!saved.open(QIODevice::ReadOnly) || saved.readAll() != "keep save") throw std::runtime_error("Runtime selection changed existing saves");
             {
                 Window debugWindow(profileRoot, launcher); debugWindow.show(); QCoreApplication::processEvents();
                 QFile::remove(profiles.prefix(g.id) + "/started"); QFile::remove(profiles.prefix(g.id) + "/survived");
@@ -411,7 +407,7 @@ int main(int argc, char **argv) {
                 QFile debugLog(profiles.gamePath(g.id, "launch.log"));
                 if (!debugLog.open(QIODevice::ReadOnly) || !debugLog.readAll().contains("One-launch Wine debug")) throw std::runtime_error("Debug UI did not mark launch log");
             }
-            if (profiles.game(g.id).json() != afterProfileChoice) throw std::runtime_error("Debug action changed saved settings");
+            if (profiles.game(g.id).json() != afterRuntimeChoice) throw std::runtime_error("Debug action changed saved settings");
         }
         {
             const auto extraRoot = t.path() + "/Extra UI", patch = t.path() + "/Patches 日本語/patch.exe";
@@ -885,6 +881,6 @@ print(target)
             if (offline.findChild<QLabel *>("gameOriginalTitle")->text() != "原題" || fixture.requests != 5)
                 throw std::runtime_error("Automatically linked metadata was not available offline");
         }
-        std::puts("PASS: grid/list actions, profiles, runtime installers, metadata, Overview, Settings, removal recovery, search, launch survival, discovery, relink and reconnection"); return 0;
+        std::puts("PASS: grid/list actions, recipes, runtime installers, metadata, Overview, Settings, removal recovery, search, launch survival, discovery, relink and reconnection"); return 0;
     } catch (const std::exception &e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }

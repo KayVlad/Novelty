@@ -1,5 +1,4 @@
 #include "setup.h"
-#include "profiles.h"
 #include <QtCore/qdatetime.h>
 #include <QtCore/qcryptographichash.h>
 #include <QtCore/qfileinfo.h>
@@ -12,13 +11,17 @@ namespace novelty {
 namespace {
 QString now() { return QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs); }
 QJsonObject inputs(const Game &g) {
-    const auto &profile = resolveSetupProfile(g);
-    if (profile.preparation != "generic-proton-v1")
-        throw std::runtime_error("This setup profile requires an unsupported preparation method.");
-    return {{"preset", profile.preparation}, {"runner", canonicalPath(g.runner)},
+    return {{"runner", canonicalPath(g.runner)},
             {"runner_version", runnerVersion(g.runner)}, {"locale", g.locale},
             {"environment", g.json()["environment"]}, {"umu_launcher", g.umuResolved},
             {"umu_game_id", g.umuGameId}, {"store", g.store}};
+}
+bool compatibleInputs(QJsonObject saved, const QJsonObject &current) {
+    // Older receipts recorded the compiled generic setup profile. Its preparation
+    // was identical, so keep those successful prefixes valid without retaining
+    // the profile as an active setting.
+    if (saved.contains("preset") && saved.take("preset") != "generic-proton-v1") return false;
+    return saved == current;
 }
 QStringList appliedWinetricks(const Library &lib, const Game &g) {
     const auto receipt = readJson(lib.gamePath(g.id, "recipe.lock.json"));
@@ -65,7 +68,7 @@ bool setupComplete(const Library &lib, const Game &g) {
         const auto recipe = readJson(lib.gamePath(g.id, "recipe.lock.json"));
         return state["schema"].toInt() == 1 && state["state"] == "complete" &&
             !state["attempt"].toString().isEmpty() && state["attempt"] == recipe["attempt"] &&
-            recipe["schema"].toInt() == 2 && recipe["inputs"].toObject() == inputs(g) &&
+            recipe["schema"].toInt() == 2 && compatibleInputs(recipe["inputs"].toObject(), inputs(g)) &&
             recipe["prefix_identity"].toString() == folderIdentity(lib.prefix(g.id)) &&
             QFileInfo(lib.prefix(g.id) + "/system.reg").isFile();
     } catch (const std::exception &) {
@@ -91,7 +94,7 @@ void preparePrefix(const Library &lib, const Game &g, const std::function<int()>
         auto previous = readJson(lib.gamePath(g.id, "recipe.lock.json"));
         QJsonObject receipt{{"schema", 2}, {"attempt", state["attempt"]},
                   {"inputs", expectedInputs}, {"prefix_identity", folderIdentity(lib.prefix(g.id))},
-                  {"prepared_at", now()}, {"profile", g.setupProfile}, {"configuration", g.json()},
+                  {"prepared_at", now()}, {"configuration", g.json()},
                   {"winetricks_requested", QJsonArray::fromStringList(g.winetricks)}};
         if (previous["schema"].toInt() == 2 && previous["prefix_identity"] == receipt["prefix_identity"] &&
             previous["winetricks_applied"].isArray())

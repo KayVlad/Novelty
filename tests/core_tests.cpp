@@ -1,13 +1,11 @@
 #include "core.h"
 #include "setup.h"
-#include "profiles.h"
 #include "recipes.h"
 #include "saves.h"
 #include "steam_shortcut.h"
 #include "devices.h"
 #include "pairing.h"
 #include "peer_tls.h"
-#include "sync_queue.h"
 #include "lan_games.h"
 #include "runtime_migration.h"
 #include <QtCore/qcoreapplication.h>
@@ -116,21 +114,6 @@ void testLanGameManifest() {
             appliedSaveSnapshotId(transfer, transferGame.id) == transferHead,
             "an empty save folder does not publish an empty transfer snapshot or erase history");
 }
-void testSetupRecipePrecedence() {
-    const QList<SetupRule> rules{{{}, {}, "Ren'Py", "generic-proton-v1"},
-                                 {"fixture:story", "build-1", {}, "renpy-bundled-v1"}};
-    const auto exact = recommendSetupProfile("Ren'Py", "fixture:story", "build-1", rules);
-    require(exact.profileId == "renpy-bundled-v1" && exact.source.contains("game"),
-            "exact game and release recipe precedes engine recipe");
-    const auto engine = recommendSetupProfile("Ren'Py", "fixture:story", "build-2", rules);
-    require(engine.profileId == "generic-proton-v1" && engine.source.contains("engine"),
-            "different release falls back to verified engine recipe");
-    require(recommendSetupProfile("Generic").profileId == "generic-game-v1" &&
-            recommendSetupProfile("Ren'Py").profileId == "generic-game-v1",
-            "unverified engines do not select a compiled recipe");
-    rejects([&] { recommendSetupProfile("Ren'Py", {}, {}, {{"fixture:story", {}, {}, "renpy-bundled-v1"}}); },
-            "incomplete game recipe is rejected");
-}
 void testEditableRecipes(const QString &base) {
     const auto root = base + "/recipe-library";
     const auto game = root + "/Yosuga no Sora";
@@ -139,8 +122,8 @@ void testEditableRecipes(const QString &base) {
     QDir().mkpath(game + "/Folder/game");
     Library library(root);
     const QStringList executables{game + "/Folder/Story.exe"};
-    auto selected = selectRecipe(root, game, executables, "generic-vn-v1");
-    require(!selected.ambiguous() && selected.selected().id == "renpy-bundled-v1",
+    auto selected = selectRecipe(root, game, executables, "general-vn");
+    require(!selected.ambiguous() && selected.selected().id == "renpy",
             "nested Ren'Py structure matches an engine recipe");
     touch(game + "/Folder/game/saves/slot.sav", "progress");
     library.import({inspect(game, root)}, {});
@@ -160,22 +143,22 @@ void testEditableRecipes(const QString &base) {
         QJsonObject{{"file", "marker.txt"}}};
     touch(game + "/Folder/assets.dat", "archive");
     saveRecipe(root, "games", specific("story", exact));
-    selected = selectRecipe(root, game, executables, "generic-vn-v1");
-    require(selected.selected().id == "renpy-bundled-v1", "every game recipe condition is required");
+    selected = selectRecipe(root, game, executables, "general-vn");
+    require(selected.selected().id == "renpy", "every game recipe condition is required");
     touch(game + "/marker.txt");
-    selected = selectRecipe(root, game, executables, "generic-vn-v1");
+    selected = selectRecipe(root, game, executables, "general-vn");
     require(!selected.ambiguous() && selected.selected().id == "story", "specific game recipe precedes engine");
     Game configured; configured.folder = game;
     applyRecipeToGame(configured, selected.selected());
     require(configured.executable == game + "/Folder/Story.exe" && configured.runnerSelector == "proton-experimental" &&
             configured.recipeSaves.size() == 1, "recipe settings use paths relative to the top-level game folder");
     saveRecipe(root, "games", specific("story-alternative", exact));
-    selected = selectRecipe(root, game, executables, "generic-vn-v1");
+    selected = selectRecipe(root, game, executables, "general-vn");
     require(selected.ambiguous() && selected.matches.size() == 2, "equal-tier complete matches require a choice");
     QFile::remove(game + "/marker.txt");
     QFile::remove(game + "/Folder/renpy/__init__.py");
-    selected = selectRecipe(root, game, executables, "generic-vn-v1");
-    require(selected.selected().id == "generic-vn-v1", "selected default is the final fallback");
+    selected = selectRecipe(root, game, executables, "general-vn");
+    require(selected.selected().id == "general-vn", "selected default is the final fallback");
     rejects([&] { saveRecipe(root, "games", specific("bad", QJsonArray{QJsonObject{{"file", "../escape"}}})); },
             "recipe paths cannot escape the game folder");
 }
@@ -433,7 +416,7 @@ void testNestedGameDiscovery(const QString &base) {
     require(library.import(found, {}) == 1, "nested game imports once");
     const auto game = library.games().first();
     require(game.folder == title && game.name == "Title" && game.executable == executable &&
-            game.workingDirectory == QFileInfo(executable).absolutePath() && game.engine == "Ren'Py" &&
+            game.workingDirectory == QFileInfo(executable).absolutePath() && game.engine == "renpy" &&
             library.import(discover(root), {}) == 0,
             "nested game keeps the top-level folder and correct launch directory without duplicates");
 }
@@ -540,38 +523,6 @@ void testPairingProtocol() {
     rejects([&] { takeControlFrame(buffer, payload); }, "unknown frame version rejected");
     buffer = QByteArray(2 * (7 + maxControlPayload) + 1, 'x');
     rejects([&] { takeControlFrame(buffer, payload); }, "excess buffered input rejected");
-}
-void testSyncQueue(const QString &base) {
-    const auto root = base + "/Pending sync", peerRoot = base + "/Pending sync peer";
-    touch(root + "/Game/game.exe"); touch(peerRoot + "/Peer/game.exe");
-    Library lib(root), peer(peerRoot);
-    lib.import({inspect(root + "/Game")}, {});
-    const auto game = lib.games().first();
-    auto config = loadSaveConfig(lib, game.id);
-    config.mappings = {{"game", "saves"}};
-    saveSaveConfig(lib, game.id, config);
-    touch(game.folder + "/saves/slot.sav", "first");
-    const auto first = createSaveSnapshot(lib, game.id);
-    const auto fingerprint = ensureDeviceIdentity(peer).fingerprint;
-    approvePairedPeer(lib, fingerprint, "Peer");
-    queuePeerSync(lib, game.id, first.id);
-    queuePeerSync(lib, game.id, first.id);
-    require(pendingPeerSync(lib).size() == 1 && pendingPeerSync(lib).first().snapshotId == first.id,
-            "repeat pending save work stays durable and idempotent");
-    touch(game.folder + "/saves/slot.sav", "second");
-    const auto second = createSaveSnapshot(lib, game.id);
-    require(pendingPeerSync(lib).size() == 1 && pendingPeerSync(lib).first().snapshotId == first.id,
-            "new local captures do not schedule automatic peer transfers");
-    queuePeerSync(lib, game.id, second.id);
-    acknowledgePeerSync(lib, fingerprint, game.id, first.id);
-    require(pendingPeerSync(lib).size() == 1 && pendingPeerSync(lib).first().snapshotId == second.id,
-            "late acknowledgement cannot clear newer pending progress");
-    acknowledgePeerSync(lib, fingerprint, game.id, second.id);
-    require(pendingPeerSync(lib).isEmpty(), "matching acknowledgement clears pending progress");
-    rejects([&] { queuePeerSync(lib, game.id, QUuid::createUuid().toString(QUuid::WithoutBraces)); },
-            "missing snapshot cannot be queued for a peer");
-    touch(lib.dataRoot() + "/sync/queue.json", "damaged");
-    rejects([&] { pendingPeerSync(lib); }, "damaged pending peer work fails closed");
 }
 void testSaveSnapshots(const QString &base) {
     const auto root = base + "/Save snapshots";
@@ -1166,7 +1117,7 @@ exit 0
     require(supervise(lib, g.id, false, {}, {}, true) == 0, "supervised installer completes");
     const auto installed = lib.game(g.id);
     require(!installed.installPending && installed.installer.isEmpty() && installed.id == g.id && installed.executable == g.folder + "/Novel/Story.exe", "detection selects installed game retaining ID");
-    require(installed.engine == "Ren'Py" && installed.setupProfile == "renpy-bundled-v1", "nested installed engine selects profile");
+    require(installed.engine == "renpy" && installed.recipeId == "renpy", "nested installed engine selects recipe");
     require(canonicalPath(lib.prefix(g.id) + "/dosdevices/n:") == g.folder && setupComplete(lib, installed), "mapped destination and prepared prefix retained");
     QFile invocations(lib.prefix(g.id) + "/installer-invocations");
     require(invocations.open(QIODevice::ReadOnly) && invocations.readAll() == (source + '\n' + QFileInfo(source).absolutePath() + '\n').toUtf8(), "installer keeps external media working directory");
@@ -1447,24 +1398,25 @@ exit 0
     require(supervise(lib, id, false) == 0 && attempts() == 1, "legacy prefix gets preparation before launch");
     require(setupComplete(lib, g) && lib.status(g) == "Ready", "explicit setup completion is ready"); savesKept();
     auto recipe = readJson(recipePath);
-    auto legacy = g.json(); legacy.remove("setup_profile"); legacy["engine"] = "Ren'Py";
+    auto legacy = g.json(); legacy["setup_profile"] = "future-v99";
+    auto oldBase = legacy["recipe_base"].toObject(); oldBase["setup_profile"] = "generic-game-v1";
+    legacy["recipe_base"] = oldBase;
+    auto oldOverrides = legacy["recipe_overrides"].toObject(); oldOverrides["setup_profile"] = "future-v99";
+    legacy["recipe_overrides"] = oldOverrides;
     const auto oldGame = Game::fromJson(legacy);
-    require(oldGame.setupProfile == "generic-proton-v1" && setupComplete(lib, oldGame), "legacy RenPy records retain valid generic preparation");
-    g.setupProfile = "renpy-bundled-v1"; lib.save(g);
-    require(lib.game(id).setupProfile == g.setupProfile, "profile pin persists");
-    require(supervise(lib, id, false) == 0 && attempts() == 1 && readJson(recipePath) == recipe,
-        "equivalent profile switch preserves preparation and does not rerun setup");
-    g.setupProfile = "generic-proton-v1"; lib.save(g);
-    auto unsupported = g; unsupported.setupProfile = "future-v99";
-    require(!setupComplete(lib, unsupported), "unknown profile cannot reuse a receipt");
-    rejects([&] { launchCommand(lib, unsupported); }, "unknown profile cannot launch");
-    rejects([&] { lib.save(unsupported); }, "unknown profile cannot be silently saved as generic");
-    bool invoked = false; const auto priorState = readJson(statePath);
-    rejects([&] { preparePrefix(lib, unsupported, [&] { invoked = true; return 0; }); }, "unknown preparation rejected");
-    require(!invoked && readJson(statePath) == priorState && attempts() == 1, "unknown profile leaves receipt and backend untouched");
-    require(Game::fromJson(unsupported.json()).setupProfile == "future-v99", "unknown saved profile remains visible for repair");
-    legacy["setup_profile"] = QJsonValue::Null;
-    require(!findSetupProfile(Game::fromJson(legacy).setupProfile), "malformed profile is not silently converted to default");
+    require(!oldGame.json().contains("setup_profile") && !oldGame.recipeBase.contains("setup_profile") &&
+            !oldGame.recipeOverrides.contains("setup_profile") && setupComplete(lib, oldGame),
+            "legacy profile fields are ignored without invalidating a prepared prefix");
+    auto oldReceipt = recipe;
+    auto oldInputs = oldReceipt["inputs"].toObject(); oldInputs["preset"] = "generic-proton-v1";
+    oldReceipt["inputs"] = oldInputs; oldReceipt["profile"] = "renpy-bundled-v1";
+    writeJson(recipePath, oldReceipt);
+    require(setupComplete(lib, g) && supervise(lib, id, false) == 0 && attempts() == 1,
+            "a valid old receipt preserves preparation without rerunning setup");
+    recipe = readJson(recipePath);
+    lib.save(oldGame);
+    require(!lib.game(id).json().contains("setup_profile") && setupComplete(lib, lib.game(id)),
+            "saving a legacy game removes obsolete profile settings");
     savesKept();
     g.name = "Changed title"; g.arguments = {"new argument"}; lib.save(g);
     require(supervise(lib, id, false) == 0 && attempts() == 1, "ordinary launch edits do not repeat setup");
@@ -1556,13 +1508,13 @@ touch "$WINEPREFIX/played"; exit 0
     writeJson(lib.gamePath(id, "recipe.lock.json"), legacyReceipt);
     require(setupComplete(lib, g) && pendingWinetricks(lib, g).isEmpty(),
             "existing schema 2 receipts without component fields remain valid");
-    lib.setSettings({{"umu", fake}, {"default_recipe", "generic-vn-v1"}});
-    lib.applyRecipe(id, "generic-vn-v1"); g = lib.game(id); g.runner = runner; lib.save(g); g = lib.game(id);
+    lib.setSettings({{"umu", fake}, {"default_recipe", "general-vn"}});
+    lib.applyRecipe(id, "general-vn"); g = lib.game(id); g.runner = runner; lib.save(g); g = lib.game(id);
     require(g.winetricks.isEmpty() && supervise(lib, id, true) == 0 &&
             !QFileInfo::exists(prefix + "/winetricks-calls"), "clean General VN Prepare has no component install");
     touch(prefix + "/save.dat", "keep save");
     const auto parent = QJsonObject{{"schema", 1}, {"id", "media-base"}, {"name", "Media base"},
-        {"inherits", "generic-game-v1"}, {"match", QJsonObject{}},
+        {"inherits", "general-game"}, {"match", QJsonObject{}},
         {"settings", QJsonObject{{"winetricks", QJsonArray{"quartz", "wmp11", "quartz"}},
             {"environment", QJsonObject{{"TZ", "Asia/Tokyo"}}}}}};
     saveRecipe(root, "default", QJsonDocument(parent).toJson());
@@ -1903,14 +1855,9 @@ int main(int argc, char **argv) {
         touch(folder + "/renpy/__init__.py"); touch(folder + "/lib/python.exe");
         touch(root + "/.novelty/ignore/secret.exe");
         auto found = discover(root);
-        for (const auto &engine : {"Generic", "Unknown"})
-            require(defaultSetupProfile(engine) == "generic-game-v1", "unidentified games use the general-game fallback");
-        for (const auto &engine : {"Kirikiri candidate", "Siglus candidate"})
-            require(defaultSetupProfile(engine) == "generic-game-v1", "unverified engines use the general fallback");
-        require(preferredProtonVersion("generic-proton-v1").isEmpty() &&
-                preferredProtonVersion("generic-game-v1").isEmpty() &&
-                preferredProtonVersion("renpy-bundled-v1").isEmpty(),
-                "setup profiles do not pin a runner version");
+        ensureRecipeCatalog(root);
+        for (const auto &recipe : loadRecipes(root))
+            require(!recipe.settings.contains("setup_profile"), "new recipes do not use compiled setup profiles");
         require(found.size() == 1, "ignore managed folder");
         require(found[0].engine == "Ren'Py", "RPA must not be misidentified as XP3");
         require(found[0].executables == QStringList{folder + "/Tenpure.exe"}, "exclude helpers/uninstallers");
@@ -1956,9 +1903,9 @@ int main(int argc, char **argv) {
             Game g; for (auto item : list) if (item.name == "Template!!") g = item;
             id = g.id;
             require(!id.isEmpty(), "stable ID");
-            require(g.setupProfile == "renpy-bundled-v1", "new RenPy imports pin bundled-runtime baseline");
+            require(g.recipeId == "renpy", "new RenPy imports select the engine recipe");
             g.engine = "Manually corrected label"; lib.save(g);
-            require(lib.game(id).setupProfile == "renpy-bundled-v1", "engine label edits do not silently change pinned setup");
+            require(lib.game(id).recipeId == "renpy", "engine label edits do not silently change the selected recipe");
             require(lib.status(g) == "New", "new prefix state");
             require(list[0].executable.isEmpty(), "ambiguous executable needs selection");
             g.arguments = {"argument with spaces", "$(do-not-execute)", "日本語"}; g.locale = "ja_JP.UTF-8";
@@ -2027,9 +1974,7 @@ int main(int argc, char **argv) {
         testNestedGameDiscovery(temp.path());
         testNativeGameDiscovery(temp.path());
         testPairingProtocol();
-        testSyncQueue(temp.path());
         testLanGameManifest();
-        testSetupRecipePrecedence();
         testEditableRecipes(temp.path());
         testLegacyRuntimeMigration(temp.path());
         std::printf("PASS: %d assertions\n", assertions); return 0;

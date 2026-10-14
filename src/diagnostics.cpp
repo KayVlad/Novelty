@@ -22,7 +22,7 @@ QJsonObject diagnosticReport(const Library &lib, const QString &id) {
     QJsonObject game{{"id", g.id}, {"name", g.name}, {"folder", g.folder}, {"executable", g.executable},
         {"cwd", g.workingDirectory}, {"engine", g.engine}, {"evidence", g.evidence},
         {"backend", g.backend}, {"runner", g.runner}, {"runner_revision", g.runnerRevision},
-        {"profile", g.setupProfile}, {"locale", g.locale}, {"install_pending", g.installPending},
+        {"recipe", g.recipeId}, {"locale", g.locale}, {"install_pending", g.installPending},
         {"environment_names", names}};
     const auto statePath = [&](const QString &file) { return lib.gamePath(id, file); };
     auto readLog = [&](const QString &file) {
@@ -34,7 +34,7 @@ QJsonObject diagnosticReport(const Library &lib, const QString &id) {
     const auto logText = readLog("launch.log"), previousLog = readLog("launch.log.previous");
     const auto status = safeRecord(statePath("status.json"), {"state", "message", "updated"});
     const auto setup = safeRecord(statePath("setup.json"), {"state", "step", "attempt", "started_at", "completed_at", "failed_at", "message"});
-    const auto recipe = safeRecord(statePath("recipe.lock.json"), {"schema", "attempt", "prefix_identity", "prepared_at", "profile"});
+    const auto recipe = safeRecord(statePath("recipe.lock.json"), {"schema", "attempt", "prefix_identity", "prepared_at"});
     const auto runtime = safeRecord(statePath("runtime.json"), {"schema", "boot_id", "supervisor_pid", "started_at"});
     const auto extra = safeRecord(statePath("extra-launch.json"), {"kind", "state", "attempt", "started_at", "finished_at", "exit_code", "message", "executable", "cwd"});
     QString display;

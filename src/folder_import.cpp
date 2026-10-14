@@ -1,5 +1,4 @@
 #include "core.h"
-#include "profiles.h"
 #include "recipes.h"
 #include "runtime.h"
 #include <QtCore/qdir.h>

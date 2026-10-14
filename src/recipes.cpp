@@ -147,22 +147,18 @@ void ensureRecipeCatalog(const QString &libraryRoot) {
         writeNew(runtimeMap, QJsonDocument(QJsonObject{{"1391110", "steamrt2"}, {"1628350", "steamrt3"},
             {"4183110", "steamrt4"}, {"4185400", "steamrt4-arm64"}}).toJson(QJsonDocument::Indented));
     if (QFileInfo::exists(marker)) return;
-    const QJsonObject generic{{"backend", "umu"}, {"setup_profile", "generic-game-v1"},
-        {"runner", "GE-Proton11-7"},
-        {"ignore_executables", QJsonArray{"unins*", "*uninstall*", "setup.exe", "install.exe",
-            "python*.exe", "zsync*.exe", "crashreporter.exe", "*/lib/*", "*/ost/*", "*/soundtrack/*"}}};
-    const QJsonObject vn{{"setup_profile", "generic-proton-v1"}};
-    const QJsonObject renpy{{"setup_profile", "renpy-bundled-v1"}, {"save_strategy", "renpy"}};
-    const QJsonObject native{{"backend", "native"}, {"ignore_executables", generic["ignore_executables"]}};
+    const QJsonArray ignored{"unins*", "*uninstall*", "setup.exe", "install.exe",
+        "python*.exe", "zsync*.exe", "crashreporter.exe", "*/lib/*", "*/ost/*", "*/soundtrack/*"};
+    const QJsonObject native{{"backend", "native"}, {"ignore_executables", ignored}};
     const struct { const char *tier, *id, *name; QJsonObject match, settings; const char *parent, *category; } builtins[] = {
         {"general", "general-game", "General Windows Game", {},
-            {{"backend", "umu"}, {"runner", "GE-Proton11-7"}, {"setup_profile", "generic-game-v1"}, {"locale", "system"},
-             {"environment", QJsonObject{}}, {"winetricks", QJsonArray{}}, {"save_candidates", QJsonArray{}}}, "", "game"},
-        {"general", "general-vn", "General Visual Novel", {}, {{"setup_profile", "generic-proton-v1"}}, "general-game", "visual_novel"},
-        {"general", "generic-game-v1", "Generic game (legacy)", {}, generic, "", "game"},
-        {"general", "generic-vn-v1", "Generic VN (legacy)", {}, vn, "generic-game-v1", "visual_novel"},
-        {"engines", "renpy-bundled-v1", "Ren'Py", {{"root", "executable_ancestor"},
-            {"all", QJsonArray{QJsonObject{{"file", "renpy/__init__.py"}}, QJsonObject{{"directory", "game"}}}}}, renpy, "generic-vn-v1", ""},
+            {{"backend", "umu"}, {"runner", "GE-Proton11-7"}, {"locale", "system"},
+             {"environment", QJsonObject{}}, {"winetricks", QJsonArray{}}, {"save_candidates", QJsonArray{}},
+             {"ignore_executables", ignored}}, "", "game"},
+        {"general", "general-vn", "General Visual Novel", {}, {}, "general-game", "visual_novel"},
+        {"engines", "renpy", "Ren'Py", {{"root", "executable_ancestor"},
+            {"all", QJsonArray{QJsonObject{{"file", "renpy/__init__.py"}}, QJsonObject{{"directory", "game"}}}}},
+            {{"engine", "renpy"}, {"save_strategy", "renpy"}}, "general-vn", ""},
         {"engines", "native-linux-v1", "Native Linux", {{"all", QJsonArray{QJsonObject{{"native_executable", true}}}}}, native, "", "game"}
     };
     for (const auto &entry : builtins) {
@@ -203,7 +199,12 @@ Recipe parseRecipe(const QByteArray &json, const QString &path, const QString &t
             fail("Invalid recipe evidence: " + it.key());
     if (object.contains("inherits") && (!object["inherits"].isString() || !validId(object["inherits"].toString()) ||
         object["inherits"].toString() == id)) fail("Invalid recipe parent: " + path);
-    const auto match = object["match"].toObject(), settings = object["settings"].toObject();
+    const auto match = object["match"].toObject();
+    auto settings = object["settings"].toObject();
+    if (settings.contains("setup_profile")) {
+        if (!settings["setup_profile"].isString()) fail("Invalid legacy setup profile: " + path);
+        settings.remove("setup_profile"); // Read existing recipes without carrying this obsolete setting forward.
+    }
     for (auto it = match.begin(); it != match.end(); ++it)
         if (it.key() != "root" && it.key() != "all" && it.key() != "any") fail("Unknown recipe match field: " + it.key());
     if ((match.contains("all") && !match["all"].isArray()) || (match.contains("any") && !match["any"].isArray()))
@@ -233,10 +234,10 @@ Recipe parseRecipe(const QByteArray &json, const QString &path, const QString &t
             fail("Invalid recipe match path: " + path);
     }
     const QSet<QString> allowedSettings{"engine", "executable", "working_directory", "runner", "umu_launcher", "umu_game_id",
-        "store", "backend", "setup_profile", "ignore_executables", "saves", "save_candidates", "save_strategy", "arguments", "environment", "locale", "winetricks"};
+        "store", "backend", "ignore_executables", "saves", "save_candidates", "save_strategy", "arguments", "environment", "locale", "winetricks"};
     for (auto it = settings.begin(); it != settings.end(); ++it)
         if (!allowedSettings.contains(it.key())) fail("Unknown recipe setting: " + it.key());
-    for (const auto &key : {"engine", "executable", "working_directory", "runner", "umu_launcher", "umu_game_id", "store", "backend", "setup_profile", "locale"})
+    for (const auto &key : {"engine", "executable", "working_directory", "runner", "umu_launcher", "umu_game_id", "store", "backend", "locale"})
         if (settings.contains(key) && !settings[key].isString()) fail("Invalid recipe setting: " + path);
     if (settings.contains("umu_launcher") && !settings["umu_launcher"].toString().isEmpty() &&
         !QRegularExpression("^umu-(latest|[0-9]+(?:[.][0-9]+)*)$").match(settings["umu_launcher"].toString()).hasMatch())
@@ -447,7 +448,6 @@ void applyRecipeToGame(Game &game, const Recipe &recipe) {
     game.engine = settings["engine"].toString(recipe.tier == "engines" ? recipe.name : "Generic");
     game.evidence = "Recipe: " + recipe.name;
     game.backend = settings["backend"].toString("umu");
-    game.setupProfile = settings["setup_profile"].toString("generic-proton-v1");
     game.runnerSelector = settings["runner"].toString();
     game.umuLauncher = settings["umu_launcher"].toString();
     game.umuResolved = game.umuLauncher.isEmpty() ? QString() :
@@ -478,7 +478,6 @@ void applyRecipeToGame(Game &game, const Recipe &recipe) {
 QJsonObject portableGameSettings(const Game &game, QStringList *omissions) {
     QJsonObject settings{{"backend", game.backend}, {"engine", game.engine},
                          {"locale", game.locale.isEmpty() ? "system" : game.locale},
-                         {"setup_profile", game.setupProfile},
                          {"arguments", QJsonArray::fromStringList(game.arguments)},
                          {"winetricks", QJsonArray::fromStringList(game.winetricks)},
                          {"save_candidates", game.recipeSaves}};
@@ -605,6 +604,8 @@ QJsonObject applyLibraryPreset(const QJsonObject &current, const QJsonObject &do
     return result;
 }
 void saveRecipe(const QString &libraryRoot, const QString &tier, const QByteArray &json) {
+    if (QJsonDocument::fromJson(json).object()["settings"].toObject().contains("setup_profile"))
+        fail("setup_profile is obsolete; remove it and use the recipe settings directly.");
     const auto recipe = parseRecipe(json, {}, tier);
     const auto path = recipePath(libraryRoot, tier, recipe.id);
     if (QFileInfo(path).isSymbolicLink()) fail("A recipe cannot be a symbolic link.");

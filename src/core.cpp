@@ -1,6 +1,5 @@
 #include "core.h"
 #include "setup.h"
-#include "profiles.h"
 #include "runtime.h"
 #include "saves.h"
 #include "recipes.h"
@@ -171,7 +170,7 @@ QJsonObject Game::json() const {
             {"locale", locale}, {"backend", backend}, {"steam_id", steamId}, {"runner_revision", runnerRevision},
             {"folder_identity", folderIdentity}, {"source", source},
             {"installer", installer}, {"install_pending", installPending},
-            {"engine", engine}, {"category", category}, {"evidence", evidence}, {"setup_profile", setupProfile},
+            {"engine", engine}, {"category", category}, {"evidence", evidence},
             {"recipe_id", recipeId}, {"recipe_revision", recipeRevision},
             {"recipe_base", recipeBase}, {"recipe_overrides", overrides},
             {"recipe_candidates", QJsonArray::fromStringList(recipeCandidates)},
@@ -194,10 +193,9 @@ Game Game::fromJson(const QJsonObject &j) {
     g.engine = j["engine"].toString("Generic"); g.category = j["category"].toString("game");
     g.evidence = j["evidence"].toString();
     g.metadata = j["metadata"].toObject();
-    // Legacy installations retain their exact generic baseline, regardless of detected engine.
-    g.setupProfile = j.contains("setup_profile") ? j["setup_profile"].toString() : "generic-proton-v1";
     g.recipeId = j["recipe_id"].toString(); g.recipeRevision = j["recipe_revision"].toString();
-    g.recipeBase = j["recipe_base"].toObject(); g.recipeOverrides = j["recipe_overrides"].toObject();
+    g.recipeBase = j["recipe_base"].toObject(); g.recipeBase.remove("setup_profile");
+    g.recipeOverrides = j["recipe_overrides"].toObject(); g.recipeOverrides.remove("setup_profile");
     for (const auto &value : j["recipe_candidates"].toArray()) g.recipeCandidates.append(value.toString());
     for (const auto &value : j["winetricks"].toArray()) g.winetricks.append(value.toString());
     g.recipeSaves = j["recipe_saves"].toArray();
@@ -508,7 +506,6 @@ void Library::save(Game g, const SaveConfig *saveConfig) {
     const bool creating = g.id.isEmpty();
     if (g.id.isEmpty()) g.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     if (!safeId(g.id) || g.name.trimmed().isEmpty()) fail("A game needs a valid ID and name.");
-    if (g.backend == "umu") resolveSetupProfile(g);
     QLockFile mutation(dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
     if (!mutation.tryLock(saveConfig ? 2000 : 0)) fail("Library maintenance is in progress. Retry saving shortly.");
     if (!creating) game(g.id); // A stale Manage window must not recreate a removed installation.
@@ -807,7 +804,6 @@ Game Library::previewRecipe(const QString &id, const QString &recipeId) const {
             if (QDir::isAbsolutePath(selector)) { updated.runner = selector; updated.runnerSelector.clear(); }
             else { updated.runner.clear(); updated.runnerSelector = selector; }
         } else if (key == "locale") updated.locale = value == "system" ? QString() : value.toString();
-        else if (key == "setup_profile") updated.setupProfile = value.toString();
         else if (key == "arguments") {
             updated.arguments.clear();
             for (const auto &argument : value.toArray()) updated.arguments.append(argument.toString());
@@ -869,7 +865,6 @@ QString Library::status(const Game &g) const {
     if (g.backend == "steam") return g.steamId.isEmpty() ? "Needs Steam shortcut" : "Steam shortcut";
     if (g.backend == "native") return g.executable.isEmpty() ? "Choose executable" :
         nativeExecutable(g.executable) ? "Ready" : "Executable not runnable";
-    if (!findSetupProfile(g.setupProfile)) return "Choose setup profile";
     if (g.executable.isEmpty()) return "Choose executable";
     if (!QFileInfo(QDir(g.runner).filePath("proton")).isFile()) return "Choose runner";
     if (!g.runnerRevision.isEmpty() && runnerVersion(g.runner) != g.runnerRevision) return "Runner changed";

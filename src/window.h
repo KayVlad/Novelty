@@ -67,7 +67,6 @@ public:
     void syncSavesFromPeer(const QString &gameId, QWidget *parent);
     void installFromPeer();
     void refreshPeerGames();
-    void syncPendingPeers();
     void addGame();
     void launch(bool prepareOnly = false, const QString &tool = {}, const std::optional<ExtraLaunch> &extra = {}, bool installing = false, bool debugWine = false);
 private:

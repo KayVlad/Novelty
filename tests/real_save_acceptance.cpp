@@ -20,7 +20,6 @@ int main(int argc, char **argv) {
         game.runner = runner;
         game.executable = folder + "/Tenpure.exe";
         game.workingDirectory = folder;
-        game.setupProfile = "generic-proton-v1";
         lib.save(game);
         const auto saveDir = folder + "/game/saves";
         if (!QFileInfo(saveDir + "/1-1-LT1.save").isFile())

@@ -19,7 +19,6 @@ struct Game {
     bool installPending = false;
     QString folderIdentity, source = "manual";
     QString engine = "Generic", category = "game", evidence;
-    QString setupProfile = "generic-proton-v1";
     QString recipeId, recipeRevision, runnerSelector, umuLauncher, umuResolved, umuGameId, store, saveStrategy;
     QStringList recipeCandidates, winetricks;
     QJsonArray recipeSaves;

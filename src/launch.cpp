@@ -1,6 +1,5 @@
 #include "core.h"
 #include "setup.h"
-#include "profiles.h"
 #include "recipes.h"
 #include "runtime.h"
 #include "saves.h"
@@ -72,7 +71,6 @@ Command launchCommand(const Library &lib, const Game &g, bool prepare) {
         return c;
     }
     if (g.backend != "umu") fail("Unsupported launch backend.");
-    resolveSetupProfile(g); // Reject unavailable versions before starting a backend or changing a prefix.
     auto umu = g.umuLauncher.isEmpty() ? lib.settings()["umu"].toString("umu-run") :
                g.umuResolved;
     if (umu == "umu-run" && resolveProgram(umu).isEmpty()) {
@@ -219,7 +217,7 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
                 {"state", "preparing"}, {"kind", installing ? "installer" : "extra"}, {"started_at", now()}, {"executable", cmd.arguments.first()},
                 {"cwd", cmd.cwd}, {"arguments", QJsonArray::fromStringList(extra->arguments)},
                 {"umu", cmd.program}, {"runner", canonicalPath(g.runner)}, {"runner_version", runnerVersion(g.runner)},
-                {"prefix", lib.prefix(id)}, {"profile", g.setupProfile}};
+                {"prefix", lib.prefix(id)}};
             const auto previous = readJson(operationPath);
             if (!previous.isEmpty()) writeJson(operationPath + ".previous", previous);
             writeJson(operationPath, operation);
@@ -247,7 +245,6 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
             return 0;
         }
         // Explicit Prepare also repairs an already-completed Proton prefix without deleting it.
-        if (g.backend == "umu") log.write(("Setup profile: " + g.setupProfile + "\n").toUtf8());
         if (g.backend == "umu" && (prepareOnly || !setupComplete(lib, g))) {
             lib.recordStatus(id, "Preparing");
             preparePrefix(lib, g, [&] { return executeTracked(lib, id, launchCommand(lib, g, true), log); });

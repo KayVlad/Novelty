@@ -39,6 +39,37 @@ int main(int argc, char **argv) {
         Library library(root);
         check(QFileInfo::exists(root + "/.novelty/recipes/general/legacy.json") &&
               !QFileInfo::exists(root + "/.novelty/recipes/default/legacy.json"), "old directory migrated without deleting recipe");
+        check(!QFileInfo::exists(recipePath(root, "general", "generic-game-v1")) &&
+              !QFileInfo::exists(recipePath(root, "engines", "renpy-bundled-v1")),
+              "fresh libraries do not seed deprecated profile recipes");
+        file(recipePath(root, "general", "legacy-profile"),
+             recipe("legacy-profile", {{"category", "game"}}, {{"setup_profile", "generic-game-v1"}}));
+        for (const auto &entry : loadRecipes(root)) if (entry.id == "legacy-profile")
+            check(!entry.settings.contains("setup_profile"), "existing profile recipe loads without obsolete setting");
+        rejects([&] { saveRecipe(root, "games", recipe("new-profile", {{"category", "game"}},
+            {{"setup_profile", "generic-game-v1"}})); });
+        QTemporaryDir older; check(older.isValid(), "old recipe library fixture");
+        const auto oldRoot = older.path(), oldFolder = oldRoot + "/Visual Novel";
+        file(oldRoot + "/.novelty/recipes/catalog-v2", "older catalog");
+        file(recipePath(oldRoot, "general", "generic-game-v1"),
+             recipe("generic-game-v1", {{"category", "game"}},
+                    {{"backend", "umu"}, {"setup_profile", "generic-game-v1"}}));
+        file(recipePath(oldRoot, "general", "generic-vn-v1"),
+             recipe("generic-vn-v1", {{"inherits", "generic-game-v1"}, {"category", "visual_novel"}},
+                    {{"setup_profile", "generic-proton-v1"}}));
+        file(recipePath(oldRoot, "engines", "renpy-bundled-v1"),
+             recipe("renpy-bundled-v1", {{"inherits", "generic-vn-v1"},
+                 {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"type", "file"}, {"path", "renpy/__init__.py"}},
+                                                       QJsonObject{{"type", "directory"}, {"path", "game"}}}}}}},
+                    {{"setup_profile", "renpy-bundled-v1"}, {"save_strategy", "renpy"}}));
+        file(oldFolder + "/renpy/__init__.py");
+        QDir().mkpath(oldFolder + "/game");
+        Library olderLibrary(oldRoot);
+        const auto oldChoice = selectRecipe(oldRoot, oldFolder, {}, "generic-vn-v1");
+        check(oldChoice.selected().id == "renpy-bundled-v1" &&
+              !oldChoice.selected().settings.contains("setup_profile") &&
+              oldChoice.selected().category == "visual_novel",
+              "older inherited catalog remains usable without compiled profiles");
         const auto inherited = recipe("vn-engine", {{"inherits", "general-vn"},
             {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"type", "file"}, {"path", "Story.exe"}}}},
                                    {"any", QJsonArray{QJsonObject{{"type", "directory"}, {"path", "assets"}},
