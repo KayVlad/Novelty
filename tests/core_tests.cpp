@@ -1542,7 +1542,7 @@ touch "$WINEPREFIX/played"; exit 0
     QFile::setPermissions(fake, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     Library lib(root); lib.setSettings({{"umu", fake}, {"runner", runner}});
     const auto recipes = loadRecipes(root);
-    for (const auto &recipe : recipes) if (recipe.tier == "default")
+    for (const auto &recipe : recipes) if (recipe.tier == "general")
         require(recipe.settings["winetricks"].toArray().isEmpty() &&
                 recipe.settings["runner"] == "GE-Proton11-7", "general recipes start clean with the tested GE pin");
     lib.import(discover(root), runner);
@@ -1593,16 +1593,17 @@ touch "$WINEPREFIX/played"; exit 0
     invalid["settings"] = QJsonObject{{"winetricks", QJsonArray{QJsonObject{{"url", "https://example.invalid/install.exe"}}}}};
     rejects([&] { saveRecipe(root, "default", QJsonDocument(invalid).toJson()); }, "recipe cannot add an installer URL in a component entry");
     invalid["id"] = "missing-parent"; invalid["inherits"] = "absent-recipe"; invalid["settings"] = QJsonObject{};
-    saveRecipe(root, "default", QJsonDocument(invalid).toJson());
+    rejects([&] { saveRecipe(root, "default", QJsonDocument(invalid).toJson()); }, "editor refuses missing parent");
+    touch(recipePath(root, "default", "missing-parent"), QJsonDocument(invalid).toJson());
     rejects([&] { loadRecipes(root); }, "missing recipe parent is rejected");
-    removeRecipe(root, "default", "missing-parent");
+    QFile::remove(recipePath(root, "default", "missing-parent"));
     auto cycleA = invalid, cycleB = invalid;
     cycleA["id"] = "cycle-a"; cycleA["inherits"] = "cycle-b";
     cycleB["id"] = "cycle-b"; cycleB["inherits"] = "cycle-a";
-    saveRecipe(root, "default", QJsonDocument(cycleA).toJson());
-    saveRecipe(root, "default", QJsonDocument(cycleB).toJson());
+    touch(recipePath(root, "default", "cycle-a"), QJsonDocument(cycleA).toJson());
+    touch(recipePath(root, "default", "cycle-b"), QJsonDocument(cycleB).toJson());
     rejects([&] { loadRecipes(root); }, "recipe inheritance cycle is rejected");
-    removeRecipe(root, "default", "cycle-a"); removeRecipe(root, "default", "cycle-b");
+    QFile::remove(recipePath(root, "default", "cycle-a")); QFile::remove(recipePath(root, "default", "cycle-b"));
     lib.applyRecipe(id, "media-game"); g = lib.game(id); g.runner = runner; lib.save(g); g = lib.game(id);
     require(g.winetricks == QStringList({"quartz", "wmp11", "qasf"}), "resolved verbs persist with the game");
     require(supervise(lib, id, false) == 1 && !QFileInfo::exists(prefix + "/winetricks-calls") &&

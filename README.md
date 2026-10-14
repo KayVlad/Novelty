@@ -14,26 +14,29 @@ Implementation uses C++20, Qt6 Widgets and SQLite. The current build includes li
 
 Automatic discovery waits briefly for new folders to stop changing before import. Each direct child of Games remains one game entry even when its executable is nested, for example `Title/Game/Play.exe` beside `Title/OST/`. Discovery searches nested folders for Windows `.exe` files and executable Linux ELF files or launch scripts, including files without an extension. A native Linux game launches directly, without Proton. **Add game → Select folder** also offers an explicit native execution choice and file picker; **Manage → Launch** can change the backend later. Novelty ignores hidden folders such as `.novelty` and prefers a game launcher over utilities inside soundtrack or runtime folders. Existing games remain available while this check runs. If a library disappears, reconnect it and use Rescan; the open window retains its entries. For umu and native games, renaming/moving the same folder within the Games directory follows its filesystem identity. Other moves use **Manage → Relink folder…**, preserving the installation ID and settings. Reopen the updated launcher and let the first scan finish before testing a rename.
 
-Recipes live in `Games/.novelty/recipes/default/`, `engines/`, and `games/`. Edit them in **Settings → Add or edit recipes…** or edit their JSON files. Each file uses the same `schema: 1`, `id`, `name`, `match`, and `settings` structure. Novelty requires every condition in `match.all` to pass. It first tries game recipes, then engine recipes, then the default selected in Settings. If several recipes fully match at one level, choose one in **Manage → Runtime**. Paths in a recipe, including `executable`, `working_directory`, and game-local saves, start at the imported game folder. An omitted `backend` means `umu`. `runner` can be `proton-experimental`, `proton-latest`, `ge-proton-latest`, or an installed exact version; `umu_launcher` can be `umu-latest` or `umu-<version>`. A Ren'Py recipe can set `save_strategy` to `renpy` to inspect its own save configuration, including nested installations. Existing games keep their applied settings until a recipe is applied again. The Steam Runtime app ID mapping is editable at `Games/.novelty/runtime-appids.json`.
+Recipes live in `Games/.novelty/recipes/general/`, `engines/`, and `games/`. Existing `default/` recipes are moved to `general/` when the library opens; user edits and stable IDs are retained. Edit or import recipes in **Settings → Add or edit recipes…**. All files use schema 1, and `category` (`game` or `visual_novel`) is declared in JSON, independently of the engine. `match.all` requires every condition; optional `match.any` requires at least one. Novelty tries game recipes, then engine recipes, then the general preset selected in Settings. An ambiguous same-tier match needs a choice. Paths in recipes start at the imported game folder. An omitted `backend` means `umu`; `runner` accepts an installed exact version or a supported alias. A Ren'Py recipe can request `save_strategy: renpy` to inspect nested save configuration. Recipe save paths are candidates, never confirmed mappings. Existing games retain materialized settings even when a recipe changes or disappears. Manage previews changes before a selected preset is applied, retains explicit overrides, and exports a portable manual game preset. Settings can export and import sanitized library defaults. The Steam Runtime app ID mapping is editable at `Games/.novelty/runtime-appids.json`.
 
-Recipes can name one parent with `inherits`; child settings override scalars, merge environment keys, and add ordered, deduplicated `winetricks` verbs. Matching still uses only the child's own conditions. General Game and General VN use the pinned GE-Proton11-7 recommendation and a clean, dedicated prefix with no extra components; an explicit or valid library runner keeps priority over that general recommendation. A game or engine recipe may request only `cjkfonts`, `corefonts`, `quartz`, `wmp11`, or `qasf` in `settings.winetricks`; engine recognition alone requests none. Play or Prepare shows the pending components and asks before changing the prefix. Headless launches wait for this approval. Novelty runs each approved verb through the selected GE-Proton/UMU-Proton bundle and umu, records completed verbs in `recipe.lock.json`, and retries only unfinished ones. Removing a verb from a recipe does not remove it from an existing prefix; a successful installation receipt does not mean the game was tested. Changing runners can also change the prefix and is not guaranteed to be reversible. For troubleshooting, try the pinned runner first, then another exact GE version with a disposable prefix, then a demonstrated environment fix, and only then a justified component. Novelty does not cycle through these automatically.
+Recipes can name one parent with `inherits`; child settings override scalars, merge environment keys, and add ordered, deduplicated `winetricks` verbs. Matching still uses only the child's own conditions. General Game and General VN use the pinned GE-Proton11-7 recommendation and a clean, dedicated prefix with no extra components; an explicit or valid library runner keeps priority over that general recommendation. A game or engine recipe may request only `cjkfonts`, `corefonts`, `quartz`, `wmp11`, or `qasf` in `settings.winetricks`; engine recognition alone requests none. Manage → Runtime can edit a game's requested components with the same allowlist. Play or Prepare shows the pending components and asks before changing the prefix. Headless launches wait for this approval. Novelty runs each approved verb through the selected GE-Proton/UMU-Proton bundle and umu, records completed verbs in `recipe.lock.json`, and retries only unfinished ones. Removing a verb from a recipe does not remove it from an existing prefix; a successful installation receipt does not mean the game was tested. Changing runners can also change the prefix and is not guaranteed to be reversible. For troubleshooting, try the pinned runner first, then another exact GE version with a disposable prefix, then a demonstrated environment fix, and only then a justified component. Novelty does not cycle through these automatically.
 
-For example, save this as `Games/.novelty/recipes/games/story.json`:
+For example, save this as `Games/.novelty/recipes/games/story.json` after reviewing its release markers:
 
 ```json
 {
   "schema": 1,
   "id": "story",
   "name": "Story settings",
-  "match": {"all": [{"file": "Folder/Story.exe"}, {"directory": "Folder/game"}]},
+  "inherits": "general-vn",
+  "category": "visual_novel",
+  "match": {"all": [{"type": "file", "path": "Folder/Story.exe"}, {"type": "directory", "path": "Folder/game"}]},
   "settings": {
     "executable": "Folder/Story.exe",
-    "runner": "ge-proton-latest",
-    "umu_launcher": "umu-latest",
-    "saves": [{"scope": "game", "path": "Folder/game/saves"}]
+    "runner": "GE-Proton11-7",
+    "save_candidates": [{"scope": "game", "path": "Folder/game/saves"}]
   }
 }
 ```
+
+**Settings → Proton Manager** lists managed GE installs, fetches the official release catalog, uses the existing checksum-verified installer, and guards removal of selected or referenced builds. Manage links to it for runtime installation. Installing a build does not change the library default until Settings is saved; changing a runner can affect an existing prefix. Release-specific compatibility still needs real play, movie and save/load testing.
 
 Paired devices connect automatically while Novelty is open. Games available on a trusted device appear in the library with desaturated covers and **Not installed** status. Right-click → **Install**, or double-click the cover, to transfer a game; known saves travel through verified save snapshots separately. Install selects a local runner, prepares the receiving device's runtime and prefix, and applies one compatible peer save when there is no local progress, without starting the game. If setup is interrupted, Play retries it and continues with the peer save. Transfer addresses are remembered after authentication and rediscovered on the LAN when they change.
 
@@ -52,7 +55,7 @@ Build and run locally:
 
 Choose the Games folder in Settings on first launch. The selected folder is saved in `build/data/settings.json` for the local build; later launches use that path. `--root /path/to/Games` can supply an initial folder before one is saved.
 
-Template!! previously passed user gameplay/save-load checks with Proton 10. The user subsequently reported a GE 7-18 failure; a clean GE compatibility baseline remains pending. Use Settings → Get umu / Get GE-Proton for runtime installation. The terminal alternative for umu is:
+Template!! previously passed user gameplay/save-load checks with Proton 10. The user subsequently reported a GE 7-18 failure; a clean GE compatibility baseline remains pending. Use Settings → Get umu and Settings → Proton Manager for runtime installation. The terminal alternative for umu is:
 
 ```sh
 python3 scripts/install-umu.py /path/to/Games

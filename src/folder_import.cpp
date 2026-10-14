@@ -168,14 +168,14 @@ FolderImportResult Library::addFolder(const QString &chosen, const QString &nati
             g.runner = settings()["runner"].toString(); g.backend = candidate.native ? "native" : settings()["backend"].toString("umu");
             g.runnerRevision = runnerVersion(g.runner); g.source = "discovered";
             const auto choice = selectRecipe(root(), path, candidate.executables,
-                settings()["default_recipe"].toString("generic-game-v1"));
+                settings()["default_recipe"].toString("general-game"));
             auto executables = candidate.executables;
             if (choice.ambiguous()) {
                 for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
             } else {
                 applyRecipeToGame(g, choice.selected());
                 if (choice.selected().settings.contains("runner") &&
-                    ((choice.selected().tier != "default" && choice.selected().runnerExplicit) ||
+                    ((choice.selected().tier != "general" && choice.selected().runnerExplicit) ||
                      !QFileInfo(QDir(g.runner).filePath("proton")).isFile())) {
                     g.runner.clear(); g.runnerRevision.clear();
                 }
@@ -191,6 +191,7 @@ FolderImportResult Library::addFolder(const QString &chosen, const QString &nati
                 g.workingDirectory = QFileInfo(g.executable).absolutePath();
                 g.backend = "native"; g.runner.clear(); g.runnerRevision.clear();
             }
+            if (!choice.ambiguous()) g.recipeBase = portableGameSettings(g);
         } else {
             g = previous; g.folder = path; g.executable = movedPath(g.executable, source, path);
             g.workingDirectory = movedPath(g.workingDirectory, source, path);

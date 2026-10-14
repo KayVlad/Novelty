@@ -71,7 +71,7 @@ QString provisionGe(QWidget *parent, const QString &libraryRoot, const QString &
         auto releases = new QLabel("<a style='color:#9eafc5' href='https://github.com/GloriousEggroll/proton-ge-custom/releases'>Browse official GE-Proton releases</a>", &dialog);
         releases->setOpenExternalLinks(true); layout->addWidget(releases);
         auto form = new QFormLayout;
-        auto version = new QLineEdit(saved["version"].toString().isEmpty() ? suggestedVersion : saved["version"].toString(), &dialog);
+        auto version = new QLineEdit(suggestedVersion.isEmpty() ? saved["version"].toString() : suggestedVersion, &dialog);
         version->setObjectName("geVersion"); version->setPlaceholderText("For example: GE-Proton11-7"); form->addRow("Exact version", version);
         auto destination = new QLabel(root, &dialog); destination->setWordWrap(true); destination->setTextFormat(Qt::PlainText);
         form->addRow("Games library", destination); layout->addLayout(form);
@@ -116,7 +116,7 @@ QString provisionGe(QWidget *parent, const QString &libraryRoot, const QString &
                 if (script.isEmpty() || python.isEmpty()) throw std::runtime_error("GE downloads require the bundled installer helper and Python 3.");
                 QJsonObject config{{"schema", 1}, {"version", selected}, {"architecture", "x86_64"}, {"auto_download", true}};
                 if (saved["version"] == selected && saved.contains("sha512")) config["sha512"] = saved["sha512"];
-                writeJson(configPath, config);
+                if (startImmediately) writeJson(configPath, config); // Ordinary installs do not repin the library default.
                 requestConfig = data + "/ge-request-" + QUuid::createUuid().toString(QUuid::WithoutBraces) + ".json";
                 writeJson(requestConfig, config); // Another window cannot replace this request's version mid-startup.
                 output.clear(); errors.clear(); dialog.cancelled = false;

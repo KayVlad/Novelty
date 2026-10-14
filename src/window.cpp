@@ -3,6 +3,7 @@
 #include "provisioning.h"
 #include "profiles.h"
 #include "recipes.h"
+#include "runner_manager.h"
 #include "setup.h"
 #include "metadata.h"
 #include "saves.h"
@@ -96,6 +97,18 @@ QComboBox *runnerBox(QWidget *parent, const QString &current, const QString &lib
     box->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
     for (auto path : installedRunners(libraryRoot)) box->addItem(path);
     box->setCurrentText(current); return box;
+}
+QString askPresetId(QWidget *parent, const QString &title, const QString &suggested) {
+    QDialog dialog(parent); dialog.setWindowTitle(title);
+    auto layout = new QVBoxLayout(&dialog);
+    auto field = new QLineEdit(suggested, &dialog);
+    layout->addWidget(new QLabel("Preset ID (lowercase letters, digits, dots, dashes or underscores)", &dialog));
+    layout->addWidget(field);
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addWidget(buttons);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    return dialog.exec() == QDialog::Accepted ? field->text().trimmed() : QString();
 }
 QStringList metadataStrings(const QJsonValue &value) {
     QStringList result; for (const auto &item : value.toArray()) if (!item.toString().isEmpty()) result.append(item.toString());
@@ -888,12 +901,52 @@ void Window::settings() {
     form->addRow("Default backend", backend); form->addRow("Default Proton directory", runner);
     auto defaultRecipe = new QComboBox(&dialog); defaultRecipe->setObjectName("defaultRecipe");
     if (library_) try {
-        for (const auto &recipe : loadRecipes(library_->root())) if (recipe.tier == "default")
+        for (const auto &recipe : loadRecipes(library_->root())) if (recipe.tier == "general")
             defaultRecipe->addItem(recipe.name, recipe.id);
     } catch (const std::exception &e) { message(QString::fromUtf8(e.what())); }
-    const auto savedDefault = s["default_recipe"].toString("generic-game-v1");
+    const auto savedDefault = s["default_recipe"].toString("general-game");
     defaultRecipe->setCurrentIndex(defaultRecipe->findData(savedDefault));
     form->addRow("Default recipe", defaultRecipe);
+    auto presetActions = new QHBoxLayout;
+    auto exportLibrary = new QPushButton("Export library preset…", &dialog);
+    auto importLibrary = new QPushButton("Import library preset…", &dialog);
+    presetActions->addWidget(exportLibrary); presetActions->addWidget(importLibrary);
+    form->addRow(presetActions);
+    connect(exportLibrary, &QPushButton::clicked, &dialog, [&, this] {
+        try {
+            if (!library_) throw std::runtime_error("Choose a Games folder first.");
+            const auto id = askPresetId(&dialog, "Export library preset", "my-library-defaults");
+            if (id.isEmpty()) return;
+            QStringList omissions;
+            const auto document = libraryPresetDocument(library_->settings(), id, library_->root(), &omissions);
+            const auto path = QFileDialog::getSaveFileName(&dialog, "Export library preset", id + ".json", "JSON files (*.json)");
+            if (path.isEmpty()) return;
+            QSaveFile file(path);
+            const auto bytes = QJsonDocument(document).toJson(QJsonDocument::Indented);
+            if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
+                throw std::runtime_error("Could not write library preset.");
+            QMessageBox::information(&dialog, "Preset exported", omissions.isEmpty() ?
+                "Portable library defaults exported." : "Portable library defaults exported.\n" + omissions.join("\n"));
+        } catch (const std::exception &e) { QMessageBox::warning(&dialog, "Cannot export preset", QString::fromUtf8(e.what())); }
+    });
+    connect(importLibrary, &QPushButton::clicked, &dialog, [&, this] {
+        try {
+            if (!library_) throw std::runtime_error("Choose a Games folder first.");
+            const auto path = QFileDialog::getOpenFileName(&dialog, "Import library preset", {}, "JSON files (*.json)");
+            if (path.isEmpty()) return;
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly)) throw std::runtime_error("Could not read library preset.");
+            const auto proposed = applyLibraryPreset(library_->settings(), parseLibraryPreset(file.read(64 * 1024 + 1)), library_->root());
+            const auto summary = "Default recipe: " + proposed["default_recipe"].toString() +
+                "\nBackend: " + proposed["backend"].toString() +
+                "\nRunner: " + proposed["runner"].toString() +
+                "\n\nOnly these portable defaults will be loaded into Settings. Save Settings to keep them.";
+            if (QMessageBox::question(&dialog, "Load library preset?", summary) != QMessageBox::Yes) return;
+            backend->setCurrentIndex(backend->findData(proposed["backend"].toString()));
+            runner->setCurrentText(proposed["runner"].toString());
+            defaultRecipe->setCurrentIndex(defaultRecipe->findData(proposed["default_recipe"].toString()));
+        } catch (const std::exception &e) { QMessageBox::warning(&dialog, "Cannot import preset", QString::fromUtf8(e.what())); }
+    });
     auto editRecipes = new QPushButton("Add or edit recipes…", &dialog); editRecipes->setObjectName("editRecipes");
     form->addRow(editRecipes);
     connect(editRecipes, &QPushButton::clicked, &dialog, [&, this] {
@@ -901,15 +954,90 @@ void Window::settings() {
         recipes();
         defaultRecipe->clear();
         if (!library_) return;
-        try { for (const auto &recipe : loadRecipes(library_->root())) if (recipe.tier == "default")
+        try { for (const auto &recipe : loadRecipes(library_->root())) if (recipe.tier == "general")
             defaultRecipe->addItem(recipe.name, recipe.id); }
         catch (const std::exception &e) { message(QString::fromUtf8(e.what())); }
         defaultRecipe->setCurrentIndex(defaultRecipe->findData(selectedDefault));
     });
-    auto getGe = new QPushButton("Get GE-Proton…", &dialog); getGe->setObjectName("getGeSettings"); form->addRow(getGe);
-    connect(getGe, &QPushButton::clicked, &dialog, [&] {
-        const auto installed = provisionGe(&dialog, folderField->text());
-        if (!installed.isEmpty()) { if (runner->findText(installed) < 0) runner->addItem(installed); runner->setCurrentText(installed); }
+    bool managerPinChosen = false;
+    auto protonManager = new QPushButton("Proton Manager…", &dialog); protonManager->setObjectName("protonManager");
+    form->addRow(protonManager);
+    connect(protonManager, &QPushButton::clicked, &dialog, [&, this] {
+        if (!library_) { QMessageBox::warning(&dialog, "Proton Manager", "Choose a Games folder first."); return; }
+        QDialog manager(&dialog); manager.setObjectName("protonManagerDialog");
+        manager.setWindowTitle("Proton Manager"); manager.resize(660, 430);
+        auto managerLayout = new QVBoxLayout(&manager);
+        auto installed = new QListWidget(&manager); installed->setObjectName("managedGeList");
+        auto available = new QListWidget(&manager); available->setObjectName("availableGeList");
+        managerLayout->addWidget(new QLabel("Installed managed GE-Proton builds", &manager)); managerLayout->addWidget(installed);
+        managerLayout->addWidget(new QLabel("Official available builds (refresh to fetch)", &manager)); managerLayout->addWidget(available);
+        auto status = new QLabel(&manager); status->setWordWrap(true); status->setTextFormat(Qt::PlainText); managerLayout->addWidget(status);
+        auto row = new QHBoxLayout; managerLayout->addLayout(row);
+        auto refresh = new QPushButton("Refresh catalog", &manager);
+        auto install = new QPushButton("Install selected / exact…", &manager);
+        install->setObjectName("installManagedGe");
+        auto pin = new QPushButton("Use selected as default", &manager);
+        auto remove = new QPushButton("Remove selected…", &manager);
+        row->addWidget(refresh); row->addWidget(install); row->addWidget(pin); row->addWidget(remove);
+        auto close = new QPushButton("Close", &manager); managerLayout->addWidget(close, 0, Qt::AlignRight);
+        connect(close, &QPushButton::clicked, &manager, &QDialog::accept);
+        const auto reloadInstalled = [&] {
+            installed->clear();
+            for (const auto &entry : managedGeRunners(*library_)) {
+                auto item = new QListWidgetItem(entry.version + (entry.verified ? " · verified install" : " · needs repair"), installed);
+                item->setData(Qt::UserRole, entry.version);
+                item->setToolTip(entry.path);
+            }
+        };
+        reloadInstalled();
+        connect(refresh, &QPushButton::clicked, &manager, [&] {
+            auto work = std::async(std::launch::async, [root = library_->root()] { return fetchGeCatalog(root); });
+            QDialog progress(&manager); progress.setWindowTitle("Checking GE releases");
+            auto progressLayout = new QVBoxLayout(&progress);
+            progressLayout->addWidget(new QLabel("Loading official GE-Proton releases…", &progress));
+            QTimer poll; poll.setInterval(50);
+            connect(&poll, &QTimer::timeout, &progress, [&] {
+                if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
+            });
+            poll.start(); progress.exec(); poll.stop();
+            const auto catalog = work.get();
+            available->clear();
+            for (const auto &entry : catalog.releases) {
+                auto item = new QListWidgetItem(entry.version + " · " + entry.published.left(10), available);
+                item->setData(Qt::UserRole, entry.version);
+                item->setToolTip(QString::number(entry.archiveSize) + " byte download");
+            }
+            status->setText(catalog.fromCache ? "Release service unavailable; showing cached results. " + catalog.error :
+                catalog.error.isEmpty() ? "Official release catalog loaded. Installation still verifies the release checksum." : catalog.error);
+        });
+        connect(install, &QPushButton::clicked, &manager, [&] {
+            const auto selected = available->currentItem() ? available->currentItem()->data(Qt::UserRole).toString() : QString();
+            const auto path = provisionGe(&manager, library_->root(), {}, false, selected);
+            if (!path.isEmpty()) { reloadInstalled(); status->setText("Installed " + QFileInfo(path).fileName() + ". Choose Use selected as default to pin it."); }
+        });
+        connect(pin, &QPushButton::clicked, &manager, [&] {
+            if (!installed->currentItem()) { status->setText("Choose an installed build."); return; }
+            const auto version = installed->currentItem()->data(Qt::UserRole).toString();
+            const auto path = library_->dataRoot() + "/runners/" + version;
+            bool verified = false;
+            for (const auto &entry : managedGeRunners(*library_))
+                if (entry.version == version) verified = entry.verified;
+            if (!verified) { status->setText("Selected build needs repair before it can be the default."); return; }
+            if (runner->findText(path) < 0) runner->addItem(path);
+            runner->setCurrentText(path); managerPinChosen = true;
+            status->setText("Selected " + version + " as the Settings default. Save Settings to keep it.");
+        });
+        connect(remove, &QPushButton::clicked, &manager, [&] {
+            if (!installed->currentItem()) { status->setText("Choose an installed build."); return; }
+            const auto version = installed->currentItem()->data(Qt::UserRole).toString();
+            if (const auto reason = managedRunnerRemovalIssue(*library_, version); !reason.isEmpty())
+                { status->setText(reason); return; }
+            if (QMessageBox::question(&manager, "Remove GE-Proton?", "Remove managed " + version + "? Installed games and prefixes are kept.",
+                                      QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+            try { removeManagedRunner(*library_, version); reloadInstalled(); status->setText(version + " removed."); }
+            catch (const std::exception &e) { status->setText(QString::fromUtf8(e.what())); }
+        });
+        manager.exec();
     });
     form->addRow("umu executable", pathField(umu, &dialog, false, "Select umu-run"));
     auto getUmu = new QPushButton("Get umu…", &dialog); getUmu->setObjectName("getUmuSettings"); form->addRow(getUmu);
@@ -985,7 +1113,7 @@ void Window::settings() {
     devicesButton->setObjectName("devicesSettings"); devicesButton->setEnabled(bool(library_));
     connect(devicesButton, &QPushButton::clicked, &dialog, [this] { devices(); });
     body->addWidget(devicesButton);
-    auto note = new QLabel("Default backend and Proton apply to newly discovered games. The umu executable applies to all umu games in this library.\n\nGet GE-Proton and Get umu install pinned versions for this library. Manage → Add to Steam creates a shortcut to Novelty's existing launch path.", &dialog); note->setWordWrap(true); body->addWidget(note);
+    auto note = new QLabel("Default backend and Proton apply to newly discovered games. The umu executable applies to all umu games in this library.\n\nProton Manager installs GE builds and selects the library default. Get umu installs the launcher for this library. Manage → Add to Steam creates a shortcut to Novelty's existing launch path.", &dialog); note->setWordWrap(true); body->addWidget(note);
     scroll->setWidget(content); layout->addWidget(scroll, 1);
     auto buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog); layout->addWidget(buttons);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept); connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
@@ -1052,7 +1180,11 @@ void Window::settings() {
         }
         // A selected Games folder owns its own defaults. Switching to a copied
         // library must retain its relocated runner and umu paths.
-        if (!changedRoot) library_->setSettings(s);
+        if (!changedRoot) {
+            if (managerPinChosen || s["runner"] != library_->settings()["runner"])
+                syncGeProvisioningPolicy(*library_, s["runner"].toString());
+            library_->setSettings(s);
+        }
         refresh();
     } catch (const std::exception &e) { message(QString::fromUtf8(e.what())); }
 }
@@ -1060,17 +1192,18 @@ void Window::recipes() {
     if (!library_) return;
     QDialog dialog(this); dialog.setObjectName("recipesDialog"); dialog.setWindowTitle("Recipes"); dialog.resize(800, 600);
     auto layout = new QVBoxLayout(&dialog);
-    auto note = new QLabel("Every recipe uses the same JSON structure. Games match first, then engines; Settings chooses the fallback from Default. Every match condition must pass. Paths are relative to the game folder.", &dialog);
+    auto note = new QLabel("Every recipe uses the same JSON structure. Games match first, then engines; Settings chooses the fallback from General. All conditions must pass; any needs one match when present. Paths are relative to the game folder.", &dialog);
     note->setWordWrap(true); layout->addWidget(note);
     auto row = new QHBoxLayout; layout->addLayout(row, 1);
     auto list = new QListWidget(&dialog); list->setObjectName("recipeList"); list->setMinimumWidth(220); row->addWidget(list, 1);
     auto right = new QVBoxLayout; row->addLayout(right, 3);
     auto tier = new QComboBox(&dialog); tier->setObjectName("recipeTier");
-    tier->addItem("Default", "default"); tier->addItem("Engines", "engines"); tier->addItem("Games", "games"); right->addWidget(tier);
+    tier->addItem("General", "general"); tier->addItem("Engines", "engines"); tier->addItem("Games", "games"); right->addWidget(tier);
     auto editor = new QPlainTextEdit(&dialog); editor->setObjectName("recipeJson"); right->addWidget(editor, 1);
     auto error = new QLabel(&dialog); error->setTextFormat(Qt::PlainText); error->setWordWrap(true); right->addWidget(error);
     auto actions = new QHBoxLayout; right->addLayout(actions);
     auto add = new QPushButton("New", &dialog); add->setObjectName("newRecipe"); actions->addWidget(add);
+    auto importButton = new QPushButton("Import…", &dialog); importButton->setObjectName("importRecipe"); actions->addWidget(importButton);
     auto save = new QPushButton("Save", &dialog); save->setObjectName("saveRecipe"); actions->addWidget(save);
     auto remove = new QPushButton("Delete", &dialog); remove->setObjectName("deleteRecipe"); actions->addWidget(remove);
     auto close = new QPushButton("Close", &dialog); actions->addWidget(close);
@@ -1078,7 +1211,7 @@ void Window::recipes() {
     const auto root = library_->root();
     const auto reload = [&] {
         list->clear();
-        for (const auto &folder : {"default", "engines", "games"}) {
+        for (const auto &folder : {"general", "engines", "games"}) {
             const auto directory = recipeRoot(root) + '/' + folder;
             for (const auto &file : QDir(directory).entryList({"*.json"}, QDir::Files | QDir::NoSymLinks, QDir::Name)) {
                 const auto id = file.left(file.size() - 5), path = directory + '/' + file;
@@ -1104,13 +1237,28 @@ void Window::recipes() {
         list->clearSelection(); currentId.clear(); currentTier.clear(); tier->setEnabled(true);
         const auto id = "new-recipe-" + QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
         const auto selectedTier = tier->currentData().toString();
-        const QJsonObject match = selectedTier == "default" ? QJsonObject{} :
+        const QJsonObject match = selectedTier == "general" ? QJsonObject{} :
             QJsonObject{{"all", QJsonArray{QJsonObject{{"file", "MyGame.exe"}}}}};
-        const QJsonObject settings = selectedTier == "default" ? QJsonObject{} :
+        const QJsonObject settings = selectedTier == "general" ? QJsonObject{} :
             QJsonObject{{"executable", "MyGame.exe"}};
         editor->setPlainText(QString::fromUtf8(QJsonDocument(QJsonObject{{"schema", 1}, {"id", id},
-            {"name", "New recipe"}, {"match", match}, {"settings", settings}}).toJson(QJsonDocument::Indented)));
+            {"name", "New recipe"}, {"category", "game"}, {"match", match}, {"settings", settings}}).toJson(QJsonDocument::Indented)));
         remove->setEnabled(false); error->clear();
+    });
+    connect(importButton, &QPushButton::clicked, &dialog, [&] {
+        try {
+            const auto path = QFileDialog::getOpenFileName(&dialog, "Import recipe", {}, "JSON files (*.json)");
+            if (path.isEmpty()) return;
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly)) throw std::runtime_error("Could not read recipe.");
+            const auto bytes = file.read(256 * 1024 + 1);
+            const auto selectedTier = tier->currentData().toString();
+            const auto parsed = parseRecipe(bytes, path, selectedTier);
+            if (QFileInfo::exists(recipePath(root, selectedTier, parsed.id)) &&
+                QMessageBox::question(&dialog, "Replace recipe?", "Replace the existing " + parsed.id + " recipe?") != QMessageBox::Yes) return;
+            saveRecipe(root, selectedTier, bytes); reload();
+            error->setText("Imported. Existing games retain their saved settings.");
+        } catch (const std::exception &e) { error->setText(QString::fromUtf8(e.what())); }
     });
     connect(save, &QPushButton::clicked, &dialog, [&] {
         try {
@@ -1128,7 +1276,7 @@ void Window::recipes() {
     });
     connect(remove, &QPushButton::clicked, &dialog, [&] {
         if (currentId.isEmpty()) return;
-        if (currentTier == "default" && library_->settings()["default_recipe"].toString("generic-game-v1") == currentId) {
+        if (currentTier == "general" && library_->settings()["default_recipe"].toString("general-game") == currentId) {
             error->setText("Choose another default recipe in Settings before deleting this one."); return;
         }
         if (QMessageBox::question(&dialog, "Delete recipe?", "Delete this recipe file? Existing game settings will be kept.") != QMessageBox::Yes) return;
@@ -1794,20 +1942,66 @@ void Window::manage() {
     resetProfile->setToolTip("Change only the setup profile. Save to apply; other settings and existing prefix files are kept.");
     runtimeForm->addRow("Setup profile", profile); runtimeForm->addRow(profileNote); runtimeForm->addRow(resetProfile);
     auto recipeChoice = new QComboBox(&d); recipeChoice->setObjectName("matchingRecipes");
-    auto applyMatchedRecipe = new QPushButton("Apply recipe", &d); applyMatchedRecipe->setObjectName("applyMatchedRecipe");
+    auto applyMatchedRecipe = new QPushButton("Preview and apply preset…", &d); applyMatchedRecipe->setObjectName("applyMatchedRecipe");
+    auto recipeState = new QLabel("Current: " + (g.recipeId.isEmpty() ? "Legacy/manual" : g.recipeId) +
+        (g.recipeOverrides.isEmpty() ? QString() : " (Modified)"), &d);
+    recipeState->setWordWrap(true); recipeState->setTextFormat(Qt::PlainText);
     try {
         const auto found = inspect(g.folder, library_->root()).executables;
         const auto selection = selectRecipe(library_->root(), g.folder, found,
-            library_->settings()["default_recipe"].toString("generic-game-v1"));
+            library_->settings()["default_recipe"].toString("general-game"));
         for (const auto &recipe : selection.matches) recipeChoice->addItem(recipe.name, recipe.id);
+        recipeChoice->insertSeparator(recipeChoice->count());
+        for (const auto &recipe : loadRecipes(library_->root()))
+            if (recipeChoice->findData(recipe.id) < 0) recipeChoice->addItem(recipe.name + " (manual)", recipe.id);
         if (recipeChoice->findData(g.recipeId) >= 0) recipeChoice->setCurrentIndex(recipeChoice->findData(g.recipeId));
     } catch (const std::exception &e) { recipeChoice->addItem(QString::fromUtf8(e.what())); applyMatchedRecipe->setEnabled(false); }
-    runtimeForm->addRow("Recipe", recipeChoice); runtimeForm->addRow(applyMatchedRecipe);
+    runtimeForm->addRow("Preset", recipeChoice); runtimeForm->addRow(recipeState); runtimeForm->addRow(applyMatchedRecipe);
     connect(applyMatchedRecipe, &QPushButton::clicked, &d, [this, &d, recipeChoice, id = g.id] {
         try {
-            library_->applyRecipe(id, recipeChoice->currentData().toString());
+            const auto selectedId = recipeChoice->currentData().toString();
+            if (selectedId.isEmpty()) throw std::runtime_error("Choose a preset.");
+            const auto current = library_->game(id);
+            const auto proposed = library_->previewRecipe(id, selectedId);
+            const auto before = portableGameSettings(current), after = portableGameSettings(proposed);
+            QStringList changes;
+            QSet<QString> keys;
+            for (auto it = before.begin(); it != before.end(); ++it) keys.insert(it.key());
+            for (auto it = after.begin(); it != after.end(); ++it) keys.insert(it.key());
+            for (const auto &key : keys) if (before[key] != after[key])
+                changes.append(key + ": " + QString::fromUtf8(QJsonDocument(QJsonArray{before[key], after[key]}).toJson(QJsonDocument::Compact)));
+            if (current.runner != proposed.runner) changes.append("installed runner: " + current.runner + " → " + proposed.runner);
+            for (const auto &recipe : loadRecipes(library_->root())) if (recipe.id == selectedId &&
+                recipe.tier != "general" && !recipeMatches(recipe, current.folder, inspect(current.folder, library_->root()).executables))
+                changes.prepend("This preset does not match the detected game files. You are choosing it manually.");
+            const auto summary = (changes.isEmpty() ? "No effective settings change." : changes.join("\n")) +
+                "\n\nThe existing prefix, save mappings and server link stay in place. A changed runner or new Winetricks request may change the prefix during a later confirmed Prepare.";
+            if (QMessageBox::question(&d, "Apply preset?", summary, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+            library_->applyRecipe(id, selectedId);
             d.accept(); refresh(); message("Recipe applied. Review the game's executable, runner and save paths before Play.");
         } catch (const std::exception &e) { QMessageBox::warning(&d, "Cannot apply recipe", QString::fromUtf8(e.what())); }
+    });
+    auto exportPreset = new QPushButton("Export current preset…", &d); exportPreset->setObjectName("exportGameRecipe");
+    runtimeForm->addRow(exportPreset);
+    connect(exportPreset, &QPushButton::clicked, &d, [this, &d, id = g.id] {
+        try {
+            const auto saved = library_->game(id);
+            const auto proposedId = askPresetId(&d, "Export game preset", saved.name.toLower().replace(' ', '-') + "-custom");
+            if (proposedId.isEmpty()) return;
+            QStringList omissions;
+            QJsonObject document;
+            const auto recipes = loadRecipes(library_->root());
+            const Recipe *parent = nullptr;
+            for (const auto &recipe : recipes) if (recipe.id == saved.recipeId) { parent = &recipe; break; }
+            document = gameRecipeDocument(saved, proposedId, library_->root(), parent, &omissions);
+            const auto path = QFileDialog::getSaveFileName(&d, "Export game preset", proposedId + ".json", "JSON files (*.json)");
+            if (path.isEmpty()) return;
+            QSaveFile file(path);
+            const auto bytes = QJsonDocument(document).toJson(QJsonDocument::Indented);
+            if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
+                throw std::runtime_error("Could not write game preset.");
+            QMessageBox::information(&d, "Preset exported", "Saved a manual game preset for review.\n" + omissions.join("\n"));
+        } catch (const std::exception &e) { QMessageBox::warning(&d, "Cannot export preset", QString::fromUtf8(e.what())); }
     });
     auto updateProfile = [=] {
         const bool umu = backend->currentData() == "umu";
@@ -1827,6 +2021,10 @@ void Window::manage() {
     });
     auto runner = runnerBox(&d, g.runner, library_->root()); auto locale = new QComboBox(&d); locale->setEditable(true);
     locale->addItems({"", "ja_JP.UTF-8", "en_US.UTF-8"}); locale->setCurrentText(g.locale);
+    auto requestedWinetricks = new QLineEdit(g.winetricks.join(", "), &d);
+    requestedWinetricks->setObjectName("requestedWinetricks");
+    requestedWinetricks->setPlaceholderText("None (clean prefix)");
+    requestedWinetricks->setToolTip("Comma-separated approved components. Saving requests them; Prepare asks before installing. Removing a request does not uninstall it from the prefix.");
     auto effective = new QLabel(&d); effective->setObjectName("effectiveSetup");
     effective->setWordWrap(true); effective->setTextFormat(Qt::PlainText);
     auto updateEffective = [=, this] {
@@ -1863,6 +2061,7 @@ void Window::manage() {
     prefix->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     auto evidence = new QLabel(g.evidence, &d); evidence->setWordWrap(true); evidence->setTextFormat(Qt::PlainText);
     runtimeForm->addRow("Proton directory", runner); runtimeForm->addRow("Windows language / locale (blank = inherit)", locale);
+    runtimeForm->addRow("Winetricks components", requestedWinetricks);
     runtimeForm->addRow("Effective setup", effective);
     connect(profile, &QComboBox::currentIndexChanged, &d, updateEffective);
     connect(runner, &QComboBox::currentTextChanged, &d, updateEffective);
@@ -1874,12 +2073,11 @@ void Window::manage() {
         auto localeNote = new QLabel("For garbled Japanese installer text, choose ja_JP.UTF-8 and Save. To rerun a completed installer, use Run another executable below.", &d);
         localeNote->setWordWrap(true); runtimeForm->addRow(localeNote);
     }
-    auto getGe = new QPushButton("Get GE-Proton…", &d); getGe->setObjectName("getGeManage"); runtimeForm->addRow(getGe);
-    getGe->setEnabled(g.backend == "umu");
-    getGe->setToolTip("Install a GE-Proton build for umu. Steam compatibility tools are currently managed in Steam.");
-    connect(getGe, &QPushButton::clicked, &d, [&, runner] {
-        const auto installed = provisionGe(&d, library_->root());
-        if (!installed.isEmpty()) { if (runner->findText(installed) < 0) runner->addItem(installed); runner->setCurrentText(installed); }
+    auto openProtonManager = new QPushButton("Open Proton Manager in Settings…", &d);
+    openProtonManager->setObjectName("openProtonManager"); runtimeForm->addRow(openProtonManager);
+    connect(openProtonManager, &QPushButton::clicked, &d, [&, runner] {
+        settings();
+        for (const auto &path : installedRunners(library_->root())) if (runner->findText(path) < 0) runner->addItem(path);
     });
     auto revision = new QLabel("Accepted runner: " + g.runnerRevision + "\nSaving settings accepts the selected runner's current version.", &d);
     revision->setWordWrap(true); runtimeForm->addRow(revision);
@@ -2245,6 +2443,15 @@ void Window::manage() {
             g.name = name->text().trimmed(); g.executable = exe->text(); g.workingDirectory = cwd->text();
             g.runner = runner->currentText(); g.locale = locale->currentText(); g.backend = backend->currentData().toString(); g.steamId = steamId->text().trimmed();
             g.setupProfile = profile->currentData().toString();
+            g.winetricks.clear();
+            for (const auto &entry : requestedWinetricks->text().split(',', Qt::SkipEmptyParts)) {
+                const auto verb = entry.trimmed();
+                if (verb.isEmpty()) continue;
+                if (!g.winetricks.contains(verb)) g.winetricks.append(verb);
+            }
+            validateWinetricks(g.winetricks);
+            if (!g.winetricks.isEmpty() && g.backend != "umu")
+                throw std::runtime_error("Winetricks components require the umu backend.");
             g.arguments = args->toPlainText().split('\n', Qt::SkipEmptyParts); g.environment.clear();
             for (auto line : env->toPlainText().split('\n', Qt::SkipEmptyParts)) {
                 const int pos = line.indexOf('='); if (pos <= 0) throw std::runtime_error("Environment entries must use KEY=value.");

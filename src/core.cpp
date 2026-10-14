@@ -155,13 +155,25 @@ QString managedUmuPath(const QString &root) {
 QJsonObject Game::json() const {
     QJsonObject env;
     for (auto it = environment.begin(); it != environment.end(); ++it) env.insert(it.key(), it.value());
+    auto overrides = recipeOverrides;
+    if (!recipeBase.isEmpty()) {
+        overrides = {};
+        auto current = portableGameSettings(*this);
+        // A selected local runner is a persisted user choice, even when its recipe used an alias.
+        if (!runner.isEmpty()) current["runner"] = runner;
+        for (auto it = current.begin(); it != current.end(); ++it)
+            if (recipeBase[it.key()] != it.value()) overrides[it.key()] = it.value();
+        for (auto it = recipeBase.begin(); it != recipeBase.end(); ++it)
+            if (!current.contains(it.key())) overrides[it.key()] = QJsonValue::Null;
+    }
     return {{"schema", 1}, {"id", id}, {"name", name}, {"folder", folder},
             {"executable", executable}, {"cwd", workingDirectory}, {"runner", runner},
             {"locale", locale}, {"backend", backend}, {"steam_id", steamId}, {"runner_revision", runnerRevision},
             {"folder_identity", folderIdentity}, {"source", source},
             {"installer", installer}, {"install_pending", installPending},
-            {"engine", engine}, {"evidence", evidence}, {"setup_profile", setupProfile},
+            {"engine", engine}, {"category", category}, {"evidence", evidence}, {"setup_profile", setupProfile},
             {"recipe_id", recipeId}, {"recipe_revision", recipeRevision},
+            {"recipe_base", recipeBase}, {"recipe_overrides", overrides},
             {"recipe_candidates", QJsonArray::fromStringList(recipeCandidates)},
             {"winetricks", QJsonArray::fromStringList(winetricks)},
             {"recipe_saves", recipeSaves},
@@ -179,11 +191,13 @@ Game Game::fromJson(const QJsonObject &j) {
     g.installer = j["installer"].toString(); g.installPending = j["install_pending"].toBool();
     g.folderIdentity = j["folder_identity"].toString(); g.source = j["source"].toString("manual");
     g.backend = j["backend"].toString("umu"); g.steamId = j["steam_id"].toString();
-    g.engine = j["engine"].toString("Generic"); g.evidence = j["evidence"].toString();
+    g.engine = j["engine"].toString("Generic"); g.category = j["category"].toString("game");
+    g.evidence = j["evidence"].toString();
     g.metadata = j["metadata"].toObject();
     // Legacy installations retain their exact generic baseline, regardless of detected engine.
     g.setupProfile = j.contains("setup_profile") ? j["setup_profile"].toString() : "generic-proton-v1";
     g.recipeId = j["recipe_id"].toString(); g.recipeRevision = j["recipe_revision"].toString();
+    g.recipeBase = j["recipe_base"].toObject(); g.recipeOverrides = j["recipe_overrides"].toObject();
     for (const auto &value : j["recipe_candidates"].toArray()) g.recipeCandidates.append(value.toString());
     for (const auto &value : j["winetricks"].toArray()) g.winetricks.append(value.toString());
     g.recipeSaves = j["recipe_saves"].toArray();
@@ -212,6 +226,11 @@ QJsonObject storedGame(const QString &root, const Game &game) {
     auto data = game.json();
     for (const auto &key : {"folder", "executable", "cwd", "runner", "installer", "umu_resolved"})
         data[key] = storedPath(root, data[key].toString());
+    auto overrides = data["recipe_overrides"].toObject();
+    if (overrides.value("runner").isString() && QDir::isAbsolutePath(overrides.value("runner").toString())) {
+        overrides["runner"] = storedPath(root, overrides.value("runner").toString());
+        data["recipe_overrides"] = overrides;
+    }
     return data;
 }
 Game resolvedGame(const QString &root, const QJsonObject &data) {
@@ -222,6 +241,11 @@ Game resolvedGame(const QString &root, const QJsonObject &data) {
     game.runner = resolvedPath(root, game.runner);
     game.installer = resolvedPath(root, game.installer);
     game.umuResolved = resolvedPath(root, game.umuResolved);
+    if (game.recipeOverrides.value("runner").isString()) {
+        const auto selector = game.recipeOverrides.value("runner").toString();
+        if (selector.contains('/') && !QDir::isAbsolutePath(selector))
+            game.recipeOverrides["runner"] = resolvedPath(root, selector);
+    }
     return game;
 }
 QJsonObject storedLibrarySettings(const QString &root, QJsonObject data) {
@@ -265,7 +289,7 @@ Candidate inspect(const QString &folder, const QString &libraryRoot) {
     c.folder = canonicalPath(folder); c.name = QFileInfo(c.folder).fileName();
     const auto all = findExecutables(c.folder, &c.watchDirectories, &c.native);
     const auto root = libraryRoot.isEmpty() ? QFileInfo(c.folder).absolutePath() : libraryRoot;
-    const auto selection = selectRecipe(root, c.folder, all, "generic-game-v1");
+    const auto selection = selectRecipe(root, c.folder, all, "general-game");
     if (!selection.empty() && !selection.ambiguous()) {
         const auto recipe = selection.selected();
         c.executables = recipeExecutables(recipe, c.folder, all);
@@ -582,15 +606,16 @@ Game Library::selectExecutable(const QString &id, const QString &chosen) {
     g.workingDirectory = QFileInfo(path).absolutePath();
     bool defaultRecipe = g.recipeId.isEmpty();
     for (const auto &recipe : loadRecipes(root_))
-        if (recipe.id == g.recipeId && recipe.tier == "default") defaultRecipe = true;
+        if (recipe.id == g.recipeId && recipe.tier == "general") defaultRecipe = true;
     if (defaultRecipe) {
-        const auto choice = selectRecipe(root_, g.folder, {path}, settings()["default_recipe"].toString("generic-game-v1"));
+        const auto choice = selectRecipe(root_, g.folder, {path}, settings()["default_recipe"].toString("general-game"));
         if (choice.ambiguous()) {
             g.recipeCandidates.clear();
             for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
-        } else if (choice.selected().tier != "default") {
+        } else if (choice.selected().tier != "general") {
             applyRecipeToGame(g, choice.selected());
             g.executable = path; g.workingDirectory = QFileInfo(path).absolutePath();
+            g.recipeBase = portableGameSettings(g);
         }
     }
     if (g.installPending) { g.installPending = false; g.installer.clear(); }
@@ -727,12 +752,12 @@ int Library::import(const QList<Candidate> &candidates, const QString &runner) {
         Game g; g.id = QUuid::createUuid().toString(QUuid::WithoutBraces); g.name = c.name; g.folder = c.folder;
         g.runner = runner; g.backend = c.native ? "native" : backend;
         const auto choice = selectRecipe(root_, c.folder, c.executables,
-            settings()["default_recipe"].toString("generic-game-v1"));
+            settings()["default_recipe"].toString("general-game"));
         if (choice.ambiguous()) {
             for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
         } else {
             applyRecipeToGame(g, choice.selected());
-            if (choice.selected().tier != "default" && choice.selected().runnerExplicit &&
+            if (choice.selected().tier != "general" && choice.selected().runnerExplicit &&
                 (runner.isEmpty() || runner == settings()["runner"].toString())) g.runner.clear();
             c.executables = recipeExecutables(choice.selected(), c.folder, c.executables);
         }
@@ -740,19 +765,18 @@ int Library::import(const QList<Candidate> &candidates, const QString &runner) {
         g.workingDirectory = g.executable.isEmpty() ? g.folder : QFileInfo(g.executable).absolutePath();
         if (!choice.ambiguous() && !choice.selected().settings["working_directory"].toString().isEmpty())
             g.workingDirectory = canonicalPath(QDir(g.folder).filePath(choice.selected().settings["working_directory"].toString()));
+        if (!choice.ambiguous()) g.recipeBase = portableGameSettings(g);
         g.runnerRevision = runnerVersion(g.runner); g.folderIdentity = folderIdentity(g.folder); g.source = "discovered";
         store(g); existing.append(g); ++added;
     }
     return added;
 }
-Game Library::applyRecipe(const QString &id, const QString &recipeId) {
+Game Library::previewRecipe(const QString &id, const QString &recipeId) const {
     auto g = game(id);
     const auto found = inspect(g.folder, root_).executables;
-    const auto selection = selectRecipe(root_, g.folder, found,
-        settings()["default_recipe"].toString("generic-game-v1"));
     Recipe chosen;
-    for (const auto &recipe : selection.matches) if (recipe.id == recipeId) chosen = recipe;
-    if (chosen.id.isEmpty()) fail("This recipe does not fully match the game folder.");
+    for (const auto &recipe : loadRecipes(root_)) if (recipe.id == recipeId) chosen = recipe;
+    if (chosen.id.isEmpty()) fail("Recipe is unavailable: " + recipeId);
     auto updated = g;
     applyRecipeToGame(updated, chosen);
     if (chosen.settings.contains("runner")) { updated.runner.clear(); updated.runnerRevision.clear(); }
@@ -764,14 +788,46 @@ Game Library::applyRecipe(const QString &id, const QString &recipeId) {
     updated.workingDirectory = chosen.settings["working_directory"].toString().isEmpty() ?
         (updated.executable.isEmpty() ? g.folder : QFileInfo(updated.executable).absolutePath()) :
         canonicalPath(QDir(g.folder).filePath(chosen.settings["working_directory"].toString()));
-    auto config = loadSaveConfig(*this, id);
-    if (chosen.settings.contains("saves") && config.mappings.isEmpty()) {
-        for (const auto &value : chosen.settings["saves"].toArray()) {
-            const auto item = value.toObject(); config.mappings.append({item["scope"].toString(), item["path"].toString()});
-        }
-        if (!config.mappings.isEmpty()) { config.discoveryState = "identified"; config.discoverySource = "recipe"; }
-        save(updated, &config);
-    } else save(updated);
+    updated.recipeBase = portableGameSettings(updated);
+    // Prior explicit edits survive a later preset choice. Historical records have no
+    // override snapshot and continue to use their materialized launch settings until
+    // the user explicitly applies a new preset.
+    const auto overrides = g.recipeOverrides;
+    for (auto it = overrides.begin(); it != overrides.end(); ++it) {
+        const auto key = it.key();
+        const auto value = it.value();
+        if (key == "engine") updated.engine = value.toString();
+        else if (key == "backend") updated.backend = value.toString();
+        else if (key == "executable") updated.executable = value.isNull() ? QString() :
+            canonicalPath(QDir(g.folder).filePath(value.toString()));
+        else if (key == "working_directory") updated.workingDirectory = value == "." ? g.folder :
+            value.isNull() ? QString() : canonicalPath(QDir(g.folder).filePath(value.toString()));
+        else if (key == "runner") {
+            const auto selector = value.toString();
+            if (QDir::isAbsolutePath(selector)) { updated.runner = selector; updated.runnerSelector.clear(); }
+            else { updated.runner.clear(); updated.runnerSelector = selector; }
+        } else if (key == "locale") updated.locale = value == "system" ? QString() : value.toString();
+        else if (key == "setup_profile") updated.setupProfile = value.toString();
+        else if (key == "arguments") {
+            updated.arguments.clear();
+            for (const auto &argument : value.toArray()) updated.arguments.append(argument.toString());
+        } else if (key == "environment") {
+            updated.environment.clear();
+            const auto environment = value.toObject();
+            for (auto env = environment.begin(); env != environment.end(); ++env)
+                updated.environment[env.key()] = env.value().toString();
+        } else if (key == "winetricks") {
+            updated.winetricks.clear();
+            for (const auto &verb : value.toArray()) updated.winetricks.append(verb.toString());
+        } else if (key == "save_candidates") updated.recipeSaves = value.toArray();
+        else if (key == "save_strategy") updated.saveStrategy = value.toString();
+    }
+    updated.recipeOverrides = overrides;
+    return updated;
+}
+Game Library::applyRecipe(const QString &id, const QString &recipeId) {
+    auto updated = previewRecipe(id, recipeId);
+    save(updated);
     return game(id);
 }
 bool Library::busy(const QString &id) const {
@@ -830,7 +886,7 @@ QString Library::status(const Game &g) const {
 QJsonObject Library::settings() const {
     QSqlQuery q(db_); if (!q.exec("SELECT value FROM settings WHERE key='app'")) fail(q.lastError().text());
     if (!q.next()) return {{"umu", "umu-run"}, {"steam", "steam"}, {"backend", "umu"},
-                           {"default_recipe", "generic-game-v1"}};
+                           {"default_recipe", "general-game"}};
     return resolvedLibrarySettings(root_, QJsonDocument::fromJson(q.value(0).toByteArray()).object());
 }
 bool Library::managedRuntimeStorage() const {

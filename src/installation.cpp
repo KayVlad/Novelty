@@ -59,14 +59,17 @@ QString Library::finishInstallation(const QString &id) {
     }
     g.workingDirectory = g.executable.isEmpty() ? g.folder : QFileInfo(g.executable).absolutePath();
     const auto choice = selectRecipe(root(), g.folder, candidate.executables,
-        settings()["default_recipe"].toString("generic-game-v1"));
+        settings()["default_recipe"].toString("general-game"));
     if (choice.ambiguous()) {
         for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
     } else {
+        const auto installerLocale = g.locale;
         applyRecipeToGame(g, choice.selected());
-        if (choice.selected().tier != "default" && choice.selected().runnerExplicit &&
+        if (choice.selected().tier != "general" && choice.selected().runnerExplicit &&
             g.runner == settings()["runner"].toString())
             { g.runner.clear(); g.runnerRevision.clear(); }
+        g.recipeBase = portableGameSettings(g);
+        if (!installerLocale.isEmpty()) g.locale = installerLocale; // Installer language is an explicit saved choice.
     }
     g.installPending = false; g.installer.clear(); store(g);
     const QString message = g.executable.isEmpty() ? "Installation detected. Choose the game's executable in Manage → Launch." : "Installation detected. Your game is ready to launch.";

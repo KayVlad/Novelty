@@ -18,11 +18,12 @@ struct Game {
     QString installer;
     bool installPending = false;
     QString folderIdentity, source = "manual";
-    QString engine = "Generic", evidence;
+    QString engine = "Generic", category = "game", evidence;
     QString setupProfile = "generic-proton-v1";
     QString recipeId, recipeRevision, runnerSelector, umuLauncher, umuResolved, umuGameId, store, saveStrategy;
     QStringList recipeCandidates, winetricks;
     QJsonArray recipeSaves;
+    QJsonObject recipeBase, recipeOverrides; // Saved recommendation and explicit changes; launch uses materialized fields.
     QJsonObject metadata; // Automatically or manually linked VNDB record, cached for offline display.
     QStringList arguments;
     QMap<QString, QString> environment;
@@ -118,6 +119,7 @@ public:
     FolderImportResult addFolder(const QString &source, const QString &nativeLauncher = {});
     QStringList recoverFolderImports();
     Game selectExecutable(const QString &id, const QString &executable);
+    Game previewRecipe(const QString &id, const QString &recipeId) const;
     Game applyRecipe(const QString &id, const QString &recipeId);
     Game createInstallation(const QString &name, const QString &installer, const QString &runner, const QString &locale = {});
     QString detectInstallation(const QString &id);

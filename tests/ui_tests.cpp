@@ -349,7 +349,7 @@ int main(int argc, char **argv) {
                         if (report["game"].toObject()["id"] != g.id) error = "Diagnostic export did not save the selected game";
                     }
                     if (pass < 2) reset->click(); else choice->setCurrentIndex(choice->findData("generic-proton-v1"));
-                    if (choice->currentData() != (pass < 2 ? "renpy-bundled-v1" : "generic-proton-v1")) error = "Profile selection did not apply";
+                    if (choice->currentData() != (pass < 2 ? "generic-game-v1" : "generic-proton-v1")) error = "Profile selection did not apply";
                     const auto preview = qEnvironmentVariable("NOVELTY_UI_PREVIEW_DIR");
                     if (pass == 1 && !preview.isEmpty()) dialog->grab().save(preview + "/manage-runtime.png");
                     if (pass == 0) dialog->reject();
@@ -357,13 +357,21 @@ int main(int argc, char **argv) {
                 });
                 window.manage(); if (!error.isEmpty()) throw std::runtime_error(error.toStdString());
                 auto expected = original;
-                if (pass == 1) expected["setup_profile"] = "renpy-bundled-v1";
-                if (pass == 2) expected["setup_profile"] = "generic-proton-v1";
+                if (pass == 1) expected["setup_profile"] = "generic-game-v1";
+                if (pass == 2) {
+                    expected["setup_profile"] = "generic-proton-v1";
+                    auto overrides = expected["recipe_overrides"].toObject();
+                    overrides["setup_profile"] = "generic-proton-v1";
+                    expected["recipe_overrides"] = overrides;
+                }
                 if (profiles.game(g.id).json() != expected) throw std::runtime_error(("Profile cancel/save changed unrelated settings or failed to persist (pass " +
                     QString::number(pass) + "): actual=" + QString::fromUtf8(QJsonDocument(profiles.game(g.id).json()).toJson(QJsonDocument::Compact)) +
                     " expected=" + QString::fromUtf8(QJsonDocument(expected).toJson(QJsonDocument::Compact))).toStdString());
             }
             auto afterProfileChoice = original; afterProfileChoice["setup_profile"] = "generic-proton-v1";
+            auto profileOverrides = afterProfileChoice["recipe_overrides"].toObject();
+            profileOverrides["setup_profile"] = "generic-proton-v1";
+            afterProfileChoice["recipe_overrides"] = profileOverrides;
             QString toolError;
             QTimer::singleShot(0, &window, [&] {
                 auto action = window.findChild<QPushButton *>("winecfgButton");
@@ -464,17 +472,26 @@ int main(int argc, char **argv) {
                 auto dialog = window.findChild<QDialog *>("settingsDialog");
                 auto folder = window.findChild<QLineEdit *>("settingsGamesFolder");
                 if (!dialog || !folder || folder->text() != root) settingsError = "Games folder is missing from Settings";
-                auto getGe = window.findChild<QPushButton *>("getGeSettings");
-                if (!getGe) settingsError = "GE installer action missing from Settings";
+                auto manager = window.findChild<QPushButton *>("protonManager");
+                if (!manager) settingsError = "Proton Manager action missing from Settings";
                 else {
                     QTimer::singleShot(0, &window, [&] {
-                        auto geDialog = window.findChild<QDialog *>("geInstallerDialog");
-                        if (!geDialog) { settingsError = "Settings did not open the GE installer"; return; }
-                        const auto preview = qEnvironmentVariable("NOVELTY_UI_PREVIEW_DIR");
-                        if (!preview.isEmpty()) geDialog->grab().save(preview + "/ge-installer.png");
-                        geDialog->reject();
+                        auto managerDialog = window.findChild<QDialog *>("protonManagerDialog");
+                        auto install = window.findChild<QPushButton *>("installManagedGe");
+                        if (!managerDialog || !install) { settingsError = "Settings did not open Proton Manager"; return; }
+                        QTimer::singleShot(0, &window, [&] {
+                            auto geDialog = window.findChild<QDialog *>("geInstallerDialog");
+                            if (!geDialog) settingsError = "Proton Manager did not open the GE installer";
+                            else {
+                                const auto preview = qEnvironmentVariable("NOVELTY_UI_PREVIEW_DIR");
+                                if (!preview.isEmpty()) geDialog->grab().save(preview + "/ge-installer.png");
+                                geDialog->reject();
+                            }
+                            managerDialog->accept();
+                        });
+                        install->click();
                     });
-                    getGe->click();
+                    manager->click();
                 }
                 auto getUmu = window.findChild<QPushButton *>("getUmuSettings");
                 if (!getUmu) settingsError = "umu installer action missing from Settings";

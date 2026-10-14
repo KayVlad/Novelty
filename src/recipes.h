@@ -7,7 +7,8 @@ namespace novelty {
 
 struct Recipe {
     QString id, name, tier, path;
-    QJsonObject match, settings;
+    QString category;
+    QJsonObject match, settings, metadata, evidence, sources;
     QByteArray revision;
     QString inherits;
     bool runnerExplicit = false;
@@ -32,6 +33,14 @@ QString recipePath(const QString &libraryRoot, const QString &tier, const QStrin
 void saveRecipe(const QString &libraryRoot, const QString &tier, const QByteArray &json);
 void removeRecipe(const QString &libraryRoot, const QString &tier, const QString &id);
 void applyRecipeToGame(Game &, const Recipe &);
+QJsonObject portableGameSettings(const Game &, QStringList *omissions = nullptr);
+QJsonObject gameRecipeDocument(const Game &, const QString &id, const QString &libraryRoot, const Recipe *parent = nullptr,
+                               QStringList *omissions = nullptr);
+QJsonObject libraryPresetDocument(const QJsonObject &, const QString &id, const QString &libraryRoot,
+                                  QStringList *omissions = nullptr);
+QJsonObject parseLibraryPreset(const QByteArray &);
+QJsonObject applyLibraryPreset(const QJsonObject &current, const QJsonObject &document,
+                               const QString &libraryRoot);
 QStringList recipeExecutables(const Recipe &, const QString &gameFolder, const QStringList &found);
 QString resolveRunnerSelector(const QString &libraryRoot, const QString &selector);
 QString resolveUmuSelector(const QString &libraryRoot, const QString &selector);
