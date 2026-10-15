@@ -58,7 +58,7 @@ QString Library::finishInstallation(const QString &id) {
     }
     g.workingDirectory = g.executable.isEmpty() ? g.folder : QFileInfo(g.executable).absolutePath();
     const auto choice = selectRecipe(root(), g.folder, candidate.executables,
-        settings()["default_recipe"].toString("general-game"));
+        settings()["default_recipe"].toString());
     if (choice.ambiguous()) {
         for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
     } else {

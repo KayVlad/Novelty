@@ -1,4 +1,5 @@
 #include "window.h"
+#include "runner_manager.h"
 #include "app_settings.h"
 #include "provisioning.h"
 #include "metadata.h"
@@ -105,8 +106,10 @@ int main(int argc, char **argv) {
     QSettings::setDefaultFormat(QSettings::IniFormat); QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, t.path());
     QCoreApplication::setOrganizationName("NoveltyTests"); QCoreApplication::setApplicationName("NoveltyTests");
     qputenv("NOVELTY_TEST_APP_DATA_DIR", QFile::encodeName(t.path()));
+    setAppSetting("autoGeUpdates", false);
     try {
         const QString root = t.path() + "/Games"; QDir().mkpath(root);
+        cacheGeCatalog(root, {{"GE-Proton11-7", "2026-01-01", 1234}});
         file(root + "/Game/game.exe"); file(t.path() + "/runner/proton");
         const auto fake = t.path() + "/fake-umu";
         file(fake, "#!/bin/sh\nif [ \"$2\" = \"/c\" ]; then mkdir -p \"$WINEPREFIX/drive_c/windows/system32\"; touch \"$WINEPREFIX/system.reg\" \"$WINEPREFIX/drive_c/windows/system32/winecfg.exe\" \"$WINEPREFIX/drive_c/windows/regedit.exe\"; exit 0; fi\nprintf '%s\\n' \"$1\" \"$PWD\" > \"$WINEPREFIX/launched-paths\"\ntouch \"$WINEPREFIX/started\"\nsleep 1\ntouch \"$WINEPREFIX/survived\"\n");
@@ -127,6 +130,7 @@ int main(int argc, char **argv) {
             if (table->horizontalHeader()->defaultAlignment() != (Qt::AlignLeft | Qt::AlignVCenter) ||
                 table->model()->index(0, 0).data(Qt::TextAlignmentRole).toInt() != int(Qt::AlignLeft | Qt::AlignVCenter)) throw std::runtime_error("List headings and cells are misaligned");
             listButton->click(); if (!table->isVisible() || grid->isVisible()) throw std::runtime_error("List toggle failed");
+            if (readJson(appSettingsPath())["libraryView"] != "list") throw std::runtime_error("View choice did not update application settings JSON");
             QString listManageError;
             QTimer::singleShot(0, &window, [&] { auto dialog = window.findChild<QDialog *>("manageDialog"); if (!dialog) listManageError = "List Manage did not open"; else dialog->reject(); });
             auto listManage = table->findChild<QAction *>("listManageAction");
@@ -328,8 +332,11 @@ int main(int argc, char **argv) {
                 QTimer::singleShot(0, &window, [&] {
                     auto dialog = window.findChild<QDialog *>("manageDialog");
                     auto components = window.findChild<QLineEdit *>("requestedWinetricks");
+                    auto umuSelector = window.findChild<QLineEdit *>("gameUmuLauncher");
+                    auto umuId = window.findChild<QLineEdit *>("gameUmuGameId");
+                    auto store = window.findChild<QLineEdit *>("gameStore");
                     auto tabs = window.findChild<QTabWidget *>("manageTabs");
-                    if (!dialog || !components || !tabs || window.findChild<QComboBox *>("setupProfile") ||
+                    if (!dialog || !components || !tabs || !umuSelector || !umuId || !store || window.findChild<QComboBox *>("setupProfile") ||
                         window.findChild<QPushButton *>("resetSetupProfile")) {
                         error = "Runtime controls are missing or obsolete profile controls remain";
                         if (dialog) dialog->reject(); return;
@@ -350,6 +357,8 @@ int main(int argc, char **argv) {
                         if (report["game"].toObject()["id"] != g.id) error = "Diagnostic export did not save the selected game";
                     }
                     components->setText(pass < 2 ? "quartz" : "");
+                    umuSelector->setText(pass < 2 ? fake : QString());
+                    umuId->setText(pass < 2 ? "umu-custom" : ""); store->setText(pass < 2 ? "gog" : "");
                     const auto preview = qEnvironmentVariable("NOVELTY_UI_PREVIEW_DIR");
                     if (pass == 1 && !preview.isEmpty()) dialog->grab().save(preview + "/manage-runtime.png");
                     if (pass == 0) dialog->reject();
@@ -359,8 +368,11 @@ int main(int argc, char **argv) {
                 auto expected = original;
                 if (pass == 1) {
                     expected["winetricks"] = QJsonArray{"quartz"};
+                    expected["umu_launcher"] = fake; expected["umu_resolved"] = fake;
+                    expected["umu_game_id"] = "umu-custom"; expected["store"] = "gog";
                     auto overrides = expected["recipe_overrides"].toObject();
                     overrides["winetricks"] = QJsonArray{"quartz"};
+                    overrides["umu_launcher"] = fake; overrides["umu_game_id"] = "umu-custom"; overrides["store"] = "gog";
                     expected["recipe_overrides"] = overrides;
                 }
                 if (profiles.game(g.id).json() != expected) throw std::runtime_error(("Runtime cancel/save changed unrelated settings or failed to persist (pass " +
@@ -486,10 +498,9 @@ int main(int argc, char **argv) {
                 else {
                     QTimer::singleShot(0, &window, [&] {
                         auto managerDialog = window.findChild<QDialog *>("protonManagerDialog");
-                        auto install = window.findChild<QPushButton *>("installManagedGe");
-                        if (!managerDialog || !install) { settingsError = "Settings did not open Proton Manager"; return; }
+                        if (!managerDialog) { settingsError = "Settings did not open Proton Manager"; return; }
                         auto managedList = managerDialog->findChild<QListWidget *>("managedGeList");
-                        auto removeManaged = managerDialog->findChild<QPushButton *>("removeManagedGe");
+                        auto removeManaged = managerDialog->findChild<QPushButton *>("removeGe_" + managedVersion);
                         auto managerStatus = managerDialog->findChild<QLabel *>("protonManagerStatus");
                         QListWidgetItem *managedItem = nullptr;
                         if (managedList) for (int row = 0; row < managedList->count(); ++row)
@@ -513,17 +524,12 @@ int main(int argc, char **argv) {
                                 !managerStatus->text().contains("selected in Settings"))
                                 settingsError = "Unsaved Settings selection did not protect its GE build";
                         }
-                        QTimer::singleShot(0, &window, [&] {
-                            auto geDialog = window.findChild<QDialog *>("geInstallerDialog");
-                            if (!geDialog) settingsError = "Proton Manager did not open the GE installer";
-                            else {
-                                const auto preview = qEnvironmentVariable("NOVELTY_UI_PREVIEW_DIR");
-                                if (!preview.isEmpty()) geDialog->grab().save(preview + "/ge-installer.png");
-                                geDialog->reject();
-                            }
-                            managerDialog->accept();
-                        });
-                        install->click();
+                        if (!managedList || managedList->count() != 2 ||
+                            managerDialog->findChild<QListWidget *>("availableGeList") ||
+                            !managerDialog->findChild<QPushButton *>("installGe_GE-Proton11-7") ||
+                            window.findChild<QDialog *>("geInstallerDialog"))
+                            settingsError = "Proton Manager must combine installations and releases with direct installation";
+                        managerDialog->accept();
                     });
                     manager->click();
                 }
@@ -542,6 +548,27 @@ int main(int argc, char **argv) {
                 if (dialog) dialog->reject();
             });
             window.settings(); if (!settingsError.isEmpty()) throw std::runtime_error(settingsError.toStdString());
+            const auto settingsBefore = lib.settings();
+            QTimer::singleShot(0, &window, [&] {
+                auto dialog = window.findChild<QDialog *>("settingsDialog");
+                auto runner = dialog ? dialog->findChild<QComboBox *>("settingsRunner") : nullptr;
+                if (!dialog || !runner) { settingsError = "Settings runner control missing"; if (dialog) dialog->reject(); return; }
+                runner->setCurrentText("ge-proton-latest");
+                dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Save)->click();
+            });
+            window.settings();
+            if (!settingsError.isEmpty() || readJson(lib.dataRoot() + "/settings.json")["runner"] != "ge-proton-latest" ||
+                lib.settings()["runner"] != "ge-proton-latest") throw std::runtime_error("Settings Save did not update library settings JSON");
+            lib.setSettings(settingsBefore);
+            const auto settingsFile = lib.dataRoot() + "/settings.json"; const auto validSettings = readJson(settingsFile);
+            file(settingsFile, "{broken JSON");
+            window.settings();
+            if (!window.findChild<QLabel *>("libraryNotice")->text().contains("Invalid settings JSON"))
+                throw std::runtime_error("Settings did not report malformed library JSON");
+            window.manage();
+            if (!window.findChild<QLabel *>("libraryNotice")->text().contains("Invalid settings JSON"))
+                throw std::runtime_error("Manage did not report malformed library JSON");
+            writeJson(settingsFile, validSettings);
             // Removal only ever touches temporary fixtures; first cancel, then explicitly confirm.
             const auto target = lib.games().first();
             auto grid = window.findChild<QListView *>("gameGrid");

@@ -5,6 +5,7 @@
 #include "saves.h"
 #include "save_server_config.h"
 #include "save_server_sync.h"
+#include "runner_manager.h"
 #include <QtCore/qdatetime.h>
 #include <QtCore/qdir.h>
 #include <QtCore/qfileinfo.h>
@@ -49,7 +50,7 @@ Command launchCommand(const Library &lib, const Game &g, bool prepare) {
         bool numeric = !g.steamId.isEmpty();
         for (auto ch : g.steamId) numeric &= ch >= '0' && ch <= '9';
         if (!numeric) fail("Set a numeric Steam launch ID in Manage. Use the ID from the Steam-created desktop shortcut.");
-        c.program = resolveProgram(lib.settings()["steam"].toString("steam"));
+        c.program = resolveProgram(lib.settings()["steam"].toString());
         if (c.program.isEmpty()) fail("Steam executable was not found. Set its location in Settings.");
         c.arguments = {"steam://rungameid/" + g.steamId};
         return c;
@@ -71,7 +72,7 @@ Command launchCommand(const Library &lib, const Game &g, bool prepare) {
         return c;
     }
     if (g.backend != "umu") fail("Unsupported launch backend.");
-    auto umu = g.umuLauncher.isEmpty() ? lib.settings()["umu"].toString("umu-run") :
+    auto umu = g.umuLauncher.isEmpty() ? lib.settings()["umu"].toString() :
                g.umuResolved;
     if (umu == "umu-run" && resolveProgram(umu).isEmpty()) {
         umu = lib.dataRoot() + "/tools/umu-run";
@@ -79,7 +80,7 @@ Command launchCommand(const Library &lib, const Game &g, bool prepare) {
     }
     c.program = resolveProgram(umu);
     if (c.program.isEmpty()) fail("umu-run was not found. Install umu-launcher or set its executable in Settings.");
-    if (!QFileInfo(QDir(g.runner).filePath("proton")).isFile()) fail("Choose a valid Proton directory in Manage.");
+    if (!runnerInstallationReady(lib.root(), g.runner)) fail("The selected Proton installation is missing or unverified. Review its path in Manage or Proton Manager.");
     if (!g.runnerRevision.isEmpty() && runnerVersion(g.runner) != g.runnerRevision)
         fail("The selected Proton version changed. Review the runner in Manage and save to accept its current version.");
     if (!prepare && !QFileInfo(g.executable).isFile()) fail("Choose the game's executable in Manage.");
@@ -193,7 +194,11 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
     QJsonObject operation;
     const auto operationPath = lib.gamePath(id, "extra-launch.json");
     try {
-        const auto g = lib.game(id);
+        auto g = lib.game(id);
+        if (g.backend == "umu" && g.runner.isEmpty() && !g.runnerSelector.isEmpty()) {
+            g.runner = resolveRunnerSelector(lib.root(), g.runnerSelector);
+            if (!g.runner.isEmpty()) g.runnerRevision = runnerVersion(g.runner);
+        }
         const auto requiredApproval = winetricksApproval(lib, g);
         if (!requiredApproval.isEmpty() && requiredApproval != winetricksApprovalToken)
             fail("Winetricks components need approval before preparation: " + pendingWinetricks(lib, g).join(", ") +
@@ -274,6 +279,9 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
                 log.write(("Save server settings need attention: " + serverSetupIssue + "\n").toUtf8());
             }
         }
+        // Sync may have attempted a local restore after the initial recovery check.
+        // Offline Play is safe only when that operation left a usable local state.
+        if (const auto issue = lib.recoveryIssue(id); !issue.isEmpty()) fail(issue);
         if (prepareOnly) {
             if (serverMode && beforeSync.status == ServerSyncStatus::Conflict)
                 lib.recordStatus(id, "Save conflict", beforeSync.detail);
@@ -319,6 +327,11 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
         }
         const auto finishSaves = [&] {
             if (!ordinaryPlay) return;
+            if (const auto issue = lib.recoveryIssue(id); !issue.isEmpty()) {
+                snapshotIssue = issue;
+                log.write(("Save capture blocked by recovery: " + issue + "\n").toUtf8());
+                return;
+            }
             try { finishSaveObservation(lib, g); discoveryIssue.clear(); }
             catch (const std::exception &e) { discoveryIssue = QString::fromUtf8(e.what()); log.write(("Save discovery needs attention: " + discoveryIssue + "\n").toUtf8()); }
             try { queuePostExitSaveSnapshot(lib, g); finishPostExitSaveSnapshot(lib, g); snapshotIssue.clear(); }

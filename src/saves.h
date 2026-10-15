@@ -41,7 +41,7 @@ struct ImportedSaveCandidate { QString snapshotId; QString created; QString rela
 struct PeerTransferUndo { QString rollbackSnapshotId; QString installedSnapshotId; bool liveChanged = false; };
 
 SaveConfig loadSaveConfig(const Library &, const QString &gameId);
-// Plausible folders for an unmapped game; a choice is needed when more than one exists.
+// Recipe and heuristic suggestions for an unmapped game; each needs confirmation.
 QList<SaveMapping> saveDiscoveryCandidates(const Library &, const QString &gameId);
 void saveSaveConfig(Library &, const QString &gameId, const SaveConfig &);
 // Validate and normalize without writing. The caller holds the library and game locks when committing.

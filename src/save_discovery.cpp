@@ -169,16 +169,8 @@ QList<SaveMapping> recipeMappings(const Library &lib, const SaveConfig &config) 
 }
 void resolveDeclaredSavePaths(Library &lib, const Game &game, SaveConfig &config) {
     if (config.discoveryState != "searching" || !config.mappings.isEmpty()) return;
-    if (!game.recipeSaves.isEmpty()) {
-        for (const auto &value : game.recipeSaves) {
-            const auto item = value.toObject();
-            config.mappings.append({item["scope"].toString(), item["path"].toString()});
-        }
-        config.discoveryState = "identified"; config.discoverySource = "recipe";
-        validate(lib, game, config);
-        writeJson(configPath(lib, game.id), configJson(config));
-        return;
-    }
+    // Only an exact game/edition save rule may establish mappings automatically.
+    // Ordinary preset paths are suggestions until the user confirms them.
     auto recipe = recipeMappings(lib, config);
     if (!recipe.isEmpty()) {
         config.mappings = recipe; config.discoveryState = "identified"; config.discoverySource = "recipe";
@@ -261,6 +253,20 @@ QList<SaveMapping> heuristicSaveMappings(const Library &lib, const Game &game) {
     }
     return found;
 }
+QList<SaveMapping> candidateSaveMappings(const Library &lib, const Game &game) {
+    QList<SaveMapping> candidates;
+    QSet<QString> targets;
+    const auto append = [&](const SaveMapping &mapping) {
+        const auto target = targetPath(lib, game, mapping);
+        if (!targets.contains(target)) { targets.insert(target); candidates.append(mapping); }
+    };
+    for (const auto &value : game.recipeSaves) {
+        const auto item = value.toObject();
+        append({item["scope"].toString(), item["path"].toString()});
+    }
+    for (const auto &mapping : heuristicSaveMappings(lib, game)) append(mapping);
+    return candidates;
+}
 void discoverSavePaths(Library &lib, const Game &game) {
     auto config = loadSaveConfig(lib, game.id);
     if (!config.mappings.isEmpty()) return;
@@ -270,13 +276,10 @@ void discoverSavePaths(Library &lib, const Game &game) {
     }
     resolveDeclaredSavePaths(lib, game, config);
     if (config.discoveryState == "identified") return;
-    const auto found = heuristicSaveMappings(lib, game);
-    config.candidates = {}; // Old observation suggestions are not trusted as confirmed paths.
-    if (found.size() == 1) {
-        config.mappings = found;
-        config.discoveryState = "identified";
-        config.discoverySource = "heuristic";
-    }
+    config.candidates = {};
+    config.discoverySource.clear();
+    for (const auto &mapping : candidateSaveMappings(lib, game))
+        config.candidates.append(QJsonObject{{"scope", mapping.scope}, {"path", mapping.path}});
     validate(lib, game, config);
     writeJson(configPath(lib, game.id), configJson(config));
 }
@@ -337,13 +340,12 @@ void beginSaveObservation(Library &lib, const Game &game) {
 void finishSaveObservation(Library &lib, const Game &game) { discoverSavePaths(lib, game); }
 QList<SaveMapping> saveDiscoveryCandidates(const Library &lib, const QString &gameId) {
     if (!loadSaveConfig(lib, gameId).mappings.isEmpty()) return {};
-    return heuristicSaveMappings(lib, lib.game(gameId));
+    return candidateSaveMappings(lib, lib.game(gameId));
 }
 QStringList unresolvedGameSaveLocations(const Library &lib, const QString &gameId) {
     const auto game = lib.game(gameId);
     if (!loadSaveConfig(lib, gameId).mappings.isEmpty()) return {};
-    const auto candidates = heuristicSaveMappings(lib, game);
-    if (candidates.size() < 2) return {};
+    const auto candidates = candidateSaveMappings(lib, game);
     QStringList paths;
     for (const auto &candidate : candidates)
         if (candidate.scope == "game") paths.append(candidate.path);

@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "id": "general-vn",
+  "name": "Visual Novel",
+  "inherits": "general-game",
+  "category": "visual_novel",
+  "match": {},
+  "settings": {
+    "locale": "ja_JP.UTF-8",
+    "environment": {
+      "TZ": "Asia/Tokyo"
+    }
+  }
+}

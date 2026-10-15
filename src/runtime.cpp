@@ -92,7 +92,7 @@ int executeTracked(const Library &lib, const QString &id, const Command &cmd, QF
 #ifdef __linux__
     // The worker is the backend's parent and subreaper. If the headless caller is
     // killed, this worker still owns descendants and can clear the barrier safely.
-    const auto issue = runtimeRecoveryIssue(lib, id);
+    const auto issue = lib.recoveryIssue(id);
     if (!issue.isEmpty()) throw std::runtime_error(issue.toStdString());
     const auto boot = bootId();
     if (boot.isEmpty()) throw std::runtime_error("Cannot establish the system boot identity; launch was not started.");

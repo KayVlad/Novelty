@@ -22,6 +22,7 @@ QComboBox *runnerBox(QWidget *parent, const QString &current, const QString &lib
     auto box = new QComboBox(parent); box->setEditable(true); box->setMinimumContentsLength(22);
     box->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
     for (auto path : installedRunners(libraryRoot)) box->addItem(path);
+    box->addItems({"ge-proton-latest", "proton-latest", "proton-experimental"});
     box->setCurrentText(current); return box;
 }
 QString askPresetId(QWidget *parent, const QString &title, const QString &suggested) {

@@ -1,4 +1,5 @@
 #include "window.h"
+#include "runner_fixture.h"
 #include "app_settings.h"
 #include "lan_connection.h"
 #include "metadata.h"
@@ -43,6 +44,7 @@ int main(int argc, char **argv) {
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, temp.path() + "/settings");
     QCoreApplication::setOrganizationName("NoveltyPeerTests"); QCoreApplication::setApplicationName("NoveltyPeerTests");
     qputenv("NOVELTY_TEST_APP_DATA_DIR", QFile::encodeName(temp.path()));
+    setAppSetting("autoGeUpdates", false);
     QTimer watchdog; watchdog.setSingleShot(true);
     QObject::connect(&watchdog, &QTimer::timeout, &app, [&] {
         for (auto widget : QApplication::topLevelWidgets()) if (widget->isVisible())
@@ -58,6 +60,7 @@ int main(int argc, char **argv) {
         // transfer without starting the game.
         const auto runner = target.dataRoot() + "/runners/GE-Proton11-7";
         file(runner + "/proton");
+        managedRunnerFixture(runner);
         file(runner + "/toolmanifest.vdf", "\"require_tool_appid\" \"4183110\"");
         const auto umu = temp.path() + "/umu";
         file(umu, "#!/bin/sh\n"

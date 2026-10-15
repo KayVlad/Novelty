@@ -11,6 +11,7 @@
 #include <QtCore/qstandardpaths.h>
 #include <QtCore/quuid.h>
 #include <stdexcept>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -62,6 +63,15 @@ bool sameDevice(const QString &a, const QString &b) {
     if (stat(QFile::encodeName(a).constData(), &left) || stat(QFile::encodeName(b).constData(), &right))
         fail("Cannot inspect the source or Games filesystem.");
     return left.st_dev == right.st_dev;
+}
+void persistImportedTree(const QString &path) {
+    const int fd = open(QFile::encodeName(path).constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) fail("Cannot open the imported filesystem for synchronization. The source was kept.");
+    // Linux syncfs persists copied file data, symlinks and the destination rename
+    // together, before another filesystem is allowed to delete the original.
+    const int result = syncfs(fd);
+    close(fd);
+    if (result != 0) fail("Cannot persist the imported game. The source was kept.");
 }
 }
 
@@ -202,14 +212,23 @@ FolderImportResult Library::addFolder(const QString &chosen, const QString &nati
         }
         g.folderIdentity = folderIdentity(path);
         if (g.folderIdentity.isEmpty()) fail("Cannot verify the moved folder's identity.");
+        if (move && !direct) persistImportedTree(destination);
         store(g);
         QString warning;
         if (move && !direct) {
             const auto retired = QFileInfo(source).absolutePath() + "/.novelty-moved-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
             if (folderIdentity(source) != identity || !QDir().rename(source, retired))
                 warning = "Game added, but the original could not be retired. Remove it manually after checking: " + source;
-            else if (!sameContents(retired, destination) || !QDir(retired).removeRecursively())
-                warning = "Game added, but the original copy remains for review: " + retired;
+            else {
+                // Registration has committed. Cleanup failure must never move the
+                // published destination away from the database's saved path.
+                try {
+                    if (!sameContents(retired, destination) || !QDir(retired).removeRecursively())
+                        warning = "Game added, but the original copy remains for review: " + retired;
+                } catch (const std::exception &error) {
+                    warning = "Game added, but the original copy remains for review: " + retired + "\n" + QString::fromUtf8(error.what());
+                }
+            }
             QFile::remove(journal);
         }
         return {g, warning, move};

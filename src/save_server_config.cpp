@@ -1,4 +1,5 @@
 #include "save_server_config.h"
+#include "app_settings.h"
 #include "save_server_client.h"
 #include <QtCore/qcoreapplication.h>
 #include <QtCore/qcryptographichash.h>
@@ -14,7 +15,7 @@
 namespace novelty {
 namespace {
 [[noreturn]] void fail(const QString &message) { throw std::runtime_error(message.toStdString()); }
-QString directory() { return QCoreApplication::applicationDirPath() + "/data/server-profiles"; }
+QString directory() { return appDataDirectory() + "/server-profiles"; }
 QString configPath(const Library &library) {
     const auto id = library.profileId();
     if (QUuid(id).isNull()) fail("Library profile identity is invalid.");

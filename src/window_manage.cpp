@@ -1,8 +1,12 @@
 #include "window_internal.h"
+#include <QtCore/qregularexpression.h>
 
 namespace novelty {
 void Window::manage() {
     auto g = selected(); if (!library_ || g.id.isEmpty() || model_->remoteGames.contains(g.id)) return;
+    QJsonObject librarySettings;
+    try { librarySettings = library_->settings(); }
+    catch (const std::exception &error) { message(QString::fromUtf8(error.what())); return; }
     if (library_->busy(g.id)) {
         message(library_->supervisorActive(g.id) ? "This game has an operation in progress. Retry when it finishes." : library_->recoveryIssue(g.id)); return;
     }
@@ -203,7 +207,7 @@ void Window::manage() {
     try {
         const auto found = inspect(g.folder, library_->root()).executables;
         const auto selection = selectRecipe(library_->root(), g.folder, found,
-            library_->settings()["default_recipe"].toString("general-game"));
+            librarySettings["default_recipe"].toString());
         for (const auto &recipe : selection.matches) recipeChoice->addItem(recipe.name, recipe.id);
         recipeChoice->insertSeparator(recipeChoice->count());
         for (const auto &recipe : loadRecipes(library_->root()))
@@ -250,14 +254,24 @@ void Window::manage() {
             document = gameRecipeDocument(saved, proposedId, library_->root(), parent, &omissions);
             const auto path = QFileDialog::getSaveFileName(&d, "Export game preset", proposedId + ".json", "JSON files (*.json)");
             if (path.isEmpty()) return;
-            QSaveFile file(path);
             const auto bytes = QJsonDocument(document).toJson(QJsonDocument::Indented);
-            if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
-                throw std::runtime_error("Could not write game preset.");
+            QString destinationTier;
+            for (const auto &tier : {"general", "games"})
+                if (canonicalPath(QFileInfo(path).absolutePath()) == canonicalPath(recipeRoot(library_->root()) + '/' + tier))
+                    destinationTier = QString::fromLatin1(tier);
+            if (!destinationTier.isEmpty()) {
+                if (QFileInfo(path).fileName() != proposedId + ".json")
+                    throw std::runtime_error("A library recipe filename must match its recipe ID.");
+                saveRecipe(library_->root(), destinationTier, bytes);
+            } else {
+                QSaveFile file(path);
+                if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
+                    throw std::runtime_error("Could not write game preset.");
+            }
             QMessageBox::information(&d, "Preset exported", "Saved a manual game preset for review.\n" + omissions.join("\n"));
         } catch (const std::exception &e) { QMessageBox::warning(&d, "Cannot export preset", QString::fromUtf8(e.what())); }
     });
-    auto runner = runnerBox(&d, g.runner, library_->root());
+    auto runner = runnerBox(&d, g.runnerSelector.isEmpty() ? g.runner : g.runnerSelector, library_->root());
     bool runnerEdited = false;
     connect(runner, &QComboBox::currentTextChanged, &d, [&] { runnerEdited = true; });
     auto locale = new QComboBox(&d); locale->setEditable(true);
@@ -277,13 +291,12 @@ void Window::manage() {
         QString runnerSource, runnerValue = runner->currentText().trimmed();
         if (!runnerValue.isEmpty()) runnerSource = "Per-game Proton";
         else {
-            const auto libraryRunner = library_->settings()["runner"].toString();
-            if (!libraryRunner.isEmpty() && QFileInfo(QDir(libraryRunner).filePath("proton")).isFile()) {
+            const auto libraryRunner = librarySettings["runner"].toString();
+            if (!libraryRunner.isEmpty()) {
                 runnerSource = "Library default Proton"; runnerValue = libraryRunner;
             } else {
-                const auto pin = readJson(library_->dataRoot() + "/ge-proton.json")["version"].toString();
-                runnerValue = pin;
-                runnerSource = pin.isEmpty() ? "Proton" : "Library GE pin";
+                runnerValue = resolveRunnerSelector(library_->root(), "ge-proton-latest");
+                runnerSource = "Latest installed GE-Proton";
             }
         }
         if (runnerValue.isEmpty()) { runnerSource = "Proton"; runnerValue = "choose at first Play"; }
@@ -339,7 +352,7 @@ void Window::manage() {
     connect(runExtra, &QPushButton::clicked, &d, [this, &d] { runExecutable(&d); });
     runtimeScroll->setWidget(runtimeTab); tabs->addTab(runtimeScroll, "Runtime");
     auto savesTab = new QWidget(&d); auto savesLayout = new QVBoxLayout(savesTab);
-    auto savesIntro = new QLabel("Novelty checks common save folders and captures progress after Play. If several folders match, select one below and press Save.", savesTab);
+    auto savesIntro = new QLabel("Novelty suggests possible save locations. Select a location below or browse to one, then press Save to confirm it. Confirmed saves are backed up after Play.", savesTab);
     savesIntro->setWordWrap(true); savesLayout->addWidget(savesIntro);
     auto discoveryStatus = new QLabel(savesTab); discoveryStatus->setObjectName("saveDiscoveryStatus");
     discoveryStatus->setWordWrap(true); discoveryStatus->setTextFormat(Qt::PlainText);
@@ -413,19 +426,19 @@ void Window::manage() {
         const auto config = loadSaveConfig(*library_, g.id);
         saveCandidates->clear();
         const auto candidates = config.mappings.isEmpty() ? saveDiscoveryCandidates(*library_, g.id) : QList<SaveMapping>{};
-        const bool needsChoice = candidates.size() > 1;
+        const bool needsChoice = !candidates.isEmpty();
         candidateLabel->setVisible(needsChoice);
         saveCandidates->setVisible(needsChoice);
         for (const auto &candidate : candidates)
             if (needsChoice) new QListWidgetItem(displaySaveLocation(candidate), saveCandidates);
         if (config.mappings.isEmpty()) {
             discoveryStatus->setText(needsChoice ?
-                "Multiple possible save folders found. Select one below, then press Save." :
+                "Possible save locations found. Select one below, then press Save to confirm." :
                 "Not found — select a save folder or file. Novelty will check again after Play.");
             legacyPaths->clear();
             return;
         }
-        discoveryStatus->setText("Detected: " + displaySaveLocation(config.mappings.first()));
+        discoveryStatus->setText("Confirmed: " + displaySaveLocation(config.mappings.first()));
         if (config.mappings.size() > 1) {
             QStringList others;
             for (const auto &mapping : config.mappings) others.append(displaySaveLocation(mapping));
@@ -599,6 +612,15 @@ void Window::manage() {
     savesScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     savesScroll->setWidget(savesTab); tabs->addTab(savesScroll, "Saves");
     auto advanceTab = new QWidget(&d); auto al = new QVBoxLayout(advanceTab);
+    auto advancedForm = new QFormLayout;
+    auto umuSelector = new QLineEdit(g.umuLauncher, advanceTab); umuSelector->setObjectName("gameUmuLauncher");
+    umuSelector->setPlaceholderText("Blank = library launcher; umu-latest, umu-1.4.4 or an executable path");
+    auto umuGameId = new QLineEdit(g.umuGameId, advanceTab); umuGameId->setObjectName("gameUmuGameId");
+    umuGameId->setPlaceholderText("Blank = umu-default");
+    auto gameStore = new QLineEdit(g.store, advanceTab); gameStore->setObjectName("gameStore");
+    gameStore->setPlaceholderText("Blank = none");
+    advancedForm->addRow("umu launcher", umuSelector); advancedForm->addRow("umu game ID", umuGameId);
+    advancedForm->addRow("Store", gameStore); al->addLayout(advancedForm);
     auto hint = new QLabel("Environment variables: one KEY=value per line. DLL overrides can be set with WINEDLLOVERRIDES. Runner and prefix are managed separately.", &d); hint->setWordWrap(true); al->addWidget(hint);
     QStringList lines; for (auto it = g.environment.begin(); it != g.environment.end(); ++it) lines.append(it.key() + '=' + it.value());
     auto env = new QPlainTextEdit(lines.join('\n'), &d); al->addWidget(env); tabs->addTab(advanceTab, "Advanced");
@@ -677,6 +699,16 @@ void Window::manage() {
             g.name = name->text().trimmed(); g.executable = exe->text(); g.workingDirectory = cwd->text();
             if (runnerEdited) g.selectRunner(runner->currentText());
             g.locale = locale->currentText(); g.backend = backend->currentData().toString(); g.steamId = steamId->text().trimmed();
+            const auto launcher = umuSelector->text().trimmed(), gameId = umuGameId->text().trimmed();
+            if (!launcher.isEmpty() && !QDir::isAbsolutePath(launcher) &&
+                !QRegularExpression("^umu-(latest|[0-9]+(?:[.][0-9]+)*)$").match(launcher).hasMatch())
+                throw std::runtime_error("Choose a managed umu selector or an absolute launcher path.");
+            if (!gameId.isEmpty() && !QRegularExpression("^[A-Za-z0-9_-]{1,80}$").match(gameId).hasMatch())
+                throw std::runtime_error("umu game IDs may contain letters, digits, underscores and dashes (up to 80 characters).");
+            if (g.umuLauncher != launcher) {
+                g.umuLauncher = launcher; g.umuResolved = launcher.isEmpty() ? QString() : resolveUmuSelector(library_->root(), launcher);
+            }
+            g.umuGameId = gameId; g.store = gameStore->text().trimmed();
             g.winetricks.clear();
             for (const auto &entry : requestedWinetricks->text().split(',', Qt::SkipEmptyParts)) {
                 const auto verb = entry.trimmed();

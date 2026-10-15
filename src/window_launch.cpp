@@ -40,6 +40,32 @@ bool Window::prepareLaunchRuntime(Game &g) {
     if (!g.umuLauncher.isEmpty() && g.umuResolved.isEmpty())
         g.umuResolved = resolveUmuSelector(library_->root(), g.umuLauncher);
     QString geVersionToInstall;
+    if (g.runner.isEmpty() && ((geUpdates_ && !geUpdates_->installingVersion().isEmpty()) || geInstallInProgress(library_->root()))) {
+        auto selector = g.runnerSelector.isEmpty() ? library_->settings()["runner"].toString() : g.runnerSelector;
+        const bool unspecified = selector.isEmpty();
+        if (unspecified) selector = "ge-proton-latest";
+        g.runner = resolveRunnerSelector(library_->root(), selector);
+        if (g.runner.isEmpty() && unspecified) {
+            for (const auto &fallback : {"proton-latest", "proton-experimental"}) {
+                g.runner = resolveRunnerSelector(library_->root(), QString::fromLatin1(fallback));
+                if (!g.runner.isEmpty()) break;
+            }
+            if (g.runner.isEmpty()) {
+                const auto available = installedRunners(library_->root());
+                if (!available.isEmpty()) g.runner = available.first();
+            }
+        }
+        if (g.runner.isEmpty()) {
+            message("No fully installed matching Proton is available. Choose an installed runner in Manage; Play does not wait for background updates.");
+            return false;
+        }
+        if (isRunnerAlias(selector) && (!unspecified || g.runner == resolveRunnerSelector(library_->root(), selector))) g.runnerSelector = selector;
+        g.runnerRevision = runnerVersion(g.runner);
+    }
+    if (!g.runner.isEmpty() && !runnerInstallationReady(library_->root(), g.runner)) {
+        message("The selected Proton installation is missing or unverified: " + g.runner + ". Reconnect it or select another runner in Manage.");
+        return false;
+    }
     if (g.runner.isEmpty()) {
         QString chosen;
         if (!g.runnerSelector.isEmpty()) {
@@ -55,40 +81,43 @@ bool Window::prepareLaunchRuntime(Game &g) {
         if (!g.runnerSelector.isEmpty()) {
             g.runner = chosen;
         } else {
-        const auto preferred = library_->settings()["runner"].toString();
-        const auto pin = readJson(library_->dataRoot() + "/ge-proton.json")["version"].toString();
-        const auto version = pin;
-        const auto available = installedRunners(library_->root());
-        chosen = !preferred.isEmpty() && QFileInfo(QDir(preferred).filePath("proton")).isFile() ? preferred : QString();
-        if (chosen.isEmpty() && !version.isEmpty()) {
-            const auto managed = library_->dataRoot() + "/runners/" + version;
-            chosen = managed;
-            if (!QFileInfo(managed + "/proton").isFile()) {
-                message("Preparing " + version + " for first Play…");
-                geVersionToInstall = version;
+            const auto preferred = library_->settings()["runner"].toString();
+            const auto available = installedRunners(library_->root());
+            chosen = resolveRunnerSelector(library_->root(), preferred.isEmpty() ? "ge-proton-latest" : preferred);
+            if (!preferred.isEmpty() && QDir::isAbsolutePath(preferred) && chosen.isEmpty()) {
+                message("The default Proton path is unavailable: " + preferred + ". Reconnect it or change the default in Settings."); return false;
             }
-        }
-        if (chosen.isEmpty() && available.size() == 1) chosen = available.first();
-        else if (chosen.isEmpty() && available.size() > 1) {
-            QDialog choice(this); choice.setObjectName("firstPlayRunnerDialog"); choice.setWindowTitle("Choose Proton for first Play");
-            auto layout = new QVBoxLayout(&choice);
-            layout->addWidget(new QLabel("Select an installed Proton version for this game. You can change it later in Manage.", &choice));
-            auto runner = new QComboBox(&choice); runner->setObjectName("firstPlayRunner"); runner->addItems(available); layout->addWidget(runner);
-            auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &choice); layout->addWidget(buttons);
-            connect(buttons, &QDialogButtonBox::accepted, &choice, &QDialog::accept);
-            connect(buttons, &QDialogButtonBox::rejected, &choice, &QDialog::reject);
-            if (choice.exec() != QDialog::Accepted) return false;
-            chosen = runner->currentText();
-        } else if (chosen.isEmpty()) {
-            message("Preparing Proton for first Play…");
-            chosen = provisionGe(this, library_->root(), {}, true);
-        }
-        if (chosen.isEmpty()) return false;
-        g.runner = chosen;
+            if (chosen.isEmpty() && !preferred.isEmpty() && !QDir::isAbsolutePath(preferred)) {
+                if (preferred == "ge-proton-latest" || preferred.startsWith("GE-Proton")) geVersionToInstall = preferred;
+                else { message("The default Proton selector has no installed match: " + preferred); return false; }
+                chosen = preferred;
+            }
+            if (chosen.isEmpty() && available.size() == 1) chosen = available.first();
+            else if (chosen.isEmpty() && available.size() > 1) {
+                QDialog choice(this); choice.setObjectName("firstPlayRunnerDialog"); choice.setWindowTitle("Choose Proton for first Play");
+                auto layout = new QVBoxLayout(&choice);
+                layout->addWidget(new QLabel("Select an installed Proton version for this game. You can change it later in Manage.", &choice));
+                auto runner = new QComboBox(&choice); runner->setObjectName("firstPlayRunner"); runner->addItems(available); layout->addWidget(runner);
+                auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &choice); layout->addWidget(buttons);
+                connect(buttons, &QDialogButtonBox::accepted, &choice, &QDialog::accept);
+                connect(buttons, &QDialogButtonBox::rejected, &choice, &QDialog::reject);
+                if (choice.exec() != QDialog::Accepted) { message("Play preparation was cancelled."); return false; }
+                chosen = runner->currentText();
+            } else if (chosen.isEmpty()) {
+                message("Preparing Proton for first Play…");
+                geVersionToInstall = "ge-proton-latest";
+                chosen = "ge-proton-latest"; // Resolved by the first-install setup step, never by a background-update wait.
+            }
+            if (chosen.isEmpty()) return false;
+            g.runner = chosen;
+            if (isRunnerAlias(preferred)) g.runnerSelector = preferred;
+            else if (preferred.isEmpty() &&
+                     (geVersionToInstall == "ge-proton-latest" || chosen == resolveRunnerSelector(library_->root(), "ge-proton-latest")))
+                g.runnerSelector = "ge-proton-latest";
         }
     }
     const auto settingsBefore = library_->settings();
-    if (!provisionFirstPlay(this, *library_, g, geVersionToInstall)) return false;
+    if (!provisionFirstPlay(this, *library_, g, geVersionToInstall)) { message("Play preparation was cancelled. Your game and existing settings were kept."); return false; }
     if (g.runner != originalRunner || g.umuResolved != originalUmu) {
         library_->save(g); // Accept the selected runner only after the full first-Play setup succeeds.
         g = library_->game(g.id);
@@ -109,7 +138,7 @@ void Window::launch(bool prepareOnly, const QString &tool, const std::optional<E
             if (!chooseExecutable(g.id)) return;
             g = library_->game(g.id);
         }
-        if (!prepareLaunchRuntime(g)) { message("Play preparation was cancelled. Your game and existing settings were kept."); return; }
+        if (!prepareLaunchRuntime(g)) return;
         QString approvedWinetricks;
         const auto pendingComponents = pendingWinetricks(*library_, g);
         if (!pendingComponents.isEmpty()) {

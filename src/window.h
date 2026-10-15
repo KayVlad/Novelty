@@ -23,6 +23,7 @@ class QAction;
 class QProcess;
 
 namespace novelty {
+class GeUpdateManager;
 class VndbClient;
 class LanListener;
 class LanConnection;
@@ -86,6 +87,7 @@ private:
     Game selected() const;
     void queryPeerGames(const TrustedPeer &);
     std::unique_ptr<Library> library_;
+    std::unique_ptr<GeUpdateManager> geUpdates_;
     std::unique_ptr<LanListener> saveListener_;
     std::unique_ptr<LanDiscovery> peerDiscovery_;
     QSet<LanConnection *> catalogueConnections_;

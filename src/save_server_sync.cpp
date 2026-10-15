@@ -1,6 +1,7 @@
 #include "save_server_sync.h"
 #include "save_server_client.h"
 #include "save_server_state.h"
+#include "save_internal.h"
 #include "saves.h"
 #include <QtCore/qtemporarydir.h>
 #include <QtCore/qlockfile.h>
@@ -95,7 +96,8 @@ ServerSyncResult retryPendingServerSave(Library &library, const QString &gameId,
     if (!launch.tryLock()) return {ServerSyncStatus::Pending, "Game is still running."};
     if (!library.recoveryIssue(gameId).isEmpty() || !saveRestoreIssue(library, gameId).isEmpty())
         return {ServerSyncStatus::Pending, "Resolve game or save recovery before server sync."};
-    try { finishPostExitSaveSnapshot(library, library.game(gameId)); }
+    // Both locks are already held; the public post-exit helper acquires mutation.lock.
+    try { save_detail::finishPendingLocked(library, library.game(gameId)); }
     catch (const std::exception &error) {
         library.recordStatus(gameId, "Save needs attention", QString::fromUtf8(error.what()));
         return {ServerSyncStatus::Pending, QString::fromUtf8(error.what())};

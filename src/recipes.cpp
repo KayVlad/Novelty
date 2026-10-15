@@ -1,5 +1,7 @@
 #include "recipes.h"
+#include "runner_manager.h"
 #include "setup.h"
+#include "default_config.h"
 #include <QtCore/qcryptographichash.h>
 #include <QtCore/qdir.h>
 #include <QtCore/qfile.h>
@@ -104,12 +106,6 @@ bool conditionMatches(const QJsonObject &condition, const QString &base, const Q
     }
     return false;
 }
-QByteArray seed(const QString &id, const QString &name, const QJsonObject &match, const QJsonObject &settings,
-                const QString &parent = {}) {
-    QJsonObject object{{"schema", 1}, {"id", id}, {"name", name}, {"match", match}, {"settings", settings}};
-    if (!parent.isEmpty()) object["inherits"] = parent;
-    return QJsonDocument(object).toJson(QJsonDocument::Indented);
-}
 void writeNew(const QString &path, const QByteArray &bytes) {
     QFile file(path);
     if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly) || file.write(bytes) != bytes.size())
@@ -148,24 +144,10 @@ void ensureRecipeCatalog(const QString &libraryRoot) {
         writeNew(runtimeMap, QJsonDocument(QJsonObject{{"1391110", "steamrt2"}, {"1628350", "steamrt3"},
             {"4183110", "steamrt4"}, {"4185400", "steamrt4-arm64"}}).toJson(QJsonDocument::Indented));
     if (QFileInfo::exists(marker)) return;
-    const QJsonArray ignored{"unins*", "*uninstall*", "setup.exe", "install.exe",
-        "python*.exe", "zsync*.exe", "crashreporter.exe", "*/lib/*", "*/ost/*", "*/soundtrack/*"};
-    const struct { const char *tier, *id, *name; QJsonObject match, settings; const char *parent, *category; } builtins[] = {
-        {"general", "general-game", "Game", {},
-            {{"backend", "umu"}, {"locale", "system"},
-             {"environment", QJsonObject{}}, {"winetricks", QJsonArray{}}, {"save_candidates", QJsonArray{}},
-             {"ignore_executables", ignored}}, "", "game"},
-        {"general", "general-vn", "Visual Novel", {},
-            {{"locale", "ja_JP.UTF-8"}, {"environment", QJsonObject{{"TZ", "Asia/Tokyo"}}}},
-            "general-game", "visual_novel"}
-    };
-    for (const auto &entry : builtins) {
-        const auto path = recipePath(libraryRoot, entry.tier, entry.id);
-        if (!QFileInfo::exists(path)) {
-            auto object = QJsonDocument::fromJson(seed(entry.id, entry.name, entry.match, entry.settings, entry.parent)).object();
-            if (*entry.category) object["category"] = entry.category;
-            writeNew(path, QJsonDocument(object).toJson(QJsonDocument::Indented));
-        }
+    for (const auto *json : {defaults::game, defaults::vn}) {
+        const auto object = QJsonDocument::fromJson(json).object();
+        const auto path = recipePath(libraryRoot, "general", object["id"].toString());
+        if (!QFileInfo::exists(path)) writeNew(path, QJsonDocument(object).toJson(QJsonDocument::Indented));
     }
     writeNew(marker, "Recipe catalog initialized. User edits are preserved.\n");
 }
@@ -236,10 +218,10 @@ Recipe parseRecipe(const QByteArray &json, const QString &path, const QString &t
             fail("Invalid recipe match path: " + path);
     }
     const QSet<QString> allowedSettings{"engine", "executable", "working_directory", "runner", "umu_launcher", "umu_game_id",
-        "store", "backend", "ignore_executables", "saves", "save_candidates", "arguments", "environment", "locale", "winetricks"};
+        "store", "steam_id", "backend", "ignore_executables", "saves", "save_candidates", "arguments", "environment", "locale", "winetricks"};
     for (auto it = settings.begin(); it != settings.end(); ++it)
         if (!allowedSettings.contains(it.key())) fail("Unknown recipe setting: " + it.key());
-    for (const auto &key : {"engine", "executable", "working_directory", "runner", "umu_launcher", "umu_game_id", "store", "backend", "locale"})
+    for (const auto &key : {"engine", "executable", "working_directory", "runner", "umu_launcher", "umu_game_id", "store", "steam_id", "backend", "locale"})
         if (settings.contains(key) && !settings[key].isString()) fail("Invalid recipe setting: " + path);
     if (settings.contains("umu_launcher") && !settings["umu_launcher"].toString().isEmpty() &&
         !QRegularExpression("^umu-(latest|[0-9]+(?:[.][0-9]+)*)$").match(settings["umu_launcher"].toString()).hasMatch())
@@ -268,6 +250,9 @@ Recipe parseRecipe(const QByteArray &json, const QString &path, const QString &t
         fail("A recipe runner must be a version or supported alias: " + path);
     if (settings.contains("backend") && !QStringList{"umu", "native", "steam"}.contains(settings["backend"].toString()))
         fail("Invalid recipe backend: " + path);
+    if (settings.contains("steam_id") && !settings["steam_id"].toString().isEmpty() &&
+        !QRegularExpression("^[0-9]+$").match(settings["steam_id"].toString()).hasMatch())
+        fail("A Steam launch ID must contain only digits: " + path);
     if (settings.contains("winetricks")) {
         if (!settings["winetricks"].isArray()) fail("Winetricks must be an array: " + path);
         QStringList verbs;
@@ -458,20 +443,26 @@ QStringList recipeExecutables(const Recipe &recipe, const QString &gameFolder, c
     return windows.isEmpty() ? native : windows;
 }
 void applyRecipeToGame(Game &game, const Recipe &recipe) {
-    const auto &settings = recipe.settings;
+    // Missing fields have neutral defaults from the bundled base recipe. Always
+    // assign them so applying a different recipe cannot retain old launch values.
+    auto settings = QJsonDocument::fromJson(defaults::game).object()["settings"].toObject();
+    for (auto it = recipe.settings.begin(); it != recipe.settings.end(); ++it) settings[it.key()] = it.value();
     game.recipeId = recipe.id; game.recipeRevision = QString::fromLatin1(recipe.revision);
     game.recipeOverrides = {};
     game.recipeCandidates.clear(); game.category = recipe.category;
-    game.engine = settings["engine"].toString("Generic");
+    game.engine = settings["engine"].toString();
     game.evidence = "Recipe: " + recipe.name;
-    game.backend = settings["backend"].toString("umu");
+    game.backend = settings["backend"].toString();
     game.runnerSelector = settings["runner"].toString();
+    if (!game.runnerSelector.isEmpty()) { game.runner.clear(); game.runnerRevision.clear(); }
     game.umuLauncher = settings["umu_launcher"].toString();
     game.umuResolved = game.umuLauncher.isEmpty() ? QString() :
         resolveUmuSelector(QFileInfo(game.folder).absolutePath(), game.umuLauncher);
     game.umuGameId = settings["umu_game_id"].toString();
     game.store = settings["store"].toString();
-    game.recipeSaves = settings.contains("save_candidates") ? settings["save_candidates"].toArray() : settings["saves"].toArray();
+    game.steamId = settings["steam_id"].toString();
+    game.recipeSaves = recipe.settings.contains("saves") && !recipe.settings.contains("save_candidates") ?
+        recipe.settings["saves"].toArray() : settings["save_candidates"].toArray();
     game.winetricks.clear();
     for (const auto &value : settings["winetricks"].toArray()) game.winetricks.append(value.toString());
     if (settings.contains("locale")) game.locale = settings["locale"] == "system" ? QString() : settings["locale"].toString();
@@ -493,6 +484,8 @@ void applyRecipeToGame(Game &game, const Recipe &recipe) {
 }
 QJsonObject recipeSettingsSnapshot(const Game &game) {
     QJsonObject settings{{"backend", game.backend}, {"engine", game.engine},
+                         {"umu_launcher", game.umuLauncher}, {"umu_game_id", game.umuGameId},
+                         {"store", game.store}, {"steam_id", game.steamId},
                          {"locale", game.locale.isEmpty() ? "system" : game.locale},
                          {"arguments", QJsonArray::fromStringList(game.arguments)},
                          {"winetricks", QJsonArray::fromStringList(game.winetricks)},
@@ -515,6 +508,10 @@ QJsonObject recipeSettingsSnapshot(const Game &game) {
 }
 QJsonObject portableGameSettings(const Game &game, QStringList *omissions) {
     auto settings = recipeSettingsSnapshot(game);
+    if (QDir::isAbsolutePath(settings["umu_launcher"].toString())) {
+        settings.remove("umu_launcher");
+        if (omissions) omissions->append("custom umu launcher path was omitted");
+    }
     QJsonObject environment;
     static const QRegularExpression secretName(
         "(?:TOKEN|PASSWORD|PASSWD|SECRET|CREDENTIAL|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|COOKIE|"
@@ -546,7 +543,7 @@ QJsonObject portableGameSettings(const Game &game, QStringList *omissions) {
     };
     relative(game.executable, "executable");
     relative(game.workingDirectory, "working_directory");
-    // Host-specific umu paths, Steam IDs and save mappings are intentionally absent.
+    // Host-specific tool paths and confirmed save mappings stay local.
     return settings;
 }
 QJsonObject gameRecipeDocument(const Game &game, const QString &id, const QString &libraryRoot,
@@ -554,7 +551,9 @@ QJsonObject gameRecipeDocument(const Game &game, const QString &id, const QStrin
     if (!validId(id)) fail("Choose a recipe ID using lowercase letters, digits, dots, dashes or underscores.");
     auto settings = portableGameSettings(game, omissions);
     const auto runnerOverride = game.recipeOverrides["runner"].toString();
-    if (!runnerOverride.isEmpty() || (game.recipeBase.isEmpty() && !game.runner.isEmpty())) {
+    if (isRunnerAlias(runnerOverride) || (!runnerOverride.isEmpty() && game.runnerSelector == runnerOverride))
+        settings["runner"] = runnerOverride;
+    else if (!runnerOverride.isEmpty() || (game.recipeBase.isEmpty() && !game.runner.isEmpty())) {
         const auto selected = runnerOverride.isEmpty() ? game.runner : runnerOverride;
         const auto name = QFileInfo(selected).fileName();
         if (resolveRunnerSelector(libraryRoot, name) == canonicalPath(selected)) settings["runner"] = name;
@@ -564,6 +563,14 @@ QJsonObject gameRecipeDocument(const Game &game, const QString &id, const QStrin
         }
     }
     QJsonObject document{{"schema", 1}, {"id", id}, {"name", game.name}, {"category", game.category}};
+    if (parent && parent->id == id) {
+        // Explicitly replacing the source recipe exports a complete snapshot,
+        // retaining its matching rules without creating self-inheritance.
+        document["match"] = parent->match;
+        if (!parent->metadata.isEmpty()) document["metadata"] = parent->metadata;
+        if (!parent->evidence.isEmpty()) document["evidence"] = parent->evidence;
+        parent = nullptr;
+    }
     if (parent) {
         bool canInherit = true;
         const auto inheritedEnvironment = parent->settings["environment"].toObject();
@@ -650,7 +657,7 @@ QJsonObject applyLibraryPreset(const QJsonObject &current, const QJsonObject &do
     if (settings.contains("default_runner")) {
         const auto runner = resolveRunnerSelector(libraryRoot, settings["default_runner"].toString());
         if (runner.isEmpty()) fail("Library preset runner is not installed: " + settings["default_runner"].toString());
-        result["runner"] = runner;
+        result["runner"] = isRunnerAlias(settings["default_runner"].toString()) ? settings["default_runner"] : QJsonValue(runner);
     }
     return result;
 }
@@ -696,7 +703,7 @@ void removeRecipe(const QString &libraryRoot, const QString &tier, const QString
 QString resolveRunnerSelector(const QString &libraryRoot, const QString &selector) {
     if (selector.isEmpty()) return {};
     if (QDir::isAbsolutePath(selector))
-        return QFileInfo(QDir(selector).filePath("proton")).isFile() ? canonicalPath(selector) : QString();
+        return runnerInstallationReady(libraryRoot, selector) ? canonicalPath(selector) : QString();
     const auto runners = installedRunners(libraryRoot);
     QString winner; QList<int> best;
     for (const auto &runner : runners) {

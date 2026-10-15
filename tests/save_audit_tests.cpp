@@ -1,5 +1,6 @@
 #include "core.h"
 #include "saves.h"
+#include "lan_games.h"
 #include <QtCore/qcoreapplication.h>
 #include <QtCore/qdir.h>
 #include <QtCore/qfile.h>
@@ -7,6 +8,7 @@
 #include <QtCore/qtemporarydir.h>
 #include <QtCore/qelapsedtimer.h>
 #include <functional>
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 #include <sys/resource.h>
@@ -44,6 +46,31 @@ struct Fixture {
         return QFileInfo(library.gamePath(game.id, "saves.json")).absolutePath() + "/snapshots/" + id;
     }
 };
+void candidateAuthority() {
+    Fixture f;
+    setSaveDiscoveryState(f.library, f.game.id, "searching");
+    auto game = f.library.game(f.game.id);
+    game.recipeSaves = QJsonArray{QJsonObject{{"scope", "game"}, {"path", "assets"}}};
+    f.library.save(game);
+    touch(game.folder + "/assets/data.bin", "game assets");
+    beginSaveObservation(f.library, game);
+    const auto config = loadSaveConfig(f.library, game.id);
+    require(config.mappings.isEmpty() && config.candidates.size() == 1 &&
+            saveDiscoveryCandidates(f.library, game.id).first().path == "assets",
+            "ordinary recipe paths remain unconfirmed candidates");
+    rejects([&] { createSaveSnapshot(f.library, game.id); });
+    const auto manifest = previewLanGameManifest(f.library, game.id).first;
+    require(std::any_of(manifest.begin(), manifest.end(), [](const auto &entry) {
+        return entry.path == "assets/data.bin";
+    }) && unresolvedGameSaveLocations(f.library, game.id).contains("assets"),
+            "candidate assets are retained in the manifest and require a choice before transfer");
+    auto confirmed = config; confirmed.mappings = {{"game", "assets"}};
+    saveSaveConfig(f.library, game.id, confirmed);
+    createSaveSnapshot(f.library, game.id);
+    require(loadSaveConfig(f.library, game.id).discoverySource == "manual" &&
+            listSaveSnapshots(f.library, game.id).size() == 1,
+            "explicit confirmation authorizes snapshot creation");
+}
 void mappingChanges() {
     Fixture source, target;
     touch(source.game.folder + "/save/slot.dat", "old mapping");
@@ -123,8 +150,11 @@ void boundedBackup() {
     huge.close();
     setSaveDiscoveryState(f.library, f.game.id, "searching");
     beginSaveObservation(f.library, f.game);
-    require(loadSaveConfig(f.library, f.game.id).discoverySource == "heuristic",
-            "conventional folder discovery can select an asset-sized directory");
+    auto suggested = loadSaveConfig(f.library, f.game.id);
+    require(suggested.mappings.isEmpty() && suggested.candidates.size() == 1,
+            "a conventional asset directory remains an unconfirmed candidate");
+    suggested.mappings = {{"game", "save"}};
+    saveSaveConfig(f.library, f.game.id, suggested);
     QElapsedTimer elapsed; elapsed.start();
     rejects([&] { createSaveSnapshot(f.library, f.game.id); });
     require(elapsed.elapsed() < 2000 && listSaveSnapshots(f.library, f.game.id).isEmpty(),
@@ -403,7 +433,8 @@ int main(int argc, char **argv) {
     QCoreApplication application(argc, argv);
     int failures = 0;
     for (const auto &[name, test] : std::initializer_list<std::pair<const char *, std::function<void()>>>{
-             {"mapping changes", mappingChanges}, {"unapplied imports", unappliedImport}, {"failed relink", failedRelink},
+             {"candidate authority", candidateAuthority}, {"mapping changes", mappingChanges},
+             {"unapplied imports", unappliedImport}, {"failed relink", failedRelink},
              {"settings recovery", settingsRecovery}, {"restore recovery copy failure", recoveryCopyFailure},
              {"restore recovery cleanup failure", recoveryCleanupFailure},
              {"committed restore cleanup", committedRestoreCleanup},

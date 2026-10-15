@@ -1,4 +1,5 @@
 #pragma once
+#include "proton_manager.h"
 #include "window.h"
 #include "app_settings.h"
 #include "provisioning.h"

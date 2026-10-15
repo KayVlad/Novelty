@@ -119,7 +119,7 @@ with tempfile.TemporaryDirectory(prefix='novelty-removal-tests-') as temporary:
                   cwd=str(other), runner=str(runner), backend='umu')
     with sqlite3.connect(dbpath) as db:
         db.execute('insert into games values(?,?,?)', (other_id, str(other), json.dumps(config)))
-        db.execute('insert into settings values(?,?)', ('app', json.dumps({'umu': '/bin/true'})))
+    (root / '.novelty/settings.json').write_text(json.dumps(dict(schema=1, umu='/bin/true')))
     for directory in (root / 'Game', prefix, root / '.novelty/installations' / ident):
         patch = directory / 'patch.exe'; patch.touch()
         result = subprocess.run([binary, '--root', root, '--run', other_id, '--extra-exe=' + str(patch)], env=env, capture_output=True, timeout=3)

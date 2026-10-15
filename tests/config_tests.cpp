@@ -1,6 +1,8 @@
 #include "core.h"
 #include "recipes.h"
 #include "runner_manager.h"
+#include "runner_fixture.h"
+#include "app_settings.h"
 #include <QtCore/qcoreapplication.h>
 #include <QtCore/qdir.h>
 #include <QtCore/qfile.h>
@@ -24,16 +26,121 @@ void file(const QString &path, const QByteArray &bytes = {}) {
     QDir().mkpath(QFileInfo(path).absolutePath()); QFile output(path);
     check(output.open(QIODevice::WriteOnly), "fixture file open"); output.write(bytes);
 }
+void settingsFiles(const QString &base) {
+    const auto initial = loadAppSettings();
+    check(initial == defaultAppSettings() && readJson(appSettingsPath()) == initial,
+          "fresh app settings are populated from the bundled JSON");
+    auto edited = initial; edited["libraryView"] = "list"; edited["autoGeUpdates"] = false;
+    writeJson(appSettingsPath(), edited);
+    check(loadAppSettings()["libraryView"] == "list" && !loadAppSettings()["autoGeUpdates"].toBool(),
+          "direct JSON edits control application preferences");
+    setAppSetting("gamesRoot", base);
+    check(readJson(appSettingsPath())["gamesRoot"] == base && readJson(appSettingsPath())["libraryView"] == "list",
+          "UI setting writes update the same JSON and retain other preferences");
+    rejects([&] { setAppSetting("autoGeUpdates", "false"); });
+    rejects([&] { setAppSetting("unsupported", true); });
+    check(!readJson(appSettingsPath())["autoGeUpdates"].toBool(), "rejected settings do not overwrite valid JSON");
+    const auto valid = readJson(appSettingsPath());
+    file(appSettingsPath(), "{broken JSON");
+    rejects([&] { loadAppSettings(); });
+    QFile broken(appSettingsPath()); check(broken.open(QIODevice::ReadOnly) && broken.readAll() == "{broken JSON",
+                                         "invalid user configuration remains available for correction"); broken.close();
+    writeJson(appSettingsPath(), valid);
+    const auto firstRoot = base + "/Configured library", secondRoot = base + "/Independent library";
+    QDir().mkpath(firstRoot); QDir().mkpath(secondRoot);
+    Library first(firstRoot), second(secondRoot);
+    auto libraryConfig = readJson(first.dataRoot() + "/settings.json");
+    check(libraryConfig == defaultLibrarySettings(), "each library gets its own opinionated settings JSON");
+    libraryConfig["default_recipe"] = "general-vn"; libraryConfig["runner"] = "ge-proton-latest";
+    writeJson(first.dataRoot() + "/settings.json", libraryConfig);
+    check(first.settings()["default_recipe"] == "general-vn" && first.settings()["runner"] == "ge-proton-latest" &&
+          second.settings()["default_recipe"] == "general-game", "file edits are authoritative and library configurations are independent");
+    auto settings = first.settings(); settings["umu"] = "/custom/umu-run"; first.setSettings(settings);
+    check(readJson(first.dataRoot() + "/settings.json")["umu"] == "/custom/umu-run", "library Settings writes the authoritative JSON");
+    Library reopened(firstRoot);
+    check(reopened.settings() == first.settings(), "library preferences survive reopening");
+    file(first.dataRoot() + "/settings.json", "{broken JSON");
+    rejects([&] { first.settings(); });
+    writeJson(first.dataRoot() + "/settings.json", libraryConfig);
+    setLocalSetting("externalProtonPaths", QJsonArray{base + "/external"});
+    check(!loadAppSettings().contains("externalProtonPaths") &&
+          loadLocalSettings()["externalProtonPaths"].toArray().size() == 1, "external registrations have separate machine-local storage");
+    setLocalSetting("externalProtonPaths", QJsonArray{});
+}
 QByteArray recipe(const QString &id, const QJsonObject &extra, const QJsonObject &settings = {}) {
     auto result = QJsonObject{{"schema", 1}, {"id", id}, {"name", id}, {"settings", settings}};
     for (auto it = extra.begin(); it != extra.end(); ++it) result[it.key()] = it.value();
     return QJsonDocument(result).toJson();
 }
+void recipeContract(const QString &base) {
+    const auto root = base + "/Recipe contract", folder = root + "/Game";
+    file(folder + "/game.exe"); Library library(root);
+    const auto older = library.dataRoot() + "/runners/GE-Proton96-1", newer = library.dataRoot() + "/runners/GE-Proton96-2";
+    managedRunnerFixture(older); managedRunnerFixture(newer);
+    library.setSettings({{"runner", newer}});
+    auto bytes = recipe("configured-game", {{"inherits", "general-game"},
+        {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"file", "game.exe"}}}}}}},
+        {{"runner", "GE-Proton96-1"}, {"locale", "ja_JP.UTF-8"}, {"arguments", QJsonArray{"recipe argument"}},
+         {"environment", QJsonObject{{"RECIPE", "original"}}}, {"umu_launcher", "umu-latest"},
+         {"umu_game_id", "umu-recipe"}, {"store", "gog"}, {"steam_id", "123"}});
+    saveRecipe(root, "games", bytes);
+    library.import({inspect(folder, root)}, newer);
+    auto game = library.games().first();
+    check(game.runnerSelector == "GE-Proton96-1" && game.runner.isEmpty() && game.umuLauncher == "umu-latest" &&
+          game.umuGameId == "umu-recipe" && game.store == "gog" && game.steamId == "123", "recipe defines launch configuration ahead of library defaults");
+    game.locale = "en_US.UTF-8"; game.arguments = {"manual argument"}; game.environment = {{"MANUAL", "yes"}};
+    game.umuGameId = "umu-custom"; game.store = "itchio"; game.steamId = "456"; game.umuLauncher.clear();
+    game.selectRunner("ge-proton-latest"); library.save(game);
+    QFile original(recipePath(root, "games", "configured-game"));
+    check(original.open(QIODevice::ReadOnly) && original.readAll() == bytes, "Manage overrides leave the source recipe byte-for-byte intact"); original.close();
+    game = library.game(game.id);
+    for (const auto &key : {"locale", "arguments", "environment", "runner", "umu_launcher", "umu_game_id", "store", "steam_id"})
+        check(game.recipeOverrides.contains(key), "all changed launch settings have saved overrides");
+    auto document = QJsonDocument::fromJson(bytes).object(); auto settings = document["settings"].toObject();
+    settings["locale"] = "fr_FR.UTF-8"; settings["umu_game_id"] = "umu-updated"; document["settings"] = settings;
+    saveRecipe(root, "games", QJsonDocument(document).toJson());
+    library.applyRecipe(game.id, "configured-game"); game = library.game(game.id);
+    check(game.locale == "en_US.UTF-8" && game.arguments == QStringList{"manual argument"} &&
+          game.environment == QMap<QString, QString>{{"MANUAL", "yes"}} && game.umuLauncher.isEmpty() &&
+          game.umuGameId == "umu-custom" && game.store == "itchio" && game.steamId == "456" && game.runner == newer,
+          "reapplying an edited recipe preserves explicit overrides including cleared values");
+    Recipe parent;
+    for (const auto &entry : loadRecipes(root)) if (entry.id == "configured-game") parent = entry;
+    const auto exported = gameRecipeDocument(game, parent.id, root, &parent);
+    check(!exported.contains("inherits") && exported["match"] == parent.match &&
+          exported["settings"].toObject()["umu_game_id"] == "umu-custom", "export can explicitly replace the source with complete settings and its matching rules");
+    saveRecipe(root, "games", QJsonDocument(exported).toJson());
+    Game fresh; fresh.folder = folder;
+    for (const auto &entry : loadRecipes(root)) if (entry.id == parent.id) applyRecipeToGame(fresh, entry);
+    check(fresh.locale == game.locale && fresh.store == game.store && fresh.umuGameId == game.umuGameId &&
+          fresh.steamId == game.steamId && fresh.arguments == game.arguments && fresh.environment == game.environment,
+          "exported effective configuration recreates the customized launch settings");
+    // Resolving a library default is not a user override, even after editing another field.
+    const auto delegatedRoot = base + "/Delegated runner", delegatedFolder = delegatedRoot + "/Game";
+    file(delegatedFolder + "/game.exe"); Library delegated(delegatedRoot);
+    managedRunnerFixture(delegated.dataRoot() + "/runners/GE-Proton96-1");
+    delegated.setSettings({{"runner", "ge-proton-latest"}});
+    delegated.import({inspect(delegatedFolder, delegatedRoot)}, "ge-proton-latest");
+    auto inherited = delegated.games().first(); inherited.locale = "en_US.UTF-8"; delegated.save(inherited);
+    check(!delegated.game(inherited.id).recipeOverrides.contains("runner"), "resolved library runner does not become a per-game override on Save");
+    saveRecipe(delegatedRoot, "games", recipe("exact-runner", {{"inherits", "general-game"}}, {{"runner", "GE-Proton96-1"}}));
+    delegated.applyRecipe(inherited.id, "exact-runner");
+    check(delegated.game(inherited.id).runnerSelector == "GE-Proton96-1" && delegated.game(inherited.id).locale == "en_US.UTF-8",
+          "a later recipe runner takes effect while an unrelated explicit override survives");
+    // A standalone recipe must not accidentally retain fields from a previously applied recipe.
+    applyRecipeToGame(fresh, parseRecipe(recipe("neutral", {}, {}), {}, "games"));
+    check(fresh.locale.isEmpty() && fresh.arguments.isEmpty() && fresh.environment.isEmpty() &&
+          fresh.umuGameId.isEmpty() && fresh.store.isEmpty() && fresh.steamId.isEmpty(), "recipe application assigns neutral values for omitted launch fields");
+}
+
 }
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     try {
         QTemporaryDir temporary; check(temporary.isValid(), "temporary library");
+        qputenv("NOVELTY_TEST_APP_DATA_DIR", QFile::encodeName(temporary.path() + "/app"));
+        settingsFiles(temporary.path());
+        recipeContract(temporary.path());
         const auto root = temporary.path(), folder = root + "/Story";
         file(root + "/.novelty/recipes/default/legacy.json", recipe("legacy", {{"category", "game"}}));
         file(folder + "/Story.exe", "game");
@@ -47,11 +154,11 @@ int main(int argc, char **argv) {
         for (const auto &entry : general) {
             if (entry.id == "general-game")
                 check(entry.name == "Game" && entry.settings["backend"] == "umu" &&
-                      !entry.settings.contains("runner") && entry.settings["locale"] == "system",
+                      entry.settings["runner"] == "" && entry.settings["locale"] == "system",
                       "game general preset uses the supplied defaults");
             if (entry.id == "general-vn")
                 check(entry.name == "Visual Novel" && entry.inherits == "general-game" &&
-                      !entry.settings.contains("runner") && entry.settings["locale"] == "ja_JP.UTF-8" &&
+                      entry.settings["runner"] == "" && entry.settings["locale"] == "ja_JP.UTF-8" &&
                       entry.settings["environment"].toObject()["TZ"] == "Asia/Tokyo",
                       "visual novel general preset inherits the game defaults and sets locale and time zone");
         }
@@ -173,7 +280,8 @@ int main(int argc, char **argv) {
             {{"script", "touch /tmp/evil"}})); });
         const auto catalog = parseGeCatalog(QJsonDocument(QJsonArray{
             QJsonObject{{"tag_name", "GE-Proton11-7"}, {"published_at", "2026-01-01T00:00:00Z"},
-                        {"assets", QJsonArray{QJsonObject{{"name", "GE-Proton11-7.tar.gz"}, {"size", 1234}}}}},
+                        {"assets", QJsonArray{QJsonObject{{"name", "GE-Proton11-7.tar.gz"}, {"size", 1234}},
+                                              QJsonObject{{"name", "GE-Proton11-7.sha512sum"}}}}},
             QJsonObject{{"tag_name", "bad"}}}).toJson());
         check(catalog.size() == 1 && catalog.first().version == "GE-Proton11-7", "official catalog parse filters unsupported tags");
         check(!fetchGeCatalog(root, QUrl("file:///nonexistent-catalog"), 100).error.isEmpty(), "unavailable catalog is visible");
@@ -217,7 +325,7 @@ int main(int argc, char **argv) {
             const auto root = provenance.path(), gameFolder = root + "/Runner Story";
             file(gameFolder + "/Story.exe", "game");
             const auto a = QString("GE-Proton90-1"), b = QString("GE-Proton90-2"), c = QString("GE-Proton90-3");
-            for (const auto &version : {a, b, c}) file(root + "/.novelty/runners/" + version + "/proton");
+            for (const auto &version : {a, b, c}) managedRunnerFixture(root + "/.novelty/runners/" + version);
             QString id;
             {
                 Library runners(root);

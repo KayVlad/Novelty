@@ -23,7 +23,7 @@ void configurePortableSettings() {
     QSettings legacy; legacy.setFallbacksEnabled(false);
     const auto legacyFile = legacy.fileName();
     const auto legacyKeys = legacy.allKeys();
-    const auto appData = QCoreApplication::applicationDirPath() + "/data";
+    const auto appData = novelty::appDataDirectory();
     if (QFileInfo(appData).isSymbolicLink() || !QDir().mkpath(appData))
         throw std::runtime_error("Novelty needs a writable data folder beside its executable.");
     for (const auto &name : {"cache", "tmp"}) {

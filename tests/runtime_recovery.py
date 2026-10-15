@@ -82,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix='novelty-process-tests-') as temporary:
                           cwd=str(game), runner=str(runner), runner_revision='fixture', backend='umu')
             with sqlite3.connect(root / '.novelty/library.sqlite') as db:
                 db.execute('insert into games values(?,?,?)', (ident, str(game), json.dumps(config)))
-                db.execute('insert into settings values(?,?)', ('app', json.dumps({'umu': str(fake)})))
+            (root / '.novelty/settings.json').write_text(json.dumps(dict(schema=1, umu=str(fake))))
             prefix = root / '.novelty/prefixes' / ident
             prefix.mkdir(parents=True)
             (prefix / 'save.dat').write_bytes(b'existing save')
@@ -121,13 +121,19 @@ with tempfile.TemporaryDirectory(prefix='novelty-process-tests-') as temporary:
         assert not (state / 'runtime.json').exists(), 'normal completion kept crash barrier'
         assert read(state / 'setup.json')['state'] == 'complete'
 
-        # The ordinary headless --run path must discover and snapshot a save made by the game.
+        # Headless Play suggests paths; only confirmed mappings authorize snapshots.
         save_root, save_id, save_prefix, save_state = fixture('Headless after-exit saves')
         assert command(save_root, '--prepare', save_id).returncode == 0
         (save_prefix / 'write-game-save').touch()
         assert command(save_root, '--run', save_id).returncode == 0
         save_config = read(save_state / 'saves.json')
-        assert save_config['mappings'] == [{'scope': 'game', 'path': 'UserData'}], 'headless Play did not discover UserData'
+        assert save_config['mappings'] == [], 'headless Play confirmed a heuristic without consent'
+        assert save_config['candidates'] == [{'scope': 'game', 'path': 'UserData'}]
+        assert not (save_state / 'save-head.json').exists(), 'unconfirmed saves were captured'
+        save_config.update(mappings=[{'scope': 'game', 'path': 'UserData'}],
+                           discovery_state='identified', discovery_source='manual', candidates=[])
+        (save_state / 'saves.json').write_text(json.dumps(save_config))
+        assert command(save_root, '--run', save_id).returncode == 0
         save_head = read(save_state / 'save-head.json')['snapshot_id']
         save_manifest = read(save_state / 'snapshots' / save_head / 'manifest.json')
         assert save_manifest['files'] == 1 and save_manifest['items'][0]['path'] == 'UserData', 'headless Play did not capture its save'

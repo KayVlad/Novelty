@@ -1,5 +1,6 @@
 #include "provisioning.h"
 #include "recipes.h"
+#include "runner_manager.h"
 #include "core.h"
 #include <QtCore/qcoreapplication.h>
 #include <QtCore/qdir.h>
@@ -311,9 +312,11 @@ bool provisionFirstPlay(QWidget *parent, Library &library, Game &game, const QSt
     }
     const auto data = library.dataRoot();
     const bool latestGe = geVersion == "ge-proton-latest";
+    const auto installedGe = geVersion.isEmpty() ? QString() : resolveRunnerSelector(library.root(), geVersion);
+    if (!installedGe.isEmpty()) { game.runner = installedGe; game.runnerRevision = runnerVersion(installedGe); }
     const auto gePath = geVersion.isEmpty() || latestGe ? QString() : data + "/runners/" + geVersion;
-    const bool needGe = latestGe || (!geVersion.isEmpty() && !QFileInfo(gePath + "/proton").isFile());
-    const auto selectedUmu = game.umuLauncher.isEmpty() ? library.settings()["umu"].toString("umu-run") :
+    const bool needGe = !geVersion.isEmpty() && installedGe.isEmpty();
+    const auto selectedUmu = game.umuLauncher.isEmpty() ? library.settings()["umu"].toString() :
                              game.umuResolved;
     const bool needUmu = game.umuLauncher.isEmpty() ?
         selectedUmu == "umu-run" && resolveProgram(selectedUmu).isEmpty() &&
@@ -417,7 +420,7 @@ bool provisionFirstPlay(QWidget *parent, Library &library, Game &game, const QSt
                     const auto installed = QString::fromUtf8(output).trimmed();
                     complete = complete && (latestGe ?
                         installed.startsWith(data + "/runners/GE-Proton") : installed == gePath) &&
-                        QFileInfo(installed + "/proton").isFile();
+                        runnerInstallationReady(library.root(), installed);
                     if (complete) game.runner = installed;
                 } else if (current == Step::Umu) {
                     const auto installed = QString::fromUtf8(output).trimmed();

@@ -2,6 +2,9 @@
 
 namespace novelty {
 void Window::settings() {
+    QJsonObject currentSettings;
+    try { currentSettings = library_ ? library_->settings() : defaultLibrarySettings(); }
+    catch (const std::exception &error) { message(QString::fromUtf8(error.what())); return; }
     QDialog dialog(this); dialog.setObjectName("settingsDialog"); dialog.setWindowTitle("Settings"); dialog.resize(750, 520);
     auto layout = new QVBoxLayout(&dialog);
     auto scroll = new QScrollArea(&dialog); scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame);
@@ -10,18 +13,18 @@ void Window::settings() {
     auto form = new QFormLayout;
     auto folderField = new QLineEdit(rootPath_, &dialog); folderField->setObjectName("settingsGamesFolder");
     form->addRow("Games folder", pathField(folderField, &dialog, true, "Choose your main Games folder"));
-    auto s = library_ ? library_->settings() : QJsonObject(); auto backend = backendBox(&dialog, s["backend"].toString("umu"), false);
+    auto s = currentSettings; auto backend = backendBox(&dialog, s["backend"].toString(), false);
     auto runner = runnerBox(&dialog, s["runner"].toString(), library_ ? library_->root() : QString());
     runner->setObjectName("settingsRunner");
-    auto umu = new QLineEdit(s["umu"].toString("umu-run"), &dialog);
-    auto steam = new QLineEdit(s["steam"].toString("steam"), &dialog);
-    form->addRow("Default backend", backend); form->addRow("Default Proton directory", runner);
+    auto umu = new QLineEdit(s["umu"].toString(), &dialog);
+    auto steam = new QLineEdit(s["steam"].toString(), &dialog);
+    form->addRow("Fallback backend", backend); form->addRow("Default Proton directory", runner);
     auto defaultRecipe = new QComboBox(&dialog); defaultRecipe->setObjectName("defaultRecipe");
     if (library_) try {
         for (const auto &recipe : loadRecipes(library_->root())) if (recipe.tier == "general")
             defaultRecipe->addItem(recipe.name, recipe.id);
     } catch (const std::exception &e) { message(QString::fromUtf8(e.what())); }
-    const auto savedDefault = s["default_recipe"].toString("general-game");
+    const auto savedDefault = s["default_recipe"].toString();
     defaultRecipe->setCurrentIndex(defaultRecipe->findData(savedDefault));
     form->addRow("Default recipe", defaultRecipe);
     auto presetActions = new QHBoxLayout;
@@ -81,86 +84,11 @@ void Window::settings() {
     form->addRow(protonManager);
     connect(protonManager, &QPushButton::clicked, &dialog, [&, this] {
         if (!library_) { QMessageBox::warning(&dialog, "Proton Manager", "Choose a Games folder first."); return; }
-        QDialog manager(&dialog); manager.setObjectName("protonManagerDialog");
-        manager.setWindowTitle("Proton Manager"); manager.resize(660, 430);
-        auto managerLayout = new QVBoxLayout(&manager);
-        auto installed = new QListWidget(&manager); installed->setObjectName("managedGeList");
-        auto available = new QListWidget(&manager); available->setObjectName("availableGeList");
-        managerLayout->addWidget(new QLabel("Installed managed GE-Proton builds", &manager)); managerLayout->addWidget(installed);
-        managerLayout->addWidget(new QLabel("Official available builds (refresh to fetch)", &manager)); managerLayout->addWidget(available);
-        auto status = new QLabel(&manager); status->setObjectName("protonManagerStatus");
-        status->setWordWrap(true); status->setTextFormat(Qt::PlainText); managerLayout->addWidget(status);
-        auto row = new QHBoxLayout; managerLayout->addLayout(row);
-        auto refresh = new QPushButton("Refresh catalog", &manager);
-        auto install = new QPushButton("Install selected / exact…", &manager);
-        install->setObjectName("installManagedGe");
-        auto pin = new QPushButton("Use selected as default", &manager);
-        auto remove = new QPushButton("Remove selected…", &manager);
-        remove->setObjectName("removeManagedGe");
-        row->addWidget(refresh); row->addWidget(install); row->addWidget(pin); row->addWidget(remove);
-        auto close = new QPushButton("Close", &manager); managerLayout->addWidget(close, 0, Qt::AlignRight);
-        connect(close, &QPushButton::clicked, &manager, &QDialog::accept);
-        const auto reloadInstalled = [&] {
-            installed->clear();
-            for (const auto &entry : managedGeRunners(*library_)) {
-                auto item = new QListWidgetItem(entry.version + (entry.verified ? " · verified install" : " · needs repair"), installed);
-                item->setData(Qt::UserRole, entry.version);
-                item->setToolTip(entry.path);
-            }
-        };
-        reloadInstalled();
-        connect(refresh, &QPushButton::clicked, &manager, [&] {
-            auto work = std::async(std::launch::async, [root = library_->root()] { return fetchGeCatalog(root); });
-            QDialog progress(&manager); progress.setWindowTitle("Checking GE releases");
-            auto progressLayout = new QVBoxLayout(&progress);
-            progressLayout->addWidget(new QLabel("Loading official GE-Proton releases…", &progress));
-            QTimer poll; poll.setInterval(50);
-            connect(&poll, &QTimer::timeout, &progress, [&] {
-                if (work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) progress.accept();
-            });
-            poll.start(); progress.exec(); poll.stop();
-            const auto catalog = work.get();
-            available->clear();
-            for (const auto &entry : catalog.releases) {
-                auto item = new QListWidgetItem(entry.version + " · " + entry.published.left(10), available);
-                item->setData(Qt::UserRole, entry.version);
-                item->setToolTip(QString::number(entry.archiveSize) + " byte download");
-            }
-            status->setText(catalog.fromCache ? "Release service unavailable; showing cached results. " + catalog.error :
-                catalog.error.isEmpty() ? "Official release catalog loaded. Installation still verifies the release checksum." : catalog.error);
-        });
-        connect(install, &QPushButton::clicked, &manager, [&] {
-            const auto selected = available->currentItem() ? available->currentItem()->data(Qt::UserRole).toString() : QString();
-            const auto path = provisionGe(&manager, library_->root(), {}, false, selected);
-            if (!path.isEmpty()) { reloadInstalled(); status->setText("Installed " + QFileInfo(path).fileName() + ". Choose Use selected as default to pin it."); }
-        });
-        connect(pin, &QPushButton::clicked, &manager, [&] {
-            if (!installed->currentItem()) { status->setText("Choose an installed build."); return; }
-            const auto version = installed->currentItem()->data(Qt::UserRole).toString();
-            const auto path = library_->dataRoot() + "/runners/" + version;
-            bool verified = false;
-            for (const auto &entry : managedGeRunners(*library_))
-                if (entry.version == version) verified = entry.verified;
-            if (!verified) { status->setText("Selected build needs repair before it can be the default."); return; }
-            if (runner->findText(path) < 0) runner->addItem(path);
-            runner->setCurrentText(path); managerPinChosen = true;
-            status->setText("Selected " + version + " as the Settings default. Save Settings to keep it.");
-        });
-        connect(remove, &QPushButton::clicked, &manager, [&] {
-            if (!installed->currentItem()) { status->setText("Choose an installed build."); return; }
-            const auto version = installed->currentItem()->data(Qt::UserRole).toString();
-            if (runner->currentText().trimmed() == library_->dataRoot() + "/runners/" + version) {
-                status->setText("This build is selected in Settings. Choose another default and save Settings before removing it.");
-                return;
-            }
-            if (const auto reason = managedRunnerRemovalIssue(*library_, version); !reason.isEmpty())
-                { status->setText(reason); return; }
-            if (QMessageBox::question(&manager, "Remove GE-Proton?", "Remove managed " + version + "? Installed games and prefixes are kept.",
-                                      QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
-            try { removeManagedRunner(*library_, version); reloadInstalled(); status->setText(version + " removed."); }
-            catch (const std::exception &e) { status->setText(QString::fromUtf8(e.what())); }
-        });
-        manager.exec();
+        const auto selected = manageProton(&dialog, *library_, *geUpdates_, runner->currentText());
+        if (!selected.isEmpty()) {
+            if (runner->findText(selected) < 0) runner->addItem(selected);
+            runner->setCurrentText(selected); managerPinChosen = true;
+        }
     });
     form->addRow("umu executable", pathField(umu, &dialog, false, "Select umu-run"));
     auto getUmu = new QPushButton("Get umu…", &dialog); getUmu->setObjectName("getUmuSettings"); form->addRow(getUmu);
@@ -236,7 +164,7 @@ void Window::settings() {
     devicesButton->setObjectName("devicesSettings"); devicesButton->setEnabled(bool(library_));
     connect(devicesButton, &QPushButton::clicked, &dialog, [this] { devices(); });
     body->addWidget(devicesButton);
-    auto note = new QLabel("Default backend and Proton apply to newly discovered games. The umu executable applies to all umu games in this library.\n\nProton Manager installs GE builds and selects the library default. Get umu installs the launcher for this library. Manage → Add to Steam creates a shortcut to Novelty's existing launch path.", &dialog); note->setWordWrap(true); body->addWidget(note);
+    auto note = new QLabel("Recipes define game settings. Library Proton and umu choices are used when the recipe leaves those selectors blank; Manage can override them per game.\n\nProton Manager installs and removes GE builds. Choose the library default above. Get umu installs the launcher for this library. Manage → Add to Steam creates a shortcut to Novelty's existing launch path.", &dialog); note->setWordWrap(true); body->addWidget(note);
     scroll->setWidget(content); layout->addWidget(scroll, 1);
     auto buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog); layout->addWidget(buttons);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept); connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
@@ -365,7 +293,7 @@ void Window::recipes() {
         const QJsonObject settings = selectedTier == "general" ? QJsonObject{} :
             QJsonObject{{"executable", "MyGame.exe"}};
         editor->setPlainText(QString::fromUtf8(QJsonDocument(QJsonObject{{"schema", 1}, {"id", id},
-            {"name", "New recipe"}, {"category", "game"}, {"match", match}, {"settings", settings}}).toJson(QJsonDocument::Indented)));
+            {"name", "New recipe"}, {"inherits", "general-game"}, {"category", "game"}, {"match", match}, {"settings", settings}}).toJson(QJsonDocument::Indented)));
         remove->setEnabled(false); error->clear();
     });
     connect(importButton, &QPushButton::clicked, &dialog, [&] {
@@ -399,7 +327,7 @@ void Window::recipes() {
     });
     connect(remove, &QPushButton::clicked, &dialog, [&] {
         if (currentId.isEmpty()) return;
-        if (currentTier == "general" && library_->settings()["default_recipe"].toString("general-game") == currentId) {
+        if (currentTier == "general" && library_->settings()["default_recipe"].toString() == currentId) {
             error->setText("Choose another default recipe in Settings before deleting this one."); return;
         }
         if (QMessageBox::question(&dialog, "Delete recipe?", "Delete this recipe file? Existing game settings will be kept.") != QMessageBox::Yes) return;

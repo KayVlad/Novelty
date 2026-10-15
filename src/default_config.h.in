@@ -1,0 +1,8 @@
+#pragma once
+// Generated from the editable JSON sources under config/.
+namespace novelty::defaults {
+inline constexpr char app[] = R"NOVELTY(@NOVELTY_SETTINGS_JSON@)NOVELTY";
+inline constexpr char library[] = R"NOVELTY(@NOVELTY_LIBRARY_JSON@)NOVELTY";
+inline constexpr char game[] = R"NOVELTY(@NOVELTY_GAME_JSON@)NOVELTY";
+inline constexpr char vn[] = R"NOVELTY(@NOVELTY_VN_JSON@)NOVELTY";
+}

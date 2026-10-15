@@ -1,4 +1,6 @@
 #include "core.h"
+#include "runner_fixture.h"
+#include "app_settings.h"
 #include "setup.h"
 #include "recipes.h"
 #include "saves.h"
@@ -337,11 +339,11 @@ void testMovedLibrary(const QString &base) {
                 data["runner"] == ".novelty/runners/GE-Test",
                 "database stores library-owned game paths relative to Games");
         query.finish();
-        require(query.exec("SELECT value FROM settings WHERE key='app'") && query.next(),
-                "inspect stored library defaults");
-        const auto defaults = QJsonDocument::fromJson(query.value(0).toByteArray()).object();
+        require(query.exec("SELECT value FROM settings WHERE key='app'") && !query.next(),
+                "library settings have no parallel database copy");
+        const auto defaults = readJson(newRoot + "/.novelty/settings.json");
         require(defaults["runner"] == ".novelty/runners/GE-Test" && defaults["umu"] == "umu-run",
-                "database stores managed defaults relatively and keeps command names intact");
+                "settings JSON stores managed defaults relatively and keeps command names intact");
         query.finish();
         db.close(); db = QSqlDatabase(); QSqlDatabase::removeDatabase("relative-path-fixture");
     }
@@ -640,9 +642,14 @@ void testSaveDiscovery(const QString &base) {
     QDir().mkpath(game.folder + "/UserData");
     finishSaveObservation(lib, game);
     auto found = loadSaveConfig(lib, game.id);
-    require(found.discoveryState == "identified" && found.discoverySource == "heuristic" &&
-            found.mappings.size() == 1 && found.mappings.first().path == "UserData",
-            "empty conventional UserData folder is detected after Play");
+    require(found.discoveryState == "searching" && found.mappings.isEmpty() &&
+            found.candidates.size() == 1 && found.candidates.first().toObject()["path"] == "UserData",
+            "a sole conventional folder remains a suggestion after Play");
+    queuePostExitSaveSnapshot(lib, game);
+    require(!QFileInfo::exists(lib.gamePath(game.id, "save-pending.json")) &&
+            listSaveSnapshots(lib, game.id).isEmpty(), "unconfirmed candidates do not authorize backups");
+    found.mappings = {{"game", "UserData"}};
+    saveSaveConfig(lib, game.id, found);
     queuePostExitSaveSnapshot(lib, game);
     finishPostExitSaveSnapshot(lib, game);
     require(listSaveSnapshots(lib, game.id).size() == 1 && listSaveSnapshots(lib, game.id).first().files == 0,
@@ -667,9 +674,9 @@ void testSaveDiscovery(const QString &base) {
     setSaveDiscoveryState(lib, game.id, "unidentified");
     require(loadSaveConfig(lib, game.id).discoveryState == "unidentified", "explicit stop persists unidentified state");
     beginSaveObservation(lib, game);
-    require(loadSaveConfig(lib, game.id).discoveryState == "identified" &&
-            loadSaveConfig(lib, game.id).mappings.first().path == "UserData",
-            "legacy stopped discovery resumes the bounded detector");
+    require(loadSaveConfig(lib, game.id).discoveryState == "searching" &&
+            loadSaveConfig(lib, game.id).mappings.isEmpty() && saveDiscoveryCandidates(lib, game.id).size() == 1,
+            "resumed discovery offers candidates without confirming them");
 
     const auto recipeRoot = base + "/Save recipe";
     touch(recipeRoot + "/Game/game.exe");
@@ -732,10 +739,11 @@ void testSaveDiscovery(const QString &base) {
     QDir().mkpath(titles.prefix(titleGame.id) + "/drive_c/users/steamuser/AppData/Roaming/Publisher/Amairo Chocolata");
     beginSaveObservation(titles, titleGame);
     const auto titleConfig = loadSaveConfig(titles, titleGame.id);
-    require(titleConfig.discoveryState == "identified" && titleConfig.mappings.size() == 1 &&
-            titleConfig.mappings.first().scope == "appdata" &&
-            titleConfig.mappings.first().path == "Publisher/Amairo Chocolata",
-            "title-named AppData folder is detected within bounded Wine locations");
+    const auto titleCandidates = saveDiscoveryCandidates(titles, titleGame.id);
+    require(titleConfig.discoveryState == "searching" && titleConfig.mappings.isEmpty() &&
+            titleCandidates.size() == 1 && titleCandidates.first().scope == "appdata" &&
+            titleCandidates.first().path == "Publisher/Amairo Chocolata",
+            "title-named AppData folders need confirmation even when unambiguous");
 
     const auto unityRoot = base + "/Unity candidate folders";
     touch(unityRoot + "/Aokana/Aokana.exe");
@@ -760,8 +768,9 @@ void testSaveDiscovery(const QString &base) {
     Library adjacent(adjacentRoot); adjacent.import({inspect(adjacentRoot + "/Game")}, {});
     const auto adjacentGame = adjacent.games().first();
     beginSaveObservation(adjacent, adjacentGame);
-    require(loadSaveConfig(adjacent, adjacentGame.id).mappings.first().path == "bin/UserData",
-            "save directory beside selected executable is detected");
+    require(loadSaveConfig(adjacent, adjacentGame.id).mappings.isEmpty() &&
+            saveDiscoveryCandidates(adjacent, adjacentGame.id).first().path == "bin/UserData",
+            "save directory beside selected executable is suggested");
 
     const auto unusualRoot = base + "/Unusual saves";
     touch(unusualRoot + "/Game/game.exe");
@@ -784,7 +793,8 @@ void testSaveDiscovery(const QString &base) {
     QDir().mkpath(priorGame.folder + "/UserData");
     require(recoverSaveObservations(prior).size() == 1 &&
             !QFileInfo::exists(prior.gamePath(priorGame.id, "save-observation.json")) &&
-            loadSaveConfig(prior, priorGame.id).mappings.first().path == "UserData",
+            loadSaveConfig(prior, priorGame.id).mappings.isEmpty() &&
+            saveDiscoveryCandidates(prior, priorGame.id).first().path == "UserData",
             "legacy observation metadata is cleared after bounded discovery");
 
     const auto renpyRoot = base + "/Engine saves";
@@ -1188,6 +1198,7 @@ void testSchemaAndManagedRunners(const QString &base) {
     const auto managed = root + "/.novelty/runners/GE-Proton11-7";
     const auto incomplete = root + "/.novelty/runners/.install-GE-Proton11-7";
     touch(managed + "/proton"); touch(incomplete + "/proton");
+    managedRunnerFixture(managed);
     const auto runners = installedRunners(root);
     require(runners.contains(canonicalPath(managed)), "managed GE build appears in runner picker source");
     require(!runners.contains(canonicalPath(incomplete)), "incomplete hidden download stays out of runner picker");
@@ -1504,7 +1515,7 @@ touch "$WINEPREFIX/played"; exit 0
     const auto recipes = loadRecipes(root);
     for (const auto &recipe : recipes) if (recipe.tier == "general")
         require(recipe.settings["winetricks"].toArray().isEmpty() &&
-                !recipe.settings.contains("runner"), "general recipes start clean without a runner pin");
+                recipe.settings["runner"] == "", "general recipes explicitly delegate the runner to library settings");
     lib.import(discover(root), runner);
     auto g = lib.games().first(); const auto id = g.id; const auto prefix = lib.prefix(id);
     require(g.runner == runner && g.runnerSelector.isEmpty(),
@@ -1857,6 +1868,7 @@ int main(int argc, char **argv) {
     try {
         QTemporaryDir temp;
         require(temp.isValid(), "temporary directory");
+        qputenv("NOVELTY_TEST_APP_DATA_DIR", QFile::encodeName(temp.path() + "/app"));
         auto root = temp.path() + "/Games with spaces 日本語"; QDir().mkpath(root);
         const auto folder = root + "/Template!!";
         touch(folder + "/Tenpure.exe"); touch(folder + "/unins000.exe"); touch(folder + "/game/code.xp3.rpa");

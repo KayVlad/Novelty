@@ -3,6 +3,8 @@
 #include "runtime.h"
 #include "saves.h"
 #include "recipes.h"
+#include "runner_manager.h"
+#include "app_settings.h"
 #include <QtCore/qcoreapplication.h>
 #include <QtCore/qdatetime.h>
 #include <QtCore/qcryptographichash.h>
@@ -162,13 +164,17 @@ QJsonObject Game::json() const {
             if (recipeBase[it.key()] != it.value()) overrides[it.key()] = it.value();
         for (auto it = recipeBase.begin(); it != recipeBase.end(); ++it)
             if (!current.contains(it.key())) overrides[it.key()] = QJsonValue::Null;
-        // The effective path may have been resolved by first Play. Only an explicit
-        // selection recorded by Manage is a runner override.
+        // First Play can resolve a library default or floating selector. Only
+        // selectRunner records an explicit user choice, including an exact pin.
+        overrides.remove("runner");
         if (recipeOverrides.contains("runner")) overrides["runner"] = recipeOverrides["runner"];
     }
+    // A floating selector owns its derived path. Keep persisted settings and recovery
+    // journals stable when a background install changes the current inventory.
+    const bool floating = isRunnerAlias(runnerSelector);
     return {{"schema", 1}, {"id", id}, {"name", name}, {"folder", folder},
-            {"executable", executable}, {"cwd", workingDirectory}, {"runner", runner},
-            {"locale", locale}, {"backend", backend}, {"steam_id", steamId}, {"runner_revision", runnerRevision},
+            {"executable", executable}, {"cwd", workingDirectory}, {"runner", floating ? QString() : runner},
+            {"locale", locale}, {"backend", backend}, {"steam_id", steamId}, {"runner_revision", floating ? QString() : runnerRevision},
             {"folder_identity", folderIdentity}, {"source", source},
             {"installer", installer}, {"install_pending", installPending},
             {"engine", engine}, {"category", category}, {"evidence", evidence},
@@ -189,7 +195,8 @@ void Game::selectRunner(const QString &path) {
         runnerSelector = recipeBase.value("runner").toString();
     } else {
         recipeOverrides["runner"] = runner;
-        runnerSelector.clear();
+        if (isRunnerAlias(runner)) { runnerSelector = runner; runner.clear(); }
+        else runnerSelector.clear();
     }
 }
 Game Game::fromJson(const QJsonObject &j) {
@@ -235,6 +242,10 @@ QString resolvedPath(const QString &root, const QString &path) {
 }
 QJsonObject storedGame(const QString &root, const Game &game) {
     auto data = game.json();
+    if (!game.runner.isEmpty() && !QDir::isAbsolutePath(game.runner) && !game.runner.contains('/')) {
+        data["runner_selector"] = game.runner;
+        data["runner"] = "";
+    }
     for (const auto &key : {"folder", "executable", "cwd", "runner", "installer", "umu_resolved"})
         data[key] = storedPath(root, data[key].toString());
     auto overrides = data["recipe_overrides"].toObject();
@@ -249,7 +260,10 @@ Game resolvedGame(const QString &root, const QJsonObject &data) {
     game.folder = resolvedPath(root, game.folder);
     game.executable = resolvedPath(root, game.executable);
     game.workingDirectory = resolvedPath(root, game.workingDirectory);
-    game.runner = resolvedPath(root, game.runner);
+    if (isRunnerAlias(game.runner)) {
+        if (game.runnerSelector.isEmpty()) game.runnerSelector = game.runner;
+        game.runner = resolveRunnerSelector(root, game.runner);
+    } else game.runner = resolvedPath(root, game.runner);
     game.installer = resolvedPath(root, game.installer);
     game.umuResolved = resolvedPath(root, game.umuResolved);
     if (game.recipeOverrides.value("runner").isString()) {
@@ -266,11 +280,15 @@ Game resolvedGame(const QString &root, const QJsonObject &data) {
         (canonicalPath(prior) == resolveRunnerSelector(root, inherited) ||
          prior == root + "/.novelty/runners/" + inherited))
         game.recipeOverrides.remove("runner");
+    if (isRunnerAlias(game.runnerSelector)) {
+        game.runner = resolveRunnerSelector(root, game.runnerSelector);
+        game.runnerRevision = game.runner.isEmpty() ? QString() : runnerVersion(game.runner);
+    }
     return game;
 }
 QJsonObject storedLibrarySettings(const QString &root, QJsonObject data) {
     for (const auto &key : {"runner", "umu", "steam"})
-        if (data[key].isString()) {
+        if (data.value(key).isString()) {
             const auto original = data[key].toString();
             auto path = storedPath(root, original);
             if (path != original && !path.contains('/') && path != ".") path.prepend("./");
@@ -280,9 +298,9 @@ QJsonObject storedLibrarySettings(const QString &root, QJsonObject data) {
 }
 QJsonObject resolvedLibrarySettings(const QString &root, QJsonObject data) {
     for (const auto &key : {"runner", "umu", "steam"})
-        if (data[key].isString()) {
+        if (data.value(key).isString()) {
             const auto path = data[key].toString();
-            if ((QString::fromLatin1(key) == "runner" && !path.isEmpty()) || path == "." || path.contains('/'))
+            if (path == "." || path.contains('/'))
                 data[key] = resolvedPath(root, path);
         }
     return data;
@@ -372,16 +390,7 @@ QList<Candidate> CopyTracker::observe(const QList<Candidate> &candidates, qint64
     return ready;
 }
 QStringList installedRunners(const QString &libraryRoot) {
-    QStringList out;
-    const auto base = QDir::homePath() + "/.local/share/Steam";
-    QStringList locations{base + "/compatibilitytools.d", base + "/steamapps/common"};
-    if (!libraryRoot.isEmpty()) locations.prepend(QDir(libraryRoot).filePath(".novelty/runners"));
-    for (const auto &dir : locations) {
-        for (auto f : QDir(dir).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
-            if (QFileInfo(QDir(f.filePath()).filePath("proton")).isFile()) out.append(f.canonicalFilePath());
-        }
-    }
-    out.removeDuplicates(); return out;
+    return protonInventory(libraryRoot);
 }
 QString runnerVersion(const QString &runner) {
     QFile f(QDir(runner).filePath("version"));
@@ -502,14 +511,7 @@ void Library::rebaseMovedLibrary() {
             save.addBindValue(QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Compact)));
             save.addBindValue(g.id); check(save);
         }
-        QSqlQuery existingApp(db_);
-        if (!existingApp.exec("SELECT 1 FROM settings WHERE key='app'")) fail(existingApp.lastError().text());
-        if (existingApp.next()) {
-            QSqlQuery saveApp(db_);
-            saveApp.prepare("UPDATE settings SET value=? WHERE key='app'");
-            saveApp.addBindValue(QString::fromUtf8(QJsonDocument(storedLibrarySettings(root_, app)).toJson(QJsonDocument::Compact)));
-            check(saveApp);
-        }
+        saveLibrarySettings(root_, storedLibrarySettings(root_, app));
         sql(db_, "INSERT INTO settings(key,value) VALUES('path_format','relative-v1')");
         sql(db_, "DELETE FROM settings WHERE key='library_root'");
         if (!db_.commit()) fail(db_.lastError().text());
@@ -576,7 +578,8 @@ void Library::recoverSettingsChange(const QString &id) {
     const auto path = gamePath(id, "settings-change.json");
     if (!QFileInfo::exists(path)) return;
     const auto journal = readJson(path);
-    const auto before = journal["before_game"].toObject(), after = journal["after_game"].toObject();
+    const auto before = Game::fromJson(journal["before_game"].toObject()).json();
+    const auto after = Game::fromJson(journal["after_game"].toObject()).json();
     const auto current = game(id).json();
     if (journal["schema"] != 1 || before["id"] != id || after["id"] != id || before == after ||
         !journal["before_config"].isObject() || !journal["after_config"].isObject() ||
@@ -629,7 +632,7 @@ Game Library::selectExecutable(const QString &id, const QString &chosen) {
     for (const auto &recipe : loadRecipes(root_))
         if (recipe.id == g.recipeId && recipe.tier == "general") defaultRecipe = true;
     if (defaultRecipe) {
-        const auto choice = selectRecipe(root_, g.folder, {path}, settings()["default_recipe"].toString("general-game"));
+        const auto choice = selectRecipe(root_, g.folder, {path}, settings()["default_recipe"].toString());
         if (choice.ambiguous()) {
             g.recipeCandidates.clear();
             for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
@@ -765,7 +768,7 @@ int Library::import(const QList<Candidate> &candidates, const QString &runner) {
     QLockFile mutation(dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
     if (!mutation.tryLock()) fail("Library maintenance is in progress. Use Rescan to retry discovery.");
     auto existing = games(); int added = 0;
-    const auto backend = settings()["backend"].toString("umu");
+    const auto backend = settings()["backend"].toString();
     for (auto c : candidates) {
         if (!QFileInfo(c.folder).isDir()) continue; // Another window may have removed an older scan result.
         if (removalReservedFolder(c.folder)) continue;
@@ -773,7 +776,7 @@ int Library::import(const QList<Candidate> &candidates, const QString &runner) {
         Game g; g.id = QUuid::createUuid().toString(QUuid::WithoutBraces); g.name = c.name; g.folder = c.folder;
         g.runner = runner; g.backend = c.native ? "native" : backend;
         const auto choice = selectRecipe(root_, c.folder, c.executables,
-            settings()["default_recipe"].toString("general-game"));
+            settings()["default_recipe"].toString());
         if (choice.ambiguous()) {
             for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
         } else {
@@ -789,7 +792,10 @@ int Library::import(const QList<Candidate> &candidates, const QString &runner) {
         g.workingDirectory = g.executable.isEmpty() ? g.folder : QFileInfo(g.executable).absolutePath();
         if (!choice.ambiguous() && !choice.selected().settings["working_directory"].toString().isEmpty())
             g.workingDirectory = canonicalPath(QDir(g.folder).filePath(choice.selected().settings["working_directory"].toString()));
-        if (!choice.ambiguous()) g.recipeBase = recipeSettingsSnapshot(g);
+        if (!choice.ambiguous()) {
+            g.recipeBase = recipeSettingsSnapshot(g);
+            if (g.backend == "umu" && !runner.isEmpty() && runner != settings()["runner"].toString()) g.selectRunner(runner);
+        }
         g.runnerRevision = runnerVersion(g.runner); g.folderIdentity = folderIdentity(g.folder); g.source = "discovered";
         store(g); existing.append(g); ++added;
     }
@@ -836,7 +842,13 @@ Game Library::previewRecipe(const QString &id, const QString &recipeId) const {
             const auto selector = value.toString();
             if (QDir::isAbsolutePath(selector)) { updated.runner = selector; updated.runnerSelector.clear(); }
             else { updated.runner.clear(); updated.runnerSelector = selector; }
-        } else if (key == "locale") updated.locale = value == "system" ? QString() : value.toString();
+        } else if (key == "umu_launcher") {
+            updated.umuLauncher = value.toString();
+            updated.umuResolved = resolveUmuSelector(root_, updated.umuLauncher);
+        } else if (key == "umu_game_id") updated.umuGameId = value.toString();
+        else if (key == "store") updated.store = value.toString();
+        else if (key == "steam_id") updated.steamId = value.toString();
+        else if (key == "locale") updated.locale = value == "system" ? QString() : value.toString();
         else if (key == "arguments") {
             updated.arguments.clear();
             for (const auto &argument : value.toArray()) updated.arguments.append(argument.toString());
@@ -892,16 +904,18 @@ QString Library::status(const Game &g) const {
     if (last["state"].toString() == "Needs attention") return "Needs attention";
     if (QStringList{"Preparing", "Running", "Starting", "Configuring"}.contains(last["state"].toString())) return "Interrupted";
     if (last["state"] == "Save needs attention" || !pendingSaveSnapshotIssue(*this, g.id).isEmpty()) return "Save needs attention";
+    if (last["state"] == "Sync pending" || last["state"] == "Save conflict") return last["state"].toString();
     if (g.installPending) return "Installation pending";
     if (QFileInfo::exists(g.folder + "/.novelty-transfer.json")) return "Transfer incomplete";
     if (g.backend == "steam") return g.steamId.isEmpty() ? "Needs Steam shortcut" : "Steam shortcut";
     if (g.backend == "native") return g.executable.isEmpty() ? "Choose executable" :
         nativeExecutable(g.executable) ? "Ready" : "Executable not runnable";
     if (g.executable.isEmpty()) return "Choose executable";
-    if (!QFileInfo(QDir(g.runner).filePath("proton")).isFile()) return "Choose runner";
+    if (!runnerInstallationReady(root_, g.runner)) return g.runner.isEmpty() ? "Choose runner" : "Runner unavailable";
     if (!g.runnerRevision.isEmpty() && runnerVersion(g.runner) != g.runnerRevision) return "Runner changed";
-    auto umu = g.umuLauncher.isEmpty() ? settings()["umu"].toString("umu-run") :
-               g.umuResolved;
+    QString umu;
+    try { umu = g.umuLauncher.isEmpty() ? settings()["umu"].toString() : g.umuResolved; }
+    catch (const std::exception &) { return "Settings invalid"; }
     if (umu == "umu-run" && resolveProgram(umu).isEmpty()) {
         umu = dataRoot() + "/tools/umu-run"; // Keep an existing legacy selection stable.
         if (resolveProgram(umu).isEmpty()) umu = managedUmuPath(root_);
@@ -911,11 +925,9 @@ QString Library::status(const Game &g) const {
     return QFileInfo::exists(prefix(g.id)) || QFileInfo::exists(gamePath(g.id, "setup.json")) ? "Needs setup" : "New";
 }
 QJsonObject Library::settings() const {
-    QSqlQuery q(db_); if (!q.exec("SELECT value FROM settings WHERE key='app'")) fail(q.lastError().text());
-    if (!q.next()) return {{"umu", "umu-run"}, {"steam", "steam"}, {"backend", "umu"},
-                           {"default_recipe", "general-game"}};
-    return resolvedLibrarySettings(root_, QJsonDocument::fromJson(q.value(0).toByteArray()).object());
+    return resolvedLibrarySettings(root_, loadLibrarySettings(root_));
 }
+
 bool Library::managedRuntimeStorage() const {
     QSqlQuery q(db_); if (!q.exec("SELECT value FROM settings WHERE key='runtime_storage'")) fail(q.lastError().text());
     return q.next() && q.value(0).toString() == "managed";
@@ -935,7 +947,6 @@ void Library::enableManagedRuntimeStorage() {
 void Library::setSettings(const QJsonObject &s) {
     QLockFile mutation(dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
     if (!mutation.tryLock()) fail("Library maintenance is in progress. Retry saving Settings shortly.");
-    QSqlQuery q(db_); q.prepare("INSERT INTO settings(key,value) VALUES('app',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
-    q.addBindValue(QString::fromUtf8(QJsonDocument(storedLibrarySettings(root_, s)).toJson(QJsonDocument::Compact))); check(q);
+    saveLibrarySettings(root_, storedLibrarySettings(root_, s));
 }
 } // namespace novelty

@@ -58,6 +58,7 @@ public:
         : socket_(socket), store_(store), token_(token),
           stage_(store.rootPath() + "/.request-XXXXXX") {
         socket_->setParent(this);
+        socket_->setReadBufferSize(128 * 1024);
         timeout_.setSingleShot(true);
         timeout_.setInterval(30000);
         connect(&timeout_, &QTimer::timeout, this, [this] { reply(408, "Request Timeout", {}); });
@@ -65,6 +66,9 @@ public:
         connect(socket_, &QTcpSocket::bytesWritten, this, [this](qint64) { sendDownload(); });
         connect(socket_, &QTcpSocket::disconnected, this, &QObject::deleteLater);
         timeout_.start();
+        deadline_.setSingleShot(true);
+        connect(&deadline_, &QTimer::timeout, this, [this] { socket_->abort(); });
+        deadline_.start(10000); // Header deadline is absolute, even if bytes keep arriving.
         if (!stage_.isValid()) reply(500, "Internal Server Error", {});
     }
 private:
@@ -74,6 +78,7 @@ private:
         if (answered_) return;
         answered_ = true;
         timeout_.stop();
+        deadline_.stop();
         QByteArray message = "HTTP/1.1 " + QByteArray::number(status) + ' ' + label + "\r\n";
         message += "Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n";
         message += "Content-Type: " + type + "\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\n";
@@ -136,13 +141,14 @@ private:
             CRYPTO_memcmp(presented.constData(), token_.constData(), token_.size()) != 0) {
             error(401, "Unauthorized", "unauthorized"); return false;
         }
+        deadline_.start(600000); // Bound authenticated transfers as well as idle time.
         if (headers.contains("transfer-encoding") || headers.contains("expect")) {
             error(400, "Bad Request", "unsupported_encoding"); return false;
         }
         if (target == "/v1/identity" && method == "GET") {
             reply(200, "OK", json({{"schema", 1}, {"server_id", store_.serverId()}})); return false;
         }
-        constexpr auto prefix = "/v1/games/";
+        constexpr char prefix[] = "/v1/games/";
         const auto encoded = target.mid(sizeof(prefix) - 1);
         if (!target.startsWith(prefix) || encoded.isEmpty() || encoded.contains('/') ||
             encoded.contains('?') || encoded.contains('#')) {
@@ -243,7 +249,7 @@ private:
     SaveServerStore &store_;
     QByteArray token_, header_;
     QTemporaryDir stage_;
-    QTimer timeout_;
+    QTimer timeout_, deadline_;
     QFile upload_, download_;
     QString gameKey_;
     qint64 remaining_ = 0;
@@ -267,11 +273,17 @@ int main(int argc, char **argv) {
         if (!okay || port == 0) fail("Server port must be between 1 and 65535.");
         SaveServerStore store(parser.value("data"));
         const auto token = tokenFor(parser.value("data"));
+        int activeRequests = 0;
         QTcpServer listener;
+        listener.setMaxPendingConnections(64);
         if (!listener.listen(QHostAddress::LocalHost, port)) fail("Cannot bind local save server port.");
         QObject::connect(&listener, &QTcpServer::newConnection, &app, [&] {
             while (auto *socket = listener.nextPendingConnection()) {
-                new Request(socket, store, token);
+                if (activeRequests >= 64) { socket->abort(); socket->deleteLater(); continue; }
+                auto *request = new Request(socket, store, token);
+                request->setParent(&listener);
+                ++activeRequests;
+                QObject::connect(request, &QObject::destroyed, &listener, [&] { --activeRequests; });
             }
         });
         return app.exec();

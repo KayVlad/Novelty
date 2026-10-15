@@ -1,4 +1,5 @@
 #include "window.h"
+#include "runner_fixture.h"
 #include "app_settings.h"
 #include "provisioning.h"
 #include "recipes.h"
@@ -102,6 +103,7 @@ int main(int argc, char **argv) {
     QCoreApplication::setOrganizationName("NoveltyExecutableTests");
     QCoreApplication::setApplicationName("NoveltyExecutableTests");
     qputenv("NOVELTY_TEST_APP_DATA_DIR", QFile::encodeName(temporary.path()));
+    setAppSetting("autoGeUpdates", false);
     try {
         const auto root = temporary.path() + "/Games";
         QDir().mkpath(root);
@@ -246,6 +248,7 @@ int main(int argc, char **argv) {
         require(grid->currentIndex().data(LaunchableRole).toBool(), "Installed game did not reach Play after selection");
         const auto managedRunner = root + "/.novelty/runners/GE-Proton11-7";
         touch(managedRunner + "/proton");
+        managedRunnerFixture(managedRunner);
         touch(managedRunner + "/toolmanifest.vdf", "\"manifest\"\n{\n\"require_tool_appid\" \"4183110\"\n}\n");
         touch(root + "/.novelty/runners/Fixture/proton");
         auto settings = library.settings(); settings["runner"] = ""; library.setSettings(settings);
@@ -333,7 +336,7 @@ int main(int argc, char **argv) {
                 if (tabs->indexOf(page) >= 0) { tabs->setCurrentWidget(page); break; }
             candidatesShown = candidates->item(0)->text().endsWith("/Aokana/SaveData") &&
                               candidates->item(1)->text().endsWith("/NekoNyanSoft/Aokana") &&
-                              status->text().contains("Multiple possible save folders") && candidates->isVisible();
+                              status->text().contains("Possible save locations") && candidates->isVisible();
             candidates->setCurrentRow(0);
             candidateFilledInput = location->text().endsWith("/Aokana/SaveData") && location->isModified();
             buttons->button(QDialogButtonBox::Save)->click();
@@ -344,6 +347,25 @@ int main(int argc, char **argv) {
                 selectedSave.mappings.first().scope == "game" && selectedSave.mappings.first().path == "SaveData" &&
                 selectedSave.discoverySource == "manual",
                 "Saves tab lets the user choose one of multiple detected folders and save it");
+        setSaveDiscoveryState(library, aokanaGame.id, "searching");
+        require(QDir(library.prefix(aokanaGame.id) +
+                     "/drive_c/users/steamuser/AppData/LocalLow/NekoNyanSoft/Aokana").removeRecursively(),
+                "remove diagnostic-only candidate");
+        bool singleCandidateShown = false;
+        QTimer::singleShot(0, &candidateWindow, [&] {
+            auto dialog = candidateWindow.findChild<QDialog *>("manageDialog");
+            auto candidates = dialog ? dialog->findChild<QListWidget *>("saveLocationCandidates") : nullptr;
+            auto location = dialog ? dialog->findChild<QLineEdit *>("saveLocation") : nullptr;
+            auto buttons = dialog ? dialog->findChild<QDialogButtonBox *>() : nullptr;
+            singleCandidateShown = candidates && !candidates->isHidden() && candidates->count() == 1 &&
+                                   location && location->text().isEmpty();
+            if (!singleCandidateShown || !buttons) { if (dialog) dialog->reject(); return; }
+            candidates->setCurrentRow(0);
+            buttons->button(QDialogButtonBox::Save)->click();
+        });
+        candidateWindow.manage();
+        require(singleCandidateShown && loadSaveConfig(library, aokanaGame.id).mappings.size() == 1,
+                "a sole candidate remains visible and needs an explicit Save");
         candidateWindow.close();
         firstPlay.launch();
         deadline.restart();
@@ -426,7 +448,7 @@ int main(int argc, char **argv) {
         const auto combinedGe = combinedLibrary.dataRoot() + "/runners/GE-Proton11-7";
         combinedGame.runner = combinedGe; // First-Play selection is not saved until preparation succeeds.
         const auto combinedGeHelper = temporary.path() + "/combined-ge.py";
-        touch(combinedGeHelper, "import os,sys\nr=sys.argv[1]\nopen(r+'/.novelty/ge-invoked','w').close()\nif os.path.exists(r+'/.novelty/ge-fail'): sys.exit(1)\np=r+'/.novelty/runners/GE-Proton11-7'\nos.makedirs(p,exist_ok=True)\nopen(p+'/proton','w').close()\nopen(p+'/toolmanifest.vdf','w').write('\\\"require_tool_appid\\\" \\\"4183110\\\"')\nprint(p)\n");
+        touch(combinedGeHelper, "import os,sys\nr=sys.argv[1]\nopen(r+'/.novelty/ge-invoked','w').close()\nif os.path.exists(r+'/.novelty/ge-fail'): sys.exit(1)\np=r+'/.novelty/runners/GE-Proton11-7'\nos.makedirs(p,exist_ok=True)\nopen(p+'/proton','w').close()\nimport json\nos.chmod(p+'/proton',0o700)\nopen(p+'/version','w').write(os.path.basename(p))\nopen(p+'/novelty-install.json','w').write(json.dumps(dict(schema=1,version=os.path.basename(p),architecture='x86_64',sha512='a'*128,size=1)))\nopen(p+'/toolmanifest.vdf','w').write('\\\"require_tool_appid\\\" \\\"4183110\\\"')\nprint(p)\n");
         const auto combinedUmuHelper = temporary.path() + "/combined-umu.py";
         touch(combinedUmuHelper, "import os,sys,time\nr=sys.argv[1]\np=r+'/.novelty/tools/umu-1.4.4/umu-run'\nos.makedirs(os.path.dirname(p),exist_ok=True)\nopen(r+'/.novelty/umu-invoked','w').close()\nif os.path.exists(r+'/.novelty/umu-wait'): open(r+'/.novelty/waiting','w').close(); time.sleep(20)\nopen(p,'w').write('#!/bin/sh\\n[ -z \\\"$UMU_ZENITY\\\" ] || exit 1\\nmkdir -p \\\"$UMU_FOLDERS_PATH/umu/steamrt4\\\"\\ntouch \\\"$UMU_FOLDERS_PATH/umu/steamrt4/.installed.ok\\\" \\\"$UMU_FOLDERS_PATH/umu/steamrt4/_v2-entry-point\\\"\\n')\nos.chmod(p,0o700)\nprint(p)\n");
         touch(combinedLibrary.dataRoot() + "/ge-fail");

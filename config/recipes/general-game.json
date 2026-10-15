@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "general-game",
+  "name": "Game",
+  "category": "game",
+  "match": {},
+  "settings": {
+    "engine": "Generic",
+    "backend": "umu",
+    "runner": "",
+    "umu_launcher": "",
+    "umu_game_id": "",
+    "store": "",
+    "steam_id": "",
+    "locale": "system",
+    "arguments": [],
+    "environment": {},
+    "winetricks": [],
+    "save_candidates": [],
+    "ignore_executables": [
+      "unins*",
+      "*uninstall*",
+      "setup.exe",
+      "install.exe",
+      "python*.exe",
+      "zsync*.exe",
+      "crashreporter.exe",
+      "*/lib/*",
+      "*/ost/*",
+      "*/soundtrack/*"
+    ]
+  }
+}

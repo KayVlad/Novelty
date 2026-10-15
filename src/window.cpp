@@ -431,6 +431,8 @@ void Window::openRoot(const QString &root, bool allowCreation) {
     activePeerIds_.clear();
     saveListener_.reset();
     library_ = std::move(next); rootPath_ = library_->root(); copyTracker_.clear(); scanDelay_.stop();
+    geUpdates_ = std::make_unique<GeUpdateManager>(rootPath_, this);
+    QTimer::singleShot(0, geUpdates_.get(), [updates = geUpdates_.get()] { updates->checkAtStartup(); });
     lanListenIssue_.clear();
     saveListener_ = std::make_unique<LanListener>(*library_, false, this);
     saveListener_->onConnection = [this](LanConnection *connection) {
