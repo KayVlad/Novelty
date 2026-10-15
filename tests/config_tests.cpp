@@ -180,6 +180,88 @@ int main(int argc, char **argv) {
         removeRecipe(root, "games", "pinned-runner");
         removeManagedRunner(library, version);
         check(!QFileInfo::exists(runner) && QFileInfo::exists(folder + "/Story.exe"), "unused build removed without game data loss");
+        {
+            QTemporaryDir provenance; check(provenance.isValid(), "runner provenance library");
+            const auto root = provenance.path(), gameFolder = root + "/Runner Story";
+            file(gameFolder + "/Story.exe", "game");
+            const auto a = QString("GE-Proton90-1"), b = QString("GE-Proton90-2"), c = QString("GE-Proton90-3");
+            for (const auto &version : {a, b, c}) file(root + "/.novelty/runners/" + version + "/proton");
+            QString id;
+            {
+                Library runners(root);
+                saveRecipe(root, "games", recipe("runner-a", {{"match", QJsonObject{{"all", QJsonArray{
+                    QJsonObject{{"file", "Story.exe"}}}}}}}, {{"runner", a}}));
+                runners.import({inspect(gameFolder, root)}, {});
+                auto game = runners.games().first(); id = game.id;
+                check(game.runnerSelector == a && game.runner.isEmpty(), "recipe A imports as a selector without a resolved path");
+                game.runner = resolveRunnerSelector(root, a); // First Play resolves the recipe's runner.
+                runners.save(game); game = runners.game(id);
+                check(game.runner == root + "/.novelty/runners/" + a && !game.recipeOverrides.contains("runner"),
+                      "automatic first-Play resolution does not become an override");
+                {
+                    Library reopenedAutomatic(root);
+                    check(reopenedAutomatic.game(id).runnerSelector == a &&
+                          !reopenedAutomatic.game(id).recipeOverrides.contains("runner"),
+                          "automatic runner provenance survives reopening the library");
+                }
+                game.recipeOverrides["runner"] = game.runner; // Receipt written by an older Novelty build.
+                runners.save(game);
+                check(!runners.game(id).recipeOverrides.contains("runner"), "legacy automatic runner override is recognized");
+                saveRecipe(root, "games", recipe("runner-b", {}, {{"runner", b}}));
+                runners.applyRecipe(id, "runner-b"); game = runners.game(id);
+                check(game.runner.isEmpty() && game.runnerSelector == b && !game.recipeOverrides.contains("runner"),
+                      "applying recipe B releases the automatically resolved runner A");
+                game.runner = resolveRunnerSelector(root, b); runners.save(game);
+                game = runners.game(id); game.selectRunner(resolveRunnerSelector(root, c)); runners.save(game);
+                game = runners.game(id);
+                check(game.runner == root + "/.novelty/runners/" + c &&
+                      game.recipeOverrides["runner"] == game.runner && game.runnerSelector.isEmpty(),
+                      "explicit Manage runner C is recorded separately from the recipe selector");
+                runners.applyRecipe(id, "runner-a"); game = runners.game(id);
+                check(game.runner == root + "/.novelty/runners/" + c && game.recipeOverrides["runner"] == game.runner,
+                      "explicit runner C survives a recipe change");
+                game.environment = {{"TZ", "Asia/Tokyo"}, {"CUSTOM", "portable"}, {"API_TOKEN", "secret-value-123"},
+                    {"HTTP_AUTHORIZATION", "Bearer secret-header-456"}, {"CACHE_DIR", "/home/deck/private-cache"},
+                    {"WINDOWS_CACHE", "C:\\Users\\deck\\Private"}, {"OPTIONS", "--cache=/home/deck/private"},
+                    {"EXTRA_FLAGS", "Authorization: Bearer secret-flags-789"},
+                    {"CDN_URL", "https://example.invalid/assets"}};
+                runners.save(game); game = runners.game(id);
+                QStringList omissions;
+                const auto exported = gameRecipeDocument(game, "portable-runner", root, nullptr, &omissions);
+                const auto bytes = QJsonDocument(exported).toJson();
+                const auto environment = exported["settings"].toObject()["environment"].toObject();
+                check(environment["TZ"] == "Asia/Tokyo" && environment["CUSTOM"] == "portable" &&
+                      environment["CDN_URL"] == "https://example.invalid/assets", "portable environment survives export");
+                check(!environment.contains("API_TOKEN") && !environment.contains("HTTP_AUTHORIZATION") &&
+                      !environment.contains("CACHE_DIR") && !environment.contains("WINDOWS_CACHE") &&
+                      !environment.contains("OPTIONS") && !environment.contains("EXTRA_FLAGS") &&
+                      !bytes.contains("secret-value-123") && !bytes.contains("secret-flags-789") &&
+                      !bytes.contains("secret-header-456") && !bytes.contains("/home/deck") &&
+                      omissions.join(' ').contains("API_TOKEN") && omissions.join(' ').contains("CACHE_DIR") &&
+                      !omissions.join(' ').contains("secret-value-123"),
+                      "secrets and machine paths are omitted with value-free diagnostics");
+                check(exported["settings"].toObject()["runner"] == c &&
+                      parseRecipe(bytes, {}, "games").settings["environment"].toObject() == environment,
+                      "explicit runner and sanitized environment round trip as a valid recipe");
+                Recipe privateParent; privateParent.id = "private-parent";
+                privateParent.settings = {{"environment", QJsonObject{{"API_TOKEN", "parent-secret"}}}};
+                QStringList parentOmissions;
+                const auto standalone = gameRecipeDocument(game, "standalone-private", root, &privateParent, &parentOmissions);
+                check(!standalone.contains("inherits") && !QJsonDocument(standalone).toJson().contains("parent-secret") &&
+                      parentOmissions.join(' ').contains("standalone recipe"),
+                      "export does not inherit a parent that would restore omitted secrets");
+            }
+            Library reopened(root);
+            auto game = reopened.game(id);
+            check(game.runner == root + "/.novelty/runners/" + c && game.recipeOverrides["runner"] == game.runner,
+                  "explicit runner provenance survives reopening the library");
+            reopened.applyRecipe(id, "runner-b"); game = reopened.game(id);
+            check(game.runner == root + "/.novelty/runners/" + c && game.recipeOverrides["runner"] == game.runner,
+                  "reopened explicit runner survives another recipe change");
+            game.selectRunner({}); reopened.save(game); game = reopened.game(id);
+            check(game.runner.isEmpty() && game.runnerSelector == b && !game.recipeOverrides.contains("runner"),
+                  "clearing a Manage runner selection returns to the recipe selector");
+        }
         std::printf("PASS: %d configuration assertions\n", checks); return 0;
     } catch (const std::exception &e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }

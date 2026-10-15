@@ -27,6 +27,7 @@ struct Game {
     QStringList arguments;
     QMap<QString, QString> environment;
     QJsonObject json() const;
+    void selectRunner(const QString &path); // Explicit Manage choice; an empty value restores the recipe selector.
     static Game fromJson(const QJsonObject &);
 };
 

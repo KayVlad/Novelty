@@ -33,6 +33,7 @@ QString recipePath(const QString &libraryRoot, const QString &tier, const QStrin
 void saveRecipe(const QString &libraryRoot, const QString &tier, const QByteArray &json);
 void removeRecipe(const QString &libraryRoot, const QString &tier, const QString &id);
 void applyRecipeToGame(Game &, const Recipe &);
+QJsonObject recipeSettingsSnapshot(const Game &);
 QJsonObject portableGameSettings(const Game &, QStringList *omissions = nullptr);
 QJsonObject gameRecipeDocument(const Game &, const QString &id, const QString &libraryRoot, const Recipe *parent = nullptr,
                                QStringList *omissions = nullptr);

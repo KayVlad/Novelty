@@ -474,9 +474,9 @@ void applyRecipeToGame(Game &game, const Recipe &recipe) {
         game.executable = canonicalPath(checkedPath(game.folder, relative));
     if (const auto relative = settings["working_directory"].toString(); !relative.isEmpty())
         game.workingDirectory = relative == "." ? game.folder : canonicalPath(checkedPath(game.folder, relative));
-    game.recipeBase = portableGameSettings(game);
+    game.recipeBase = recipeSettingsSnapshot(game);
 }
-QJsonObject portableGameSettings(const Game &game, QStringList *omissions) {
+QJsonObject recipeSettingsSnapshot(const Game &game) {
     QJsonObject settings{{"backend", game.backend}, {"engine", game.engine},
                          {"locale", game.locale.isEmpty() ? "system" : game.locale},
                          {"arguments", QJsonArray::fromStringList(game.arguments)},
@@ -492,12 +492,46 @@ QJsonObject portableGameSettings(const Game &game, QStringList *omissions) {
         if (absolute == game.folder && key == "working_directory") settings[key] = ".";
         else if (validRelative(path) && canonicalPath(absolute).startsWith(canonicalPath(game.folder) + '/'))
             settings[key] = path;
-        else if (omissions) omissions->append(key + " is outside the game folder and was omitted");
     };
     relative(game.executable, "executable");
     relative(game.workingDirectory, "working_directory");
     if (!game.runnerSelector.isEmpty()) settings["runner"] = game.runnerSelector;
     if (!game.saveStrategy.isEmpty()) settings["save_strategy"] = game.saveStrategy;
+    return settings;
+}
+QJsonObject portableGameSettings(const Game &game, QStringList *omissions) {
+    auto settings = recipeSettingsSnapshot(game);
+    QJsonObject environment;
+    static const QRegularExpression secretName(
+        "(?:TOKEN|PASSWORD|PASSWD|SECRET|CREDENTIAL|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|COOKIE|"
+        "AUTHORIZATION|AUTHENTICATION|(?:^|[_-])AUTH(?:$|[_-])|SESSION[_-]?(?:TOKEN|KEY|SECRET))",
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression secretValue(
+        "(?:AUTHORIZATION\\s*[:=]|BEARER\\s+|PASSWORD\\s*=|TOKEN\\s*=|API[_-]?KEY\\s*=|"
+        "://[^/@\\s]+:[^/@\\s]+@)",
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression absolutePath(
+        "(?:^|[=;:,\\s])/(?!/)|(?:^|[=;:,\\s])[A-Za-z]:[\\\\/]|(?:^|[=;:,\\s])\\\\\\\\");
+    for (auto it = game.environment.begin(); it != game.environment.end(); ++it) {
+        QString reason;
+        if (secretName.match(it.key()).hasMatch() || secretValue.match(it.value()).hasMatch())
+            reason = "may contain credentials";
+        else if (absolutePath.match(it.value()).hasMatch()) reason = "contains an absolute path";
+        if (reason.isEmpty()) environment[it.key()] = it.value();
+        else if (omissions) omissions->append("environment " + it.key() + " was omitted: " + reason);
+    }
+    settings["environment"] = environment;
+    const auto relative = [&](const QString &absolute, const QString &key) {
+        if (absolute.isEmpty()) return;
+        const auto path = QDir(game.folder).relativeFilePath(absolute);
+        if (absolute == game.folder && key == "working_directory") return;
+        if (!validRelative(path) || !canonicalPath(absolute).startsWith(canonicalPath(game.folder) + '/')) {
+            settings.remove(key);
+            if (omissions) omissions->append(key + " is outside the game folder and was omitted");
+        }
+    };
+    relative(game.executable, "executable");
+    relative(game.workingDirectory, "working_directory");
     // Host-specific umu paths, Steam IDs and save mappings are intentionally absent.
     return settings;
 }
@@ -505,9 +539,11 @@ QJsonObject gameRecipeDocument(const Game &game, const QString &id, const QStrin
                                const Recipe *parent, QStringList *omissions) {
     if (!validId(id)) fail("Choose a recipe ID using lowercase letters, digits, dots, dashes or underscores.");
     auto settings = portableGameSettings(game, omissions);
-    if (!game.runner.isEmpty()) {
-        const auto name = QFileInfo(game.runner).fileName();
-        if (resolveRunnerSelector(libraryRoot, name) == canonicalPath(game.runner)) settings["runner"] = name;
+    const auto runnerOverride = game.recipeOverrides["runner"].toString();
+    if (!runnerOverride.isEmpty() || (game.recipeBase.isEmpty() && !game.runner.isEmpty())) {
+        const auto selected = runnerOverride.isEmpty() ? game.runner : runnerOverride;
+        const auto name = QFileInfo(selected).fileName();
+        if (resolveRunnerSelector(libraryRoot, name) == canonicalPath(selected)) settings["runner"] = name;
         else {
             settings.remove("runner");
             if (omissions) omissions->append("custom Proton path was omitted; select an installed version before sharing");

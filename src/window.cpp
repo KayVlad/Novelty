@@ -1954,7 +1954,7 @@ void Window::manage() {
             if (selectedId.isEmpty()) throw std::runtime_error("Choose a preset.");
             const auto current = library_->game(id);
             const auto proposed = library_->previewRecipe(id, selectedId);
-            const auto before = portableGameSettings(current), after = portableGameSettings(proposed);
+            const auto before = recipeSettingsSnapshot(current), after = recipeSettingsSnapshot(proposed);
             QStringList changes;
             QSet<QString> keys;
             for (auto it = before.begin(); it != before.end(); ++it) keys.insert(it.key());
@@ -1994,7 +1994,10 @@ void Window::manage() {
             QMessageBox::information(&d, "Preset exported", "Saved a manual game preset for review.\n" + omissions.join("\n"));
         } catch (const std::exception &e) { QMessageBox::warning(&d, "Cannot export preset", QString::fromUtf8(e.what())); }
     });
-    auto runner = runnerBox(&d, g.runner, library_->root()); auto locale = new QComboBox(&d); locale->setEditable(true);
+    auto runner = runnerBox(&d, g.runner, library_->root());
+    bool runnerEdited = false;
+    connect(runner, &QComboBox::currentTextChanged, &d, [&] { runnerEdited = true; });
+    auto locale = new QComboBox(&d); locale->setEditable(true);
     locale->addItems({"", "ja_JP.UTF-8", "en_US.UTF-8"}); locale->setCurrentText(g.locale);
     auto requestedWinetricks = new QLineEdit(g.winetricks.join(", "), &d);
     requestedWinetricks->setObjectName("requestedWinetricks");
@@ -2409,7 +2412,8 @@ void Window::manage() {
     connect(buttons, &QDialogButtonBox::accepted, &d, [&] {
         try {
             g.name = name->text().trimmed(); g.executable = exe->text(); g.workingDirectory = cwd->text();
-            g.runner = runner->currentText(); g.locale = locale->currentText(); g.backend = backend->currentData().toString(); g.steamId = steamId->text().trimmed();
+            if (runnerEdited) g.selectRunner(runner->currentText());
+            g.locale = locale->currentText(); g.backend = backend->currentData().toString(); g.steamId = steamId->text().trimmed();
             g.winetricks.clear();
             for (const auto &entry : requestedWinetricks->text().split(',', Qt::SkipEmptyParts)) {
                 const auto verb = entry.trimmed();

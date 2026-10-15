@@ -157,13 +157,14 @@ QJsonObject Game::json() const {
     auto overrides = recipeOverrides;
     if (!recipeBase.isEmpty()) {
         overrides = {};
-        auto current = portableGameSettings(*this);
-        // A selected local runner is a persisted user choice, even when its recipe used an alias.
-        if (!runner.isEmpty()) current["runner"] = runner;
+        auto current = recipeSettingsSnapshot(*this);
         for (auto it = current.begin(); it != current.end(); ++it)
             if (recipeBase[it.key()] != it.value()) overrides[it.key()] = it.value();
         for (auto it = recipeBase.begin(); it != recipeBase.end(); ++it)
             if (!current.contains(it.key())) overrides[it.key()] = QJsonValue::Null;
+        // The effective path may have been resolved by first Play. Only an explicit
+        // selection recorded by Manage is a runner override.
+        if (recipeOverrides.contains("runner")) overrides["runner"] = recipeOverrides["runner"];
     }
     return {{"schema", 1}, {"id", id}, {"name", name}, {"folder", folder},
             {"executable", executable}, {"cwd", workingDirectory}, {"runner", runner},
@@ -179,6 +180,17 @@ QJsonObject Game::json() const {
             {"runner_selector", runnerSelector}, {"umu_launcher", umuLauncher}, {"umu_resolved", umuResolved},
             {"umu_game_id", umuGameId}, {"store", store}, {"save_strategy", saveStrategy},
             {"arguments", QJsonArray::fromStringList(arguments)}, {"environment", env}, {"metadata", metadata}};
+}
+void Game::selectRunner(const QString &path) {
+    runner = path.trimmed();
+    runnerRevision.clear();
+    if (runner.isEmpty()) {
+        recipeOverrides.remove("runner");
+        runnerSelector = recipeBase.value("runner").toString();
+    } else {
+        recipeOverrides["runner"] = runner;
+        runnerSelector.clear();
+    }
 }
 Game Game::fromJson(const QJsonObject &j) {
     if (j.value("schema").toInt() != 1) fail("Unsupported game configuration version.");
@@ -244,6 +256,15 @@ Game resolvedGame(const QString &root, const QJsonObject &data) {
         if (selector.contains('/') && !QDir::isAbsolutePath(selector))
             game.recipeOverrides["runner"] = resolvedPath(root, selector);
     }
+    // Older builds inferred a runner override from first Play's resolved path.
+    // Remove it only when the path still matches the recipe's own selector.
+    const auto inherited = game.recipeBase.value("runner").toString();
+    const auto prior = game.recipeOverrides.value("runner").toString();
+    if (!inherited.isEmpty() && game.runnerSelector == inherited &&
+        !prior.isEmpty() && canonicalPath(prior) == canonicalPath(game.runner) &&
+        (canonicalPath(prior) == resolveRunnerSelector(root, inherited) ||
+         prior == root + "/.novelty/runners/" + inherited))
+        game.recipeOverrides.remove("runner");
     return game;
 }
 QJsonObject storedLibrarySettings(const QString &root, QJsonObject data) {
@@ -612,7 +633,7 @@ Game Library::selectExecutable(const QString &id, const QString &chosen) {
         } else if (choice.selected().tier != "general") {
             applyRecipeToGame(g, choice.selected());
             g.executable = path; g.workingDirectory = QFileInfo(path).absolutePath();
-            g.recipeBase = portableGameSettings(g);
+            g.recipeBase = recipeSettingsSnapshot(g);
         }
     }
     if (g.installPending) { g.installPending = false; g.installer.clear(); }
@@ -762,7 +783,7 @@ int Library::import(const QList<Candidate> &candidates, const QString &runner) {
         g.workingDirectory = g.executable.isEmpty() ? g.folder : QFileInfo(g.executable).absolutePath();
         if (!choice.ambiguous() && !choice.selected().settings["working_directory"].toString().isEmpty())
             g.workingDirectory = canonicalPath(QDir(g.folder).filePath(choice.selected().settings["working_directory"].toString()));
-        if (!choice.ambiguous()) g.recipeBase = portableGameSettings(g);
+        if (!choice.ambiguous()) g.recipeBase = recipeSettingsSnapshot(g);
         g.runnerRevision = runnerVersion(g.runner); g.folderIdentity = folderIdentity(g.folder); g.source = "discovered";
         store(g); existing.append(g); ++added;
     }
@@ -776,7 +797,8 @@ Game Library::previewRecipe(const QString &id, const QString &recipeId) const {
     if (chosen.id.isEmpty()) fail("Recipe is unavailable: " + recipeId);
     auto updated = g;
     applyRecipeToGame(updated, chosen);
-    if (chosen.settings.contains("runner")) { updated.runner.clear(); updated.runnerRevision.clear(); }
+    if (!g.recipeBase.isEmpty() || chosen.settings.contains("runner"))
+        { updated.runner.clear(); updated.runnerRevision.clear(); }
     const auto candidates = recipeExecutables(chosen, g.folder, found);
     if (const auto relative = chosen.settings["executable"].toString(); !relative.isEmpty())
         updated.executable = canonicalPath(QDir(g.folder).filePath(relative));
@@ -785,11 +807,13 @@ Game Library::previewRecipe(const QString &id, const QString &recipeId) const {
     updated.workingDirectory = chosen.settings["working_directory"].toString().isEmpty() ?
         (updated.executable.isEmpty() ? g.folder : QFileInfo(updated.executable).absolutePath()) :
         canonicalPath(QDir(g.folder).filePath(chosen.settings["working_directory"].toString()));
-    updated.recipeBase = portableGameSettings(updated);
+    updated.recipeBase = recipeSettingsSnapshot(updated);
     // Prior explicit edits survive a later preset choice. Historical records have no
     // override snapshot and continue to use their materialized launch settings until
     // the user explicitly applies a new preset.
-    const auto overrides = g.recipeOverrides;
+    auto overrides = g.recipeOverrides;
+    if (g.recipeBase.isEmpty() && !g.runner.isEmpty() && !overrides.contains("runner"))
+        overrides["runner"] = g.runner; // A legacy/manual runner is an intentional local choice.
     for (auto it = overrides.begin(); it != overrides.end(); ++it) {
         const auto key = it.key();
         const auto value = it.value();
