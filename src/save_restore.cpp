@@ -1,3 +1,4 @@
+#include "filesystem_durability.h"
 #include "save_internal.h"
 
 namespace novelty {
@@ -41,6 +42,7 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
             // cleanup work now, never a replacement for the verified installed saves.
             if (exists(held)) removeNode(held);
             if (exists(staged)) removeNode(staged);
+            persistParent(target);
             continue;
         }
         if (exists(recoveryStage)) {
@@ -76,6 +78,8 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
                 }
             }
             if (inventory(recoveryStage) != originalEntries) fail("Cannot verify the original save during recovery.");
+            if (exists(recoveryStage)) persistTree(recoveryStage);
+            persistParent(recoveryStage);
             // Keep the installed copy until the backup is fully staged, so another I/O failure
             // or kill can retry recovery without mistaking a partial copy for player edits.
             if (exists(target) && !QDir().rename(target, staged)) fail("Cannot hold the restored save during recovery.");
@@ -83,11 +87,13 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
         } else if (inventory(target) != originalEntries) {
             fail("A save changed during restore recovery. Inspect " + target + " before retrying.");
         }
+        persistParent(target); // recovered originals must survive before retiring the incoming copy
         if (exists(staged)) removeNode(staged);
+        persistParent(target);
     }
     const auto previousHead = journal["previous_head"].toString();
     setHead(lib, game.id, committed ? journal["snapshot"].toString() : previousHead.isEmpty() ? backupId : previousHead);
-    if (!QFile::remove(journalPath(lib, game.id))) fail("Cannot clear save restore journal.");
+    removeDurableFile(journalPath(lib, game.id));
 }
 } // namespace save_detail
 using namespace save_detail;
@@ -125,7 +131,7 @@ void restoreSaveSnapshotLocked(Library &lib, const QString &gameId, const QStrin
                                   {"backup", backupId}, {"previous_head", previousHead}, {"items", journalItems}};
         // Publish recovery intent before writing any sibling stage. A process kill during copy
         // then leaves a journal that can remove the partial stage without touching originals.
-        writeJson(journalPath(lib, gameId), journal);
+        writeDurableJson(journalPath(lib, gameId), journal);
         for (int i = 0; i < items.size(); ++i) {
             const auto target = targetPath(lib, game, config.mappings[i]);
             const auto staged = target + stageSuffix(nonce, "incoming");
@@ -133,22 +139,26 @@ void restoreSaveSnapshotLocked(Library &lib, const QString &gameId, const QStrin
             const auto source = snapshotsRoot(lib, gameId) + '/' + snapshotId + "/items/" + QString::number(i);
             if (exists(source)) copyNode(source, staged);
             if (inventory(staged) != items[i].toObject()["entries"].toArray()) fail("Cannot verify staged save restore.");
+            if (exists(staged)) persistTree(staged);
+            persistParent(staged);
         }
         for (int i = 0; i < items.size(); ++i) {
             const auto target = targetPath(lib, game, config.mappings[i]);
             const auto held = target + stageSuffix(nonce, "held"), staged = target + stageSuffix(nonce, "incoming");
             if (exists(target) && !QDir().rename(target, held)) fail("Cannot hold original save: " + target);
             if (exists(staged) && !QDir().rename(staged, target)) fail("Cannot install restored save: " + target);
+            persistParent(target);
         }
         auto committed = journal; committed["phase"] = "committed";
-        writeJson(journalPath(lib, gameId), committed);
+        writeDurableJson(journalPath(lib, gameId), committed);
         setHead(lib, gameId, snapshotId);
         for (int i = 0; i < items.size(); ++i) {
             const auto target = targetPath(lib, game, config.mappings[i]);
             const auto held = target + stageSuffix(nonce, "held");
             if (exists(held)) removeNode(held);
         }
-        if (!QFile::remove(journalPath(lib, gameId))) fail("Cannot clear completed save restore journal.");
+        for (const auto &item : config.mappings) persistParent(targetPath(lib, game, item));
+        removeDurableFile(journalPath(lib, gameId));
     } catch (...) {
         if (exists(journalPath(lib, gameId))) {
             try { rollback(lib, game, readJson(journalPath(lib, gameId))); } catch (...) { /* Preserve journal for recovery. */ }
@@ -199,7 +209,7 @@ void replaceSavesFromPeer(Library &lib, const QString &gameId, const QString &sn
     if (!expectedLocalSnapshotId.isEmpty() && previous.id != expectedLocalSnapshotId)
         fail("Local saves changed since confirmation. Review them and retry the transfer.");
     const auto intentPath = transferIntentPath(lib, gameId);
-    writeJson(intentPath, {{"schema", 1}, {"kind", "replace"}, {"game_id", gameId},
+    writeDurableJson(intentPath, {{"schema", 1}, {"kind", "replace"}, {"game_id", gameId},
                            {"rollback_snapshot", previous.id}, {"installed_snapshot", snapshotId}});
     try {
         restoreSaveSnapshotLocked(lib, gameId, snapshotId);
@@ -207,7 +217,7 @@ void replaceSavesFromPeer(Library &lib, const QString &gameId, const QString &sn
         if (!exists(journalPath(lib, gameId)) && currentHead(lib, gameId) != snapshotId) QFile::remove(intentPath);
         throw;
     }
-    writeJson(transferUndoPath(lib, gameId), {{"schema", 1}, {"game_id", gameId},
+    writeDurableJson(transferUndoPath(lib, gameId), {{"schema", 1}, {"game_id", gameId},
         {"rollback_snapshot", previous.id}, {"installed_snapshot", snapshotId}});
     if (!QFile::remove(intentPath)) fail("Peer transfer committed, but its recovery intent needs cleanup.");
 }
@@ -223,7 +233,7 @@ void undoPeerSaveTransfer(Library &lib, const QString &gameId, bool preserveChan
     const auto config = loadSaveConfig(lib, gameId);
     if (undo.liveChanged) snapshotLocked(lib, game, config, "before peer transfer undo", true);
     const auto intentPath = transferIntentPath(lib, gameId);
-    writeJson(intentPath, {{"schema", 1}, {"kind", "undo"}, {"game_id", gameId},
+    writeDurableJson(intentPath, {{"schema", 1}, {"kind", "undo"}, {"game_id", gameId},
                            {"rollback_snapshot", undo.rollbackSnapshotId},
                            {"installed_snapshot", undo.installedSnapshotId}});
     try {
@@ -277,7 +287,7 @@ QStringList recoverPeerSaveTransfers(Library &lib) {
             const auto config = loadSaveConfig(lib, game.id);
             const auto head = currentHead(lib, game.id);
             if (kind == "replace" && head == installedId) {
-                writeJson(transferUndoPath(lib, game.id), {{"schema", 1}, {"game_id", game.id},
+                writeDurableJson(transferUndoPath(lib, game.id), {{"schema", 1}, {"game_id", game.id},
                     {"rollback_snapshot", rollbackId}, {"installed_snapshot", installedId}});
                 messages.append("Completed peer transfer Undo recovery for " + game.name + ".");
             } else if (kind == "undo" && head == rollbackId &&

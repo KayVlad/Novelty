@@ -1,3 +1,4 @@
+#include "filesystem_durability.h"
 #include "core.h"
 #include "recipes.h"
 #include "runtime.h"
@@ -149,12 +150,12 @@ FolderImportResult Library::addFolder(const QString &chosen, const QString &nati
         } else {
             // The intent precedes staging. Recovery only removes a stage whose
             // recorded directory identity still matches and whose source survives.
-            writeJson(journal, {{"schema", 1}, {"source", source}, {"source_identity", identity},
+            writeDurableJson(journal, {{"schema", 1}, {"source", source}, {"source_identity", identity},
                 {"destination", destination}, {"stage", stage}});
             if (!QDir().mkdir(stage)) fail("Could not create a new import staging folder. The source was kept.");
             const auto stageIdentity = folderIdentity(stage);
             if (stageIdentity.isEmpty()) fail("Could not identify the import staging folder. The source was kept.");
-            writeJson(journal, {{"schema", 1}, {"source", source}, {"source_identity", identity},
+            writeDurableJson(journal, {{"schema", 1}, {"source", source}, {"source_identity", identity},
                 {"destination", destination}, {"stage", stage}, {"stage_identity", stageIdentity}});
             QProcess copy;
             copy.start("cp", {"-a", "--reflink=auto", "--", source + "/.", stage});
@@ -223,13 +224,14 @@ FolderImportResult Library::addFolder(const QString &chosen, const QString &nati
                 // Registration has committed. Cleanup failure must never move the
                 // published destination away from the database's saved path.
                 try {
+                    persistParent(retired);
                     if (!sameContents(retired, destination) || !QDir(retired).removeRecursively())
                         warning = "Game added, but the original copy remains for review: " + retired;
                 } catch (const std::exception &error) {
                     warning = "Game added, but the original copy remains for review: " + retired + "\n" + QString::fromUtf8(error.what());
                 }
             }
-            QFile::remove(journal);
+            removeDurableFile(journal);
         }
         return {g, warning, move};
     } catch (...) {

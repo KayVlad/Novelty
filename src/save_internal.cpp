@@ -1,8 +1,10 @@
+#include "filesystem_durability.h"
 #include "save_internal.h"
+#include "filesystem_checks.h"
 
 namespace novelty::save_detail {
 [[noreturn]] void fail(const QString &message) { throw std::runtime_error(message.toStdString()); }
-bool exists(const QString &path) { const QFileInfo info(path); return info.exists() || info.isSymbolicLink(); }
+bool exists(const QString &path) { return checkedExists(path); }
 QString token() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
 bool validToken(const QString &value) { return !QUuid(value).isNull() && !value.contains('/'); }
 bool validFingerprint(const QString &value) {
@@ -57,10 +59,10 @@ QString currentHead(const Library &lib, const QString &id) {
 void setHead(const Library &lib, const QString &id, const QString &snapshotId) {
     if (!snapshotId.isEmpty() && !validToken(snapshotId)) fail("Invalid current save snapshot ID.");
     if (snapshotId.isEmpty()) {
-        if (exists(headPath(lib, id)) && !QFile::remove(headPath(lib, id))) fail("Cannot clear the current save snapshot pointer.");
+        if (exists(headPath(lib, id))) removeDurableFile(headPath(lib, id));
         return;
     }
-    writeJson(headPath(lib, id), {{"schema", 1}, {"snapshot_id", snapshotId}});
+    writeDurableJson(headPath(lib, id), {{"schema", 1}, {"snapshot_id", snapshotId}});
 }
 SaveLocks::SaveLocks(const Library &lib, const QString &id, int mutationWaitMs)
     : mutation(lib.dataRoot() + "/mutation.lock"), launch(lib.gamePath(id, "launch.lock")) {

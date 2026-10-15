@@ -1,3 +1,5 @@
+#include "filesystem_checks.h"
+#include "filesystem_durability.h"
 #include "save_server_store.h"
 #include "core.h"
 #include "saves.h"
@@ -13,7 +15,7 @@
 namespace novelty {
 namespace {
 [[noreturn]] void fail(const QString &message) { throw std::runtime_error(message.toStdString()); }
-bool exists(const QString &path) { const QFileInfo info(path); return info.exists() || info.isSymbolicLink(); }
+bool exists(const QString &path) { return checkedExists(path); }
 void noLinks(const QString &path) {
     auto current = QString("/");
     for (const auto &part : QDir::cleanPath(QFileInfo(path).absoluteFilePath()).split('/', Qt::SkipEmptyParts)) {
@@ -41,8 +43,7 @@ void copyTree(const QString &source, const QString &destination, qint64 &bytes, 
     if (info.isSymbolicLink() || ++entries > 20000) fail("Save bundle has an unsafe link or too many entries.");
     if (info.isDir()) {
         if (!QDir().mkpath(destination)) fail("Cannot stage server save directory.");
-        for (const auto &child : QDir(source).entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::System |
-                                                              QDir::NoDotAndDotDot, QDir::Name))
+        for (const auto &child : checkedDirectoryEntries(source))
             copyTree(child.absoluteFilePath(), destination + '/' + child.fileName(), bytes, entries);
     } else if (info.isFile()) {
         if (info.size() < 0 || info.size() > 512LL * 1024 * 1024 - bytes)
@@ -124,27 +125,38 @@ void recoverPending(const QString &root, const QString &serverId, const QString 
     if (current.revision == revision) {
         if (current.snapshotId != snapshotId || current.bundleDirectory != final || exists(stage))
             fail("Server save publication intent disagrees with the current revision.");
-        if (!QFile::remove(intent)) fail("Cannot clear completed server save publication intent.");
+        removeDurableFile(intent);
         return;
     }
     if (current.revision != expected || (exists(stage) && exists(final)))
         fail("Server save publication intent disagrees with the current revision.");
+    const auto phase = record["phase"].toString();
+    if (phase == "copying") {
+        if (exists(final)) fail("An unverified server stage was published unexpectedly.");
+        if (exists(stage) && !QDir(stage).removeRecursively()) fail("Cannot clean interrupted server copy.");
+        persistParent(stage);
+        removeDurableFile(intent);
+        return;
+    }
+    if (!phase.isEmpty() && phase != "verified") fail("Unknown server publication phase.");
     const auto source = exists(final) ? final : stage;
     if (!exists(source)) {
         // Publication did not start. Keep the previously committed pointer.
-        if (!QFile::remove(intent)) fail("Cannot clear abandoned server save publication intent.");
+        removeDurableFile(intent);
         return;
     }
     const auto manifest = verifyPortableSaveBundle(source);
     if (manifest["id"].toString() != snapshotId)
         fail("Server save publication payload does not match its intent.");
+    persistTree(source); persistParent(source);
     if (source == stage && !QDir().rename(stage, final))
         fail("Cannot finish publishing verified server save payload.");
-    writeJson(game + "/current.json", pointerRecord(key, serverId, revision, snapshotId, storageId));
+    persistParent(final);
+    writeDurableJson(game + "/current.json", pointerRecord(key, serverId, revision, snapshotId, storageId));
     const auto published = readCurrent(root, serverId, key, true);
     if (published.revision != revision || published.snapshotId != snapshotId || published.bundleDirectory != final)
         fail("Cannot verify recovered server save publication.");
-    if (!QFile::remove(intent)) fail("Cannot clear completed server save publication intent.");
+    removeDurableFile(intent);
 }
 }
 
@@ -166,7 +178,7 @@ SaveServerStore::SaveServerStore(const QString &root) : root_(QDir::cleanPath(QF
         if (!QDir(root_ + "/games").entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty())
             fail("Server identity is missing from an existing save store.");
         serverId_ = freshId();
-        writeJson(identity, {{"schema", 1}, {"server_id", serverId_}});
+        writeDurableJson(identity, {{"schema", 1}, {"server_id", serverId_}});
     } else {
         noLinks(identity);
         const auto record = readJson(identity);
@@ -215,25 +227,30 @@ ServerSaveRevision SaveServerStore::put(const QString &gameKey, int expectedRevi
     noLinks(stage); noLinks(final);
     if (exists(stage) || exists(final) || !QDir().mkpath(game + "/revisions"))
         fail("Cannot create server save stage.");
+    const auto intent = game + "/.inProgress";
+    noLinks(intent);
+    if (exists(intent)) fail("A server save publication is already in progress.");
+    QJsonObject publication{{"schema", 1}, {"game_key", gameKey}, {"server_id", serverId_},
+        {"expected_revision", previous.revision}, {"revision", previous.revision + 1},
+        {"snapshot_id", source["id"].toString()}, {"storage_id", nonce}, {"phase", "copying"}};
+    writeDurableJson(intent, publication); // establishes ownership before any copy is staged
     try {
         qint64 bytes = 0; int entries = 0;
         copyTree(bundleDirectory, stage, bytes, entries);
         const auto staged = verifyPortableSaveBundle(stage);
         if (staged != source) fail("Save bundle changed while staging the server revision.");
-        const auto intent = game + "/.inProgress";
-        noLinks(intent);
-        if (exists(intent)) fail("A server save publication is already in progress.");
-        writeJson(intent, {{"schema", 1}, {"game_key", gameKey}, {"server_id", serverId_},
-            {"expected_revision", previous.revision}, {"revision", previous.revision + 1},
-            {"snapshot_id", source["id"].toString()}, {"storage_id", nonce}});
+        persistTree(stage); persistParent(stage);
+        publication["phase"] = "verified";
+        writeDurableJson(intent, publication);
         if (!QDir().rename(stage, final)) fail("Cannot publish verified server save payload.");
-        writeJson(game + "/current.json", pointerRecord(gameKey, serverId_, previous.revision + 1,
+        persistParent(final); persistParent(stage);
+        writeDurableJson(game + "/current.json", pointerRecord(gameKey, serverId_, previous.revision + 1,
                                                        source["id"].toString(), nonce));
         const auto published = readCurrent(root_, serverId_, gameKey, true);
         if (published.revision != previous.revision + 1 ||
             published.snapshotId != source["id"].toString() || published.bundleDirectory != final)
             fail("Cannot verify published server save revision.");
-        if (!QFile::remove(intent)) fail("Cannot clear completed server save publication intent.");
+        removeDurableFile(intent);
     } catch (...) {
         if (!exists(game + "/.inProgress") && QFileInfo(stage).isDir()) QDir(stage).removeRecursively();
         throw;

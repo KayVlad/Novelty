@@ -1,3 +1,5 @@
+#include "filesystem_checks.h"
+#include "filesystem_durability.h"
 #include "save_internal.h"
 
 namespace novelty {
@@ -22,14 +24,9 @@ void inspectNode(const QString &path, const QString &relative, QJsonArray &entri
     if (info.isDir()) {
         if (!info.isReadable() || !info.isExecutable()) fail("Cannot read save directory: " + path);
         entries.append(QJsonObject{{"path", relative}, {"type", "directory"}});
-        QFileInfoList children;
-        QDirIterator it(path, QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot);
-        while (it.hasNext()) {
-            children.append(it.nextFileInfo());
-            if (budget && children.size() + budget->entries > 20000)
-                fail("Save folder has too many entries. Choose a more specific save location.");
-        }
-        std::sort(children.begin(), children.end(), [](const auto &a, const auto &b) { return a.fileName() < b.fileName(); });
+        const auto children = checkedDirectoryEntries(path);
+        if (budget && children.size() + budget->entries > 20000)
+            fail("Save folder has too many entries. Choose a more specific save location.");
         for (const auto &child : children)
             inspectNode(child.absoluteFilePath(), relative.isEmpty() ? child.fileName() : relative + '/' + child.fileName(), entries, budget, depth + 1);
     } else if (info.isFile()) {
@@ -59,8 +56,7 @@ void copyNode(const QString &source, const QString &destination) {
     if (info.isSymbolicLink()) fail("Save mapping contains a symbolic link: " + source);
     if (info.isDir()) {
         if (!QDir().mkpath(destination)) fail("Cannot create snapshot directory: " + destination);
-        const QDir dir(source);
-        for (const auto &child : dir.entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot, QDir::Name))
+        for (const auto &child : checkedDirectoryEntries(source))
             copyNode(child.absoluteFilePath(), QDir(destination).filePath(child.fileName()));
     } else if (info.isFile()) {
         if (!QDir().mkpath(QFileInfo(destination).absolutePath()) || !QFile::copy(source, destination))
@@ -206,7 +202,9 @@ SaveSnapshot snapshotLocked(Library &lib, const Game &game, const SaveConfig &co
             fail("Save backup metadata exceeds the portable snapshot limit. Choose a more specific save location.");
         writeJson(stage + "/manifest.json", manifest);
         verifySnapshot(stage, manifest);
+        persistTree(stage); persistParent(stage);
         if (!QDir().rename(stage, final)) fail("Cannot publish save snapshot.");
+        persistParent(final);
         setHead(lib, game.id, result.id);
         return result;
     } catch (...) { if (QFileInfo(stage).isDir()) QDir(stage).removeRecursively(); throw; }
@@ -488,7 +486,9 @@ SaveImportResult importSaveSnapshotLocked(Library &lib, const QString &gameId, c
             copyNode(source, stage);
             if (readJson(stage + "/manifest.json") != manifest) fail("Imported save manifest changed during copying.");
             verifySnapshot(stage, manifest);
+            persistTree(stage); persistParent(stage);
             if (!QDir().rename(stage, target)) fail("Cannot publish imported save snapshot.");
+            persistParent(target);
             added = true;
         } catch (...) { if (QFileInfo(stage).isDir()) QDir(stage).removeRecursively(); throw; }
     }
@@ -516,7 +516,7 @@ void queuePostExitSaveSnapshot(const Library &lib, const Game &game) {
     const auto config = loadSaveConfig(lib, game.id);
     if (config.mappings.isEmpty()) return;
     if (exists(pendingPath(lib, game.id))) return;
-    writeJson(pendingPath(lib, game.id), {{"schema", 1}, {"game_id", game.id},
+    writeDurableJson(pendingPath(lib, game.id), {{"schema", 1}, {"game_id", game.id},
         {"created", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}, {"config", configJson(config)}});
 }
 void finishPostExitSaveSnapshot(Library &lib, const Game &game) {

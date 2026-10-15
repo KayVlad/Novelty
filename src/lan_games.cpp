@@ -1,3 +1,4 @@
+#include "filesystem_durability.h"
 #include "lan_games.h"
 #include "saves.h"
 #include "devices.h"
@@ -655,10 +656,12 @@ void LanGameExchange::finalize() {
     for (const auto &local : library_.games())
         if (loadSaveConfig(library_, local.id).profileGameId == remoteGameId_ && local.folder != destination)
             throw std::runtime_error("This paired-device game was installed during the transfer.");
+    persistTree(stage_); persistParent(stage_);
     if (stage_ != destination) {
         if (QFileInfo(destination).exists() || QFileInfo(destination).isSymbolicLink())
             throw std::runtime_error("A game folder with this name already exists in Games. The verified transfer is kept.");
         if (!QDir().rename(stage_, destination)) throw std::runtime_error("Cannot place verified game in Games.");
+        persistParent(destination); persistParent(stage_);
         stage_ = destination;
     }
     Game local;
