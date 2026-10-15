@@ -1,3 +1,4 @@
+#include "game_environment.h"
 #include "core.h"
 #include "setup.h"
 #include "recipes.h"
@@ -44,6 +45,9 @@ Command launchCommand(const Library &lib, const Game &g, bool prepare) {
     const auto identity = folderIdentity(g.folder);
     if (!g.folderIdentity.isEmpty() && identity != g.folderIdentity)
         fail("This folder is a different installation. Use Manage → Relink folder before launching it with this game's prefix.");
+    for (auto it = g.environment.begin(); it != g.environment.end(); ++it)
+        if (!supportedGameEnvironment(it.key(), it.value()))
+            fail("Unsupported game environment variable " + it.key() + ". Review it in Manage before Play.");
     Command c; c.environment = externalToolEnvironment(); c.cwd = g.workingDirectory;
     if (g.backend == "steam") {
         if (prepare) fail("Prepare this shortcut in Steam; the current adapter launches existing shortcuts only.");
@@ -245,6 +249,7 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
             // Persist before dispatch: a crash immediately after sending must not enable deletion.
             writeJson(lib.gamePath(id, "steam-request.json"), {{"state", "untracked"}, {"updated", now()}});
             QProcess p; p.setProgram(cmd.program); p.setArguments(cmd.arguments); p.setWorkingDirectory(cmd.cwd);
+            p.setProcessEnvironment(cmd.environment);
             if (!p.startDetached()) fail("Steam could not receive the launch request.");
             lib.recordStatus(id, "Requested in Steam", "Steam owns the game process. Novelty cannot confirm shortcut startup or exit.");
             return 0;

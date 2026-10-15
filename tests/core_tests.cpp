@@ -19,6 +19,7 @@
 #include <QtCore/qjsonarray.h>
 #include <QtCore/qset.h>
 #include <QtCore/qtemporarydir.h>
+#include <QtCore/qstandardpaths.h>
 #include <QtCore/qthread.h>
 #include <QtCore/qlockfile.h>
 #include <QtCore/quuid.h>
@@ -973,6 +974,14 @@ void testSteamShortcut(const QString &base) {
     require(updated.added && updated.appId == added.appId && contents(account).contains(movedExecutable.toUtf8()) &&
             !addSteamShortcut(lib, game, account, movedExecutable).added,
             "repeat Add updates a moved app path without changing the shortcut ID");
+    for (const auto &path : {"/Novelty$(touch injected)", "/Novelty`touch injected`", "/Novelty\\app"}) {
+        const auto unsafePath = base + QString::fromUtf8(path);
+        touch(unsafePath, "fake executable");
+        QFile::setPermissions(unsafePath, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        const auto before = contents(account);
+        rejects([&] { addSteamShortcut(lib, game, account, unsafePath); }, "Steam shell expansion rejected");
+        require(contents(account) == before, "unsafe shortcut leaves existing VDF unchanged");
+    }
     const auto damaged = base + "/Damaged Steam/config/shortcuts.vdf";
     touch(damaged, "not binary VDF");
     rejects([&] { addSteamShortcut(lib, game, damaged, executable); }, "unrecognized Steam format fails without editing it");
@@ -1078,7 +1087,7 @@ printf 'Synthetic Wine loader output\n'
     QFile::setPermissions(fake, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     Library lib(root); lib.setSettings({{"umu", fake}}); lib.import(discover(root), runner);
     auto g = lib.games().first(); g.environment["WINEDEBUG"] = "saved-preset";
-    g.environment["SECRET_TOKEN"] = "never-export-this-value";
+    g.environment["NOVELTY_APP_SECRET_TOKEN"] = "never-export-this-value";
     g.arguments = {"--secret=also-never-export"}; lib.save(g); g = lib.game(g.id);
     const auto original = g.json();
     require(supervise(lib, g.id, false, {}, {}, false, true) == 0, "one-time debug launch works");
@@ -1089,7 +1098,7 @@ printf 'Synthetic Wine loader output\n'
     const auto report = diagnosticReport(lib, g.id);
     const auto payload = QJsonDocument(report).toJson();
     require(report["schema"] == 1 && report["game"].toObject()["id"] == g.id && report["launch_log"].toString().contains("Synthetic Wine loader output"), "diagnostic report captures saved state and current log");
-    require(report["game"].toObject()["environment_names"].toArray().contains("SECRET_TOKEN") &&
+    require(report["game"].toObject()["environment_names"].toArray().contains("NOVELTY_APP_SECRET_TOKEN") &&
             !payload.contains("never-export-this-value") && !payload.contains("also-never-export"), "diagnostic report omits custom environment values and arguments");
     require(supervise(lib, g.id, false) == 0 && lib.game(g.id).json() == original, "ordinary Play resumes saved configuration");
     require(observed.open(QIODevice::ReadOnly) && observed.readAll() == "saved-preset\n", "debug override did not persist into normal launch"); observed.close();
@@ -1112,11 +1121,11 @@ if [ "$2" = "/c" ]; then mkdir -p "$WINEPREFIX/drive_c"; touch "$WINEPREFIX/syst
 printf '%s\n' "$1" "$PWD" >> "$WINEPREFIX/installer-invocations"
 printf '%s\n' "$HOST_LC_ALL" "$LANG" > "$WINEPREFIX/installer-locale"
 [ -f data.bin ] || exit 42
-[ "$INSTALL_MODE" = fail ] && exit 7
-[ "$INSTALL_MODE" = empty ] && exit 0
+[ "$NOVELTY_APP_INSTALL_MODE" = fail ] && exit 7
+[ "$NOVELTY_APP_INSTALL_MODE" = empty ] && exit 0
 mkdir -p "$WINEPREFIX/dosdevices/n:/Novel/renpy" "$WINEPREFIX/dosdevices/n:/Novel/game"
 touch "$WINEPREFIX/dosdevices/n:/Novel/Story.exe" "$WINEPREFIX/dosdevices/n:/Novel/renpy/__init__.py"
-[ "$INSTALL_MODE" = multiple ] && touch "$WINEPREFIX/dosdevices/n:/Novel/Alt.exe"
+[ "$NOVELTY_APP_INSTALL_MODE" = multiple ] && touch "$WINEPREFIX/dosdevices/n:/Novel/Alt.exe"
 exit 0
 )SH");
     QFile::setPermissions(fake, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
@@ -1151,9 +1160,9 @@ exit 0
     require(localeRecord.open(QIODevice::ReadOnly) && localeRecord.readAll() == "ja_JP.UTF-8\nja_JP.UTF-8\n", "installer receives Japanese locale in its real command environment"); localeRecord.close();
     require(lib.game(japanese.id).locale == "ja_JP.UTF-8", "installed game keeps selected Japanese locale");
     require(supervise(lib, g.id, false, {}, {}, true) == 1, "completed installer cannot be silently rerun");
-    auto failed = lib.createInstallation("Retry", source, runner); failed.environment["INSTALL_MODE"] = "fail"; lib.save(failed);
+    auto failed = lib.createInstallation("Retry", source, runner); failed.environment["NOVELTY_APP_INSTALL_MODE"] = "fail"; lib.save(failed);
     require(supervise(lib, failed.id, false, {}, {}, true) == 1 && lib.game(failed.id).installPending, "failed installer remains recoverable");
-    touch(lib.prefix(failed.id) + "/keep-save", "save"); failed.environment["INSTALL_MODE"] = "empty"; lib.save(failed);
+    touch(lib.prefix(failed.id) + "/keep-save", "save"); failed.environment["NOVELTY_APP_INSTALL_MODE"] = "empty"; lib.save(failed);
     require(supervise(lib, failed.id, false, {}, {}, true) == 0 && lib.game(failed.id).installPending, "empty successful install stays pending");
     require(lib.status(lib.game(failed.id)) == "Installation pending", "empty installer gives actionable pending status");
     const auto completed = readJson(lib.gamePath(failed.id, "extra-launch.json"));
@@ -1167,7 +1176,7 @@ exit 0
             chosenAfterInstall.executable == manual.folder + "/manual.EXE" &&
             QFileInfo::exists(lib.prefix(manual.id) + "/keep-save"),
             "explicit executable selection completes pending install without losing prefix saves");
-    auto multiple = lib.createInstallation("Ambiguous", source, runner); multiple.environment["INSTALL_MODE"] = "multiple"; lib.save(multiple);
+    auto multiple = lib.createInstallation("Ambiguous", source, runner); multiple.environment["NOVELTY_APP_INSTALL_MODE"] = "multiple"; lib.save(multiple);
     require(supervise(lib, multiple.id, false, {}, {}, true) == 0, "multi-executable installer completes");
     require(!lib.game(multiple.id).installPending && lib.game(multiple.id).executable.isEmpty(), "ambiguous installed executables require user choice");
     auto conflict = lib.createInstallation("Mapping conflict", source, runner);
@@ -1214,8 +1223,7 @@ void testSchemaAndManagedRunners(const QString &base) {
             pinnedCommand.environment.value("UMU_FOLDERS_PATH") == QProcessEnvironment::systemEnvironment().value("UMU_FOLDERS_PATH"),
             "existing libraries keep their prior umu runtime location");
     auto redirected = g; redirected.environment["UMU_FOLDERS_PATH"] = base + "/outside";
-    require(launchCommand(lib, redirected).environment.value("UMU_FOLDERS_PATH") == base + "/outside",
-            "legacy runtime overrides remain editable");
+    rejects([&] { launchCommand(lib, redirected); }, "legacy game runtime redirects require explicit review under the environment policy");
     touch(old, "#!/bin/sh\n"); QFile::setPermissions(old, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     const auto legacyCommand = launchCommand(lib, g); qputenv("PATH", oldPath);
     require(pinnedCommand.program == pinned, "pinned umu fills a missing default executable");
@@ -1292,7 +1300,7 @@ if [ "$2" = "/c" ]; then
     mkdir -p "$WINEPREFIX"; touch "$WINEPREFIX/system.reg"
 else
     printf '%s\n' "$PWD" "$@" > "$WINEPREFIX/invocation"
-    exit "${EXTRA_EXIT:-0}"
+    exit "${NOVELTY_APP_EXTRA_EXIT:-0}"
 fi
 )SH");
     QFile::setPermissions(fake, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
@@ -1326,7 +1334,7 @@ fi
     rejects([&] { extraLaunchCommand(lib, steam, extra); }, "Steam extra launch rejected");
     QLockFile lock(lib.gamePath(g.id, "launch.lock")); require(lock.tryLock(), "hold extra prefix lock");
     require(supervise(lib, g.id, false, {}, extra) == 2 && readJson(recordPath) == record, "busy extra launch preserves prior operation"); lock.unlock();
-    g.environment["EXTRA_EXIT"] = "19"; lib.save(g);
+    g.environment["NOVELTY_APP_EXTRA_EXIT"] = "19"; lib.save(g);
     require(supervise(lib, g.id, false, {}, extra) == 1, "failed extra executable reports failure");
     require(readJson(recordPath)["state"] == "failed" && readJson(recordPath)["exit_code"] == 19 && readJson(recordPath + ".previous") == record, "failed operation retains exit code and previous operation");
     // A live operation may use a patch stored in another game's folder or prefix.
@@ -1354,13 +1362,13 @@ if [ "$2" = "/c" ]; then
     touch "$WINEPREFIX/system.reg" "$WINEPREFIX/drive_c/windows/system32/winecfg.exe" "$WINEPREFIX/drive_c/windows/regedit.exe"
 else
     printf '%s\n' "$@" > "$WINEPREFIX/tool-invocation"
-    exit "${TOOL_EXIT:-0}"
+    exit "${NOVELTY_APP_TOOL_EXIT:-0}"
 fi
 )SH");
     QFile::setPermissions(fake, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     Library lib(root); lib.setSettings({{"umu", fake}}); lib.import(discover(root), runner);
     auto g = lib.games().first(); g.executable = g.folder + "/game.exe"; g.arguments = {"game-only"};
-    g.locale = "ja_JP.UTF-8"; g.environment["CUSTOM"] = "kept"; lib.save(g); g = lib.game(g.id);
+    g.locale = "ja_JP.UTF-8"; g.environment["NOVELTY_APP_CUSTOM"] = "kept"; lib.save(g); g = lib.game(g.id);
     const auto saved = g.json(); const auto prefix = lib.prefix(g.id); touch(prefix + "/save.dat", "keep save");
     for (const auto &tool : {QString("winecfg"), QString("regedit")}) {
         const auto cmd = prefixToolCommand(lib, g, tool);
@@ -1368,7 +1376,7 @@ fi
         require(cmd.arguments == QStringList{executable}, "prefix tool uses its own executable without game arguments");
         require(cmd.program == fake && cmd.environment.value("PROTONPATH") == runner &&
                 cmd.environment.value("WINEPREFIX") == prefix && cmd.environment.value("HOST_LC_ALL") == g.locale &&
-                cmd.environment.value("CUSTOM") == "kept", "prefix tools retain selected backend, runner, prefix and overrides");
+                cmd.environment.value("NOVELTY_APP_CUSTOM") == "kept", "prefix tools retain selected backend, runner, prefix and overrides");
         require(supervise(lib, g.id, false, tool) == 0 && setupComplete(lib, g), "tool prepares its prefix before opening");
         QFile invocation(prefix + "/tool-invocation");
         require(invocation.open(QIODevice::ReadOnly) && invocation.readAll() == (executable + '\n').toUtf8(), "supervised tool receives the exact prefix utility path");
@@ -1381,7 +1389,7 @@ fi
     require(supervise(lib, g.id, false, "winecfg") == 2, "tool cannot bypass a running game's lock"); lock.unlock();
     QFile::remove(prefix + "/drive_c/windows/regedit.exe"); QFile::remove(prefix + "/tool-invocation");
     require(supervise(lib, g.id, false, "regedit") == 1 && !QFileInfo::exists(prefix + "/tool-invocation"), "missing utility does not launch a different executable");
-    g.environment["TOOL_EXIT"] = "17"; lib.save(g);
+    g.environment["NOVELTY_APP_TOOL_EXIT"] = "17"; lib.save(g);
     require(supervise(lib, g.id, false, "winecfg") == 1 &&
         readJson(lib.gamePath(g.id, "status.json"))["message"].toString().contains("winecfg exited with code 17"), "tool failures retain actionable logs");
     QFile save(prefix + "/save.dat"); require(save.open(QIODevice::ReadOnly) && save.readAll() == "keep save", "tool orchestration keeps existing saves");
@@ -1481,7 +1489,7 @@ exit 0
     require(supervise(lib, id, false) == 0 && readJson(recipePath)["inputs"].toObject()["runner_version"] == "two", "runner change prepares and records new version");
     g.locale = "ja_JP.UTF-8"; lib.save(g);
     require(!setupComplete(lib, g) && supervise(lib, id, false) == 0, "locale change receives setup verification");
-    g.environment["CUSTOM"] = "changed"; lib.save(g);
+    g.environment["NOVELTY_APP_CUSTOM"] = "changed"; lib.save(g);
     require(!setupComplete(lib, g) && supervise(lib, id, false) == 0, "environment change receives setup verification");
     touch(prefix + "/mode", "runner-change");
     require(supervise(lib, id, true) == 1 && !setupComplete(lib, g), "runner changed during preparation cannot receive completion");
@@ -1545,14 +1553,14 @@ touch "$WINEPREFIX/played"; exit 0
             {"name", "Media game"}, {"inherits", "media-base"},
             {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"file", "game.exe"}}}}}},
             {"settings", QJsonObject{{"winetricks", verbs},
-                {"environment", QJsonObject{{"CUSTOM", "value"}}}}}}).toJson());
+                {"environment", QJsonObject{{"NOVELTY_APP_CUSTOM", "value"}}}}}}).toJson());
     };
     writeGame(QJsonArray{"wmp11", "qasf"});
     auto effective = loadRecipes(root);
     for (const auto &recipe : effective) if (recipe.id == "media-game") {
         require(recipe.settings["winetricks"].toArray() == QJsonArray({"quartz", "wmp11", "qasf"}) &&
                 recipe.settings["environment"].toObject()["TZ"] == "Asia/Tokyo" &&
-                recipe.settings["environment"].toObject()["CUSTOM"] == "value",
+                recipe.settings["environment"].toObject()["NOVELTY_APP_CUSTOM"] == "value",
                 "inheritance merges environment and deduplicates components in parent-first order");
     }
     auto invalid = parent; invalid["id"] = "bad-verb";
@@ -1636,7 +1644,10 @@ touch "$WINEPREFIX/played"; exit 0
 }
 void testSteamRemovalGuard(const QString &base, const QString &runner) {
     const auto root = base + "/Steam removal guard"; touch(root + "/Game/game.exe");
-    const auto fake = base + "/fake-steam"; touch(fake, "#!/bin/sh\nexec touch steam-received\n");
+    const auto fake = base + "/fake-steam"; touch(fake, R"SH(#!/bin/sh
+printf '%s\n' "$LD_LIBRARY_PATH" "$QT_PLUGIN_PATH" > steam-environment
+exec touch steam-received
+)SH");
     QFile::setPermissions(fake, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     Library lib(root); lib.setSettings({{"steam", fake}}); lib.import(discover(root), runner);
     auto g = lib.games().first(); auto plan = lib.planRemoval(g.id);
@@ -1645,10 +1656,17 @@ void testSteamRemovalGuard(const QString &base, const QString &runner) {
     rejects([&] { lib.planRemoval(g.id); }, "Steam removal blocked without lifecycle tracking");
     plan.original = lib.game(g.id);
     rejects([&] { lib.remove(plan); }, "Steam removal guard enforced during apply");
+    const auto originalLibraryPath = qgetenv("LD_LIBRARY_PATH"), originalPlugins = qgetenv("QT_PLUGIN_PATH");
+    qputenv("NOVELTY_BUNDLED_LIB_DIR", "/fake-bundle"); qputenv("LD_LIBRARY_PATH", "/fake-bundle/lib");
+    qputenv("QT_PLUGIN_PATH", "/fake-bundle/plugins");
+    qputenv("NOVELTY_ORIGINAL_LD_LIBRARY_PATH", "/host/lib"); qputenv("NOVELTY_ORIGINAL_QT_PLUGIN_PATH", "/host/plugins");
     require(supervise(lib, g.id, false) == 0, "fake Steam request dispatched");
+    qputenv("LD_LIBRARY_PATH", originalLibraryPath); qputenv("QT_PLUGIN_PATH", originalPlugins);
+    qunsetenv("NOVELTY_BUNDLED_LIB_DIR"); qunsetenv("NOVELTY_ORIGINAL_LD_LIBRARY_PATH"); qunsetenv("NOVELTY_ORIGINAL_QT_PLUGIN_PATH");
     QElapsedTimer timeout; timeout.start();
     while (!QFileInfo::exists(g.folder + "/steam-received") && timeout.elapsed() < 2000) QThread::msleep(10);
     require(QFileInfo::exists(g.folder + "/steam-received"), "fake Steam receives request before fixture cleanup");
+    require(contents(g.folder + "/steam-environment") == "/host/lib\n/host/plugins\n", "detached Steam dispatch uses the sanitized host environment");
     require(QFileInfo::exists(lib.gamePath(g.id, "steam-request.json")), "untracked Steam request persisted");
     g.backend = "umu"; lib.save(g); writeJson(lib.gamePath(g.id, "status.json"), {{"state", "Ready"}});
     {
@@ -1743,7 +1761,7 @@ void testRelinking(const QString &base, const QString &runner, const QString &fa
     touch(folder + "/bin/game.exe");
     Library lib(root); lib.setSettings({{"umu", fake}}); lib.import(discover(root), runner);
     auto g = lib.games().first(); const auto id = g.id;
-    g.name = "Custom name"; g.arguments = {"argument with spaces"}; g.environment["CUSTOM"] = "keep"; lib.save(g); g = lib.game(id);
+    g.name = "Custom name"; g.arguments = {"argument with spaces"}; g.environment["NOVELTY_APP_CUSTOM"] = "keep"; lib.save(g); g = lib.game(id);
     require(supervise(lib, id, true) == 0, "relink fixture prefix prepared");
     const auto prefix = lib.prefix(id); touch(prefix + "/save.dat", "keep my save");
     const auto revision = g.runnerRevision; touch(runner + "/version", "changed-during-relink\n");
@@ -1793,7 +1811,7 @@ void testRelinking(const QString &base, const QString &runner, const QString &fa
     g = lib.game(id);
     require(g.folder == renamed && g.executable == renamed + "/bin/game.exe", "automatic relink remaps executable");
     require(g.workingDirectory == renamed + "/bin", "automatic relink remaps working directory");
-    require(g.name == "Custom name" && g.arguments.size() == 1 && g.environment["CUSTOM"] == "keep", "relink preserves customization");
+    require(g.name == "Custom name" && g.arguments.size() == 1 && g.environment["NOVELTY_APP_CUSTOM"] == "keep", "relink preserves customization");
     require(g.runnerRevision == revision && lib.status(g) == "Runner changed", "relink does not accept runner update");
     require(lib.import(snapshot.candidates, runner) == 0, "renamed directory does not duplicate entry");
     require(lib.prefix(id) == prefix && QFileInfo::exists(prefix + "/save.dat"), "relink keeps prefix and save data");
@@ -1951,6 +1969,12 @@ int main(int argc, char **argv) {
             QLockFile lock(lib.gamePath(id, "launch.lock")); require(lock.tryLock(), "prefix lock");
             require(lib.busy(id), "busy state"); require(supervise(lib, id, false) == 2, "concurrent launch rejected");
             rejects([&] { lib.save(g); }, "editing busy game rejected"); lock.unlock();
+            for (const auto &key : {"LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "BASH_ENV", "PROTON_REMOTE_DEBUG_CMD"}) {
+                auto unsafe = g; unsafe.environment[key] = "unsafe";
+                rejects([&] { launchCommand(lib, unsafe); }, "host execution environment rejected at launch");
+                unsafe.backend = "native";
+                rejects([&] { launchCommand(lib, unsafe); }, "native launch also rejects host execution environment");
+            }
             g.environment["WINEPREFIX"] = "/tmp/other";
             rejects([&] { launchCommand(lib, g); }, "prefix override rejected"); g.environment.remove("WINEPREFIX");
             auto settings = lib.settings(); settings["umu"] = "/missing/umu"; lib.setSettings(settings);

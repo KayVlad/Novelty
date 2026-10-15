@@ -55,8 +55,9 @@ void integer(QByteArray &out, const QByteArray &name, quint32 value) {
     for (int i = 0; i < 4; ++i) out.append(char((value >> (8 * i)) & 0xff));
 }
 QByteArray quoted(const QString &path) {
-    if (path.contains('"') || path.contains('\n') || path.contains('\r') || path.contains(QChar::Null))
-        fail("Steam shortcut paths cannot contain quotes or line breaks.");
+    if (path.contains('"') || path.contains('\n') || path.contains('\r') || path.contains(QChar::Null) ||
+        path.contains('$') || path.contains('`') || path.contains('\\'))
+        fail("Steam shortcut paths cannot contain quotes, line breaks, backslashes, dollar signs or backticks.");
     return ('"' + path + '"').toUtf8();
 }
 void commit(const QString &path, const QByteArray &original, const QByteArray &modified) {

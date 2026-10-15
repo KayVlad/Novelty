@@ -81,14 +81,14 @@ void recipeContract(const QString &base) {
     auto bytes = recipe("configured-game", {{"inherits", "general-game"},
         {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"file", "game.exe"}}}}}}},
         {{"runner", "GE-Proton96-1"}, {"locale", "ja_JP.UTF-8"}, {"arguments", QJsonArray{"recipe argument"}},
-         {"environment", QJsonObject{{"RECIPE", "original"}}}, {"umu_launcher", "umu-latest"},
+         {"environment", QJsonObject{{"NOVELTY_APP_RECIPE", "original"}}}, {"umu_launcher", "umu-latest"},
          {"umu_game_id", "umu-recipe"}, {"store", "gog"}, {"steam_id", "123"}});
     saveRecipe(root, "games", bytes);
     library.import({inspect(folder, root)}, newer);
     auto game = library.games().first();
     check(game.runnerSelector == "GE-Proton96-1" && game.runner.isEmpty() && game.umuLauncher == "umu-latest" &&
           game.umuGameId == "umu-recipe" && game.store == "gog" && game.steamId == "123", "recipe defines launch configuration ahead of library defaults");
-    game.locale = "en_US.UTF-8"; game.arguments = {"manual argument"}; game.environment = {{"MANUAL", "yes"}};
+    game.locale = "en_US.UTF-8"; game.arguments = {"manual argument"}; game.environment = {{"NOVELTY_APP_MANUAL", "yes"}};
     game.umuGameId = "umu-custom"; game.store = "itchio"; game.steamId = "456"; game.umuLauncher.clear();
     game.selectRunner("ge-proton-latest"); library.save(game);
     QFile original(recipePath(root, "games", "configured-game"));
@@ -101,7 +101,7 @@ void recipeContract(const QString &base) {
     saveRecipe(root, "games", QJsonDocument(document).toJson());
     library.applyRecipe(game.id, "configured-game"); game = library.game(game.id);
     check(game.locale == "en_US.UTF-8" && game.arguments == QStringList{"manual argument"} &&
-          game.environment == QMap<QString, QString>{{"MANUAL", "yes"}} && game.umuLauncher.isEmpty() &&
+          game.environment == QMap<QString, QString>{{"NOVELTY_APP_MANUAL", "yes"}} && game.umuLauncher.isEmpty() &&
           game.umuGameId == "umu-custom" && game.store == "itchio" && game.steamId == "456" && game.runner == newer,
           "reapplying an edited recipe preserves explicit overrides including cleared values");
     Recipe parent;
@@ -221,16 +221,16 @@ int main(int argc, char **argv) {
         library.import({inspect(folder, root)}, {});
         auto game = library.games().first();
         check(game.category == "visual_novel" && game.engine == "unknown", "import persists JSON category");
-        game.locale = "en_US.UTF-8"; game.environment["CUSTOM"] = "value"; library.save(game);
+        game.locale = "en_US.UTF-8"; game.environment["NOVELTY_APP_CUSTOM"] = "value"; library.save(game);
         game = library.game(game.id);
         check(game.recipeOverrides.contains("locale") && game.recipeOverrides.contains("environment"), "manual edits have explicit provenance");
         saveRecipe(root, "games", recipe("vn-game", {{"inherits", "general-vn"},
             {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"type", "file"}, {"path", "Story.exe"}}}}}}},
             {{"engine", "unknown"}, {"environment", QJsonObject{{"TZ", "Europe/Dublin"}}}}));
         const auto preview = library.previewRecipe(game.id, "vn-game");
-        check(preview.locale == "en_US.UTF-8" && preview.environment["CUSTOM"] == "value", "preview preserves user edits");
+        check(preview.locale == "en_US.UTF-8" && preview.environment["NOVELTY_APP_CUSTOM"] == "value", "preview preserves user edits");
         library.applyRecipe(game.id, "vn-game"); game = library.game(game.id);
-        check(game.environment["CUSTOM"] == "value" && game.locale == "en_US.UTF-8", "applying new revision preserves overrides");
+        check(game.environment["NOVELTY_APP_CUSTOM"] == "value" && game.locale == "en_US.UTF-8", "applying new revision preserves overrides");
         QStringList omissions;
         const auto recipes = loadRecipes(root);
         const Recipe *parent = nullptr;
@@ -276,6 +276,13 @@ int main(int argc, char **argv) {
             {{"executable", "../outside.exe"}})); });
         rejects([&] { saveRecipe(root, "games", recipe("bad-env", {{"category", "game"}},
             {{"environment", QJsonObject{{"WINEPREFIX", "/tmp/evil"}}}})); });
+        for (const auto &key : {"LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "BASH_ENV",
+                                "ENV", "PATH", "WINELOADER", "PROTON_REMOTE_DEBUG_CMD", "SDL_DYNAMIC_API"})
+            rejects([&] { saveRecipe(root, "games", recipe("bad-host-env", {{"category", "game"}},
+                {{"environment", QJsonObject{{key, "unsafe"}}}})); });
+        saveRecipe(root, "games", recipe("supported-env", {{"category", "game"}},
+            {{"environment", QJsonObject{{"TZ", "Europe/Dublin"}, {"DXVK_HUD", "fps"},
+                {"PROTON_NO_ESYNC", "1"}, {"WINEDLLOVERRIDES", "example=b"}}}}));
         rejects([&] { saveRecipe(root, "games", recipe("bad-key", {{"category", "game"}},
             {{"script", "touch /tmp/evil"}})); });
         const auto catalog = parseGeCatalog(QJsonDocument(QJsonArray{
@@ -369,18 +376,18 @@ int main(int argc, char **argv) {
                 runners.applyRecipe(id, "runner-a"); game = runners.game(id);
                 check(game.runner == root + "/.novelty/runners/" + c && game.recipeOverrides["runner"] == game.runner,
                       "explicit runner C survives a recipe change");
-                game.environment = {{"TZ", "Asia/Tokyo"}, {"CUSTOM", "portable"}, {"API_TOKEN", "secret-value-123"},
+                game.environment = {{"TZ", "Asia/Tokyo"}, {"NOVELTY_APP_CUSTOM", "portable"}, {"API_TOKEN", "secret-value-123"},
                     {"HTTP_AUTHORIZATION", "Bearer secret-header-456"}, {"CACHE_DIR", "/home/deck/private-cache"},
                     {"WINDOWS_CACHE", "C:\\Users\\deck\\Private"}, {"OPTIONS", "--cache=/home/deck/private"},
                     {"EXTRA_FLAGS", "Authorization: Bearer secret-flags-789"},
-                    {"CDN_URL", "https://example.invalid/assets"}};
+                    {"NOVELTY_APP_CDN_URL", "https://example.invalid/assets"}};
                 runners.save(game); game = runners.game(id);
                 QStringList omissions;
                 const auto exported = gameRecipeDocument(game, "portable-runner", root, nullptr, &omissions);
                 const auto bytes = QJsonDocument(exported).toJson();
                 const auto environment = exported["settings"].toObject()["environment"].toObject();
-                check(environment["TZ"] == "Asia/Tokyo" && environment["CUSTOM"] == "portable" &&
-                      environment["CDN_URL"] == "https://example.invalid/assets", "portable environment survives export");
+                check(environment["TZ"] == "Asia/Tokyo" && environment["NOVELTY_APP_CUSTOM"] == "portable" &&
+                      environment["NOVELTY_APP_CDN_URL"] == "https://example.invalid/assets", "portable environment survives export");
                 check(!environment.contains("API_TOKEN") && !environment.contains("HTTP_AUTHORIZATION") &&
                       !environment.contains("CACHE_DIR") && !environment.contains("WINDOWS_CACHE") &&
                       !environment.contains("OPTIONS") && !environment.contains("EXTRA_FLAGS") &&

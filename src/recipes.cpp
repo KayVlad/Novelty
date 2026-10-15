@@ -1,3 +1,4 @@
+#include "game_environment.h"
 #include "recipes.h"
 #include "runner_manager.h"
 #include "setup.h"
@@ -235,9 +236,8 @@ Recipe parseRecipe(const QByteArray &json, const QString &path, const QString &t
         if (!settings["environment"].isObject()) fail("Invalid recipe environment: " + path);
         const auto environment = settings["environment"].toObject();
         for (auto it = environment.begin(); it != environment.end(); ++it)
-            if (!it.value().isString() || !QRegularExpression("^[A-Za-z_][A-Za-z0-9_]*$").match(it.key()).hasMatch() ||
-                QStringList{"WINEPREFIX", "PROTONPATH", "GAMEID", "HOME", "LC_ALL", "HOST_LC_ALL", "LANG", "PATH"}.contains(it.key()) ||
-                it.value().toString().contains(QChar::Null)) fail("Invalid recipe environment variable: " + path);
+            if (!it.value().isString() || !supportedGameEnvironment(it.key(), it.value().toString()))
+                fail("Unsupported recipe environment variable " + it.key() + ": " + path);
     }
     static const QRegularExpression umuId("^[A-Za-z0-9_-]{1,80}$");
     if (settings.contains("umu_game_id") && !settings["umu_game_id"].toString().isEmpty() &&

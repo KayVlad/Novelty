@@ -323,7 +323,7 @@ int main(int argc, char **argv) {
             Library profiles(profileRoot); profiles.import(discover(profileRoot), t.path() + "/runner");
             profiles.setSettings({{"umu", fake}});
             auto g = profiles.games().first(); g.engine = "Ren'Py"; g.locale = "ja_JP.UTF-8";
-            g.environment["CUSTOM"] = "keep=me"; g.arguments = {"keep this argument"}; profiles.save(g);
+            g.environment["NOVELTY_APP_CUSTOM"] = "keep=me"; g.arguments = {"keep this argument"}; profiles.save(g);
             g = profiles.game(g.id); const auto original = g.json();
             file(profiles.prefix(g.id) + "/save.dat", "keep save");
             Window window(profileRoot, launcher); window.show(); QCoreApplication::processEvents();
