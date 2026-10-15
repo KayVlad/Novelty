@@ -131,7 +131,7 @@ SaveSnapshot snapshotLocked(Library &lib, const Game &game, const SaveConfig &co
                             bool allowEmpty) {
     validate(lib, game, config);
     if (config.mappings.isEmpty()) fail("Map at least one save file or folder before creating a snapshot.");
-    if (allowEmpty) verifyAvailableMappingRoots(lib, game, config);
+    verifyAvailableMappingRoots(lib, game, config);
     const auto root = snapshotsRoot(lib, game.id);
     noLinks(root);
     if (!QDir().mkpath(root)) fail("Cannot create save snapshot storage.");

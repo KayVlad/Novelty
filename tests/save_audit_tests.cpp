@@ -1,3 +1,5 @@
+#include "save_server_config.h"
+#include <QtCore/quuid.h>
 #include "core.h"
 #include "saves.h"
 #include "lan_games.h"
@@ -334,6 +336,12 @@ void manualTransferUndoCase() {
     saveSaveConfig(target.library, target.game.id, config);
     importSaveSnapshot(target.library, target.game.id, source.bundle(peer.id));
     touch(targetPath, "local progress");
+    SaveServerConfig serverMode{true, QUrl("http://127.0.0.1:42428"), "fixture-token",
+        QUuid::createUuid().toString(QUuid::WithoutBraces)};
+    saveSaveServerConfig(target.library, serverMode);
+    rejects([&] { replaceSavesFromPeer(target.library, target.game.id, peer.id); });
+    require(contents(targetPath) == "local progress", "core rejects peer replacement in automatic server mode");
+    serverMode.enabled = false; saveSaveServerConfig(target.library, serverMode);
     replaceSavesFromPeer(target.library, target.game.id, peer.id);
     require(contents(targetPath) == "peer progress", "manual peer replacement installs the chosen state");
     {
@@ -342,6 +350,10 @@ void manualTransferUndoCase() {
         require(!undo.rollbackSnapshotId.isEmpty() && undo.installedSnapshotId == peer.id && !undo.liveChanged,
                 "the one-transfer Undo point survives closing and reopening the library");
     }
+    serverMode.enabled = true; saveSaveServerConfig(target.library, serverMode);
+    rejects([&] { undoPeerSaveTransfer(target.library, target.game.id, true); });
+    require(contents(targetPath) == "peer progress", "core rejects Undo in automatic server mode");
+    serverMode.enabled = false; saveSaveServerConfig(target.library, serverMode);
     touch(targetPath, "progress after transfer");
     require(peerTransferUndo(target.library, target.game.id).liveChanged,
             "Undo detects live progress after the transfer");

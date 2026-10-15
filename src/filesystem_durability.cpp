@@ -1,4 +1,5 @@
 #include "filesystem_durability.h"
+#include "filesystem_checks.h"
 #include "core.h"
 #include <QtCore/qfile.h>
 #include <QtCore/qfileinfo.h>
@@ -39,6 +40,7 @@ void persistTree(const QString &path) { tree(std::filesystem::path(QFile::encode
 void persistParent(const QString &path) {
     // Include ancestors: mkpath may have created several previously unpersisted directories.
     auto parent = QFileInfo(path).absolutePath();
+    while (!checkedExists(parent) && parent != "/") parent = QFileInfo(parent).absolutePath();
     while (true) {
         flush(parent, true);
         if (parent == "/") break;

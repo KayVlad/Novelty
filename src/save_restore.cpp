@@ -1,3 +1,5 @@
+#include "filesystem_checks.h"
+#include "save_server_config.h"
 #include "filesystem_durability.h"
 #include "save_internal.h"
 
@@ -10,6 +12,7 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
     const auto phase = journal["phase"].toString();
     if (!phase.isEmpty() && phase != "committed") fail("Unknown restore recovery phase; inspect saves before playing.");
     const bool committed = phase == "committed";
+    if (committed) writeDurableJson(journalPath(lib, game.id), journal);
     const auto snapshot = snapshotManifest(lib, game.id, journal["snapshot"].toString());
     const auto backupId = journal["backup"].toString();
     const auto backup = backupId.isEmpty() ? QJsonObject{} : snapshotManifest(lib, game.id, backupId);
@@ -62,7 +65,11 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
             // The incoming item was installed, and the held copy may already have been cleaned.
             // Restore from the verified safety snapshot if the target still has the incoming bytes.
             const auto currentEntries = inventory(target);
-            if (currentEntries == originalEntries) continue; // This item was not changed yet.
+            if (currentEntries == originalEntries) {
+                if (exists(target)) persistTree(target);
+                persistParent(target);
+                continue;
+            } // This item was not changed yet.
             if (currentEntries != incomingEntries)
                 fail("A save changed during restore recovery. Inspect " + target + " before retrying.");
             if (!backupId.isEmpty()) {
@@ -87,6 +94,7 @@ void rollback(const Library &lib, const Game &game, const QJsonObject &journal) 
         } else if (inventory(target) != originalEntries) {
             fail("A save changed during restore recovery. Inspect " + target + " before retrying.");
         }
+        if (exists(target)) persistTree(target);
         persistParent(target); // recovered originals must survive before retiring the incoming copy
         if (exists(staged)) removeNode(staged);
         persistParent(target);
@@ -116,6 +124,11 @@ void restoreSaveSnapshotLocked(Library &lib, const QString &gameId, const QStrin
     QString backupId;
     try { backupId = snapshotLocked(lib, game, config, "before restore " + snapshotId).id; }
     catch (const NoSaveData &) { /* Fresh installation; the journal records its empty roots. */ }
+    // Backup creation has its own preflight. Reserve the incoming stage on every
+    // destination filesystem before making any live-save changes.
+    for (const auto &mapping : config.mappings)
+        requireAvailableSpace(QFileInfo(targetPath(lib, game, mapping)).absolutePath(),
+                              static_cast<qint64>(manifest["bytes"].toDouble()));
     const auto nonce = token();
     QJsonArray journalItems;
     try {
@@ -196,6 +209,8 @@ PeerTransferUndo peerTransferUndo(const Library &lib, const QString &gameId) {
 void replaceSavesFromPeer(Library &lib, const QString &gameId, const QString &snapshotId,
                           const QString &expectedLocalSnapshotId) {
     SaveLocks locks(lib, gameId);
+    if (loadSaveServerConfig(lib).enabled)
+        fail("Disable automatic server sync before replacing or undoing peer saves.");
     if (!saveRestoreIssue(lib, gameId).isEmpty() || !pendingSaveSnapshotIssue(lib, gameId).isEmpty())
         fail("Finish save recovery and pending capture before transferring saves.");
     if (snapshotId == currentHead(lib, gameId)) fail("Those peer saves are already installed.");
@@ -219,10 +234,12 @@ void replaceSavesFromPeer(Library &lib, const QString &gameId, const QString &sn
     }
     writeDurableJson(transferUndoPath(lib, gameId), {{"schema", 1}, {"game_id", gameId},
         {"rollback_snapshot", previous.id}, {"installed_snapshot", snapshotId}});
-    if (!QFile::remove(intentPath)) fail("Peer transfer committed, but its recovery intent needs cleanup.");
+    removeDurableFile(intentPath);
 }
 void undoPeerSaveTransfer(Library &lib, const QString &gameId, bool preserveChanged) {
     SaveLocks locks(lib, gameId);
+    if (loadSaveServerConfig(lib).enabled)
+        fail("Disable automatic server sync before replacing or undoing peer saves.");
     if (!saveRestoreIssue(lib, gameId).isEmpty() || !pendingSaveSnapshotIssue(lib, gameId).isEmpty())
         fail("Finish save recovery and pending capture before undoing a transfer.");
     const auto undo = peerTransferUndo(lib, gameId);
@@ -243,8 +260,8 @@ void undoPeerSaveTransfer(Library &lib, const QString &gameId, bool preserveChan
             QFile::remove(intentPath);
         throw;
     }
-    if (!QFile::remove(transferUndoPath(lib, gameId))) fail("Undo committed, but its record needs cleanup.");
-    if (!QFile::remove(intentPath)) fail("Undo committed, but its recovery intent needs cleanup.");
+    removeDurableFile(transferUndoPath(lib, gameId));
+    removeDurableFile(intentPath);
 }
 QString saveRestoreIssue(const Library &lib, const QString &gameId) {
     if (exists(journalPath(lib, gameId))) return "An interrupted save restore needs recovery before Play.";

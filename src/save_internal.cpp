@@ -6,7 +6,7 @@ namespace novelty::save_detail {
 [[noreturn]] void fail(const QString &message) { throw std::runtime_error(message.toStdString()); }
 bool exists(const QString &path) { return checkedExists(path); }
 QString token() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
-bool validToken(const QString &value) { return !QUuid(value).isNull() && !value.contains('/'); }
+bool validToken(const QString &value) { return !QUuid(value).isNull() && QUuid(value).toString(QUuid::WithoutBraces) == value; }
 bool validFingerprint(const QString &value) {
     if (value.size() != 64) return false;
     for (const auto c : value)

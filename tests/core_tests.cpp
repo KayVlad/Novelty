@@ -851,6 +851,9 @@ void testSaveDiscovery(const QString &base) {
     require(importedSaveCandidates(destination, targetGame.id).size() == 1 &&
             importedSaveCandidates(destination, targetGame.id).first().relation == "available",
             "new peer save is visible before first Play");
+    rejects([&] { adoptInitialPeerSave(destination, targetGame.id); },
+            "an unavailable prefix cannot be guessed empty during initial adoption");
+    require(QDir().mkpath(destination.prefix(targetGame.id)), "prepare empty destination prefix");
     require(adoptInitialPeerSave(destination, targetGame.id) &&
             !adoptInitialPeerSave(destination, targetGame.id),
             "an empty fresh installation applies its one verified peer head once");

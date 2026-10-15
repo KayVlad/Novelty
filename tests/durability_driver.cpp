@@ -19,8 +19,11 @@ int main(int argc, char **argv) {
         Library lib(root);
         if (mode == "setup") {
             QDir().mkpath(root + "/Game/save"); put(root + "/Game/game.exe", "exe");
+            put(root + "/Game/play.sh", "#!/bin/sh\ntouch played\n");
+            QFile::setPermissions(root + "/Game/play.sh", QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
             lib.import({inspect(root + "/Game")}, {});
-            const auto game = lib.games().first();
+            auto game = lib.games().first();
+            game.backend = "native"; game.executable = root + "/Game/play.sh"; game.workingDirectory = game.folder; lib.save(game);
             auto config = loadSaveConfig(lib, game.id); config.mappings = {{"game", "save"}};
             saveSaveConfig(lib, game.id, config); put(root + "/Game/save/slot", "old");
             const auto first = createSaveSnapshot(lib, game.id);
@@ -31,7 +34,8 @@ int main(int argc, char **argv) {
         }
         const auto game = lib.games().first();
         const auto snapshot = readJson(root + "/fixture.json")["snapshot"].toString();
-        if (mode == "inventory") inspectVerifiedLiveSaveState(lib, game.id);
+        if (mode == "play") return supervise(lib, game.id, false);
+        else if (mode == "inventory") inspectVerifiedLiveSaveState(lib, game.id);
         else if (mode == "restore") restoreSaveSnapshot(lib, game.id, snapshot);
         else if (mode == "snapshot") { put(root + "/Game/save/slot", "third"); createSaveSnapshot(lib, game.id); }
         else if (mode == "recover") {
