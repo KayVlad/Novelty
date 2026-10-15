@@ -12,7 +12,6 @@
 #include <QtCore/qjsonobject.h>
 #include <QtCore/qjsondocument.h>
 #include <QtCore/qlockfile.h>
-#include <QtCore/qregularexpression.h>
 #include <QtCore/quuid.h>
 #include <QtCore/qsysinfo.h>
 #include <QtCore/qset.h>
@@ -53,8 +52,6 @@ QJsonObject configJson(const SaveConfig &config);
 SaveConfig parseConfig(const QJsonObject &data, const QString &gameId);
 QString recipePath(const Library &lib, const SaveConfig &config);
 QList<SaveMapping> recipeMappings(const Library &lib, const SaveConfig &config);
-QString renpyRoot(const Game &game);
-QList<SaveMapping> renpyMappings(const Game &game);
 void resolveDeclaredSavePaths(Library &lib, const Game &game, SaveConfig &config);
 QString saveNameKey(const QString &name);
 QList<SaveMapping> heuristicSaveMappings(const Library &lib, const Game &game);

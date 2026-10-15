@@ -29,7 +29,7 @@ bool validRelative(const QString &path) {
     return true;
 }
 QString normalizedTier(const QString &tier) { return tier == "default" ? "general" : tier; }
-bool validTier(const QString &tier) { return tier == "general" || tier == "default" || tier == "engines" || tier == "games"; }
+bool validTier(const QString &tier) { return tier == "general" || tier == "default" || tier == "games"; }
 QString checkedPath(const QString &root, const QString &relative) {
     if (!validRelative(relative)) fail("Recipe paths must be relative to the game folder.");
     const auto path = QDir(root).filePath(relative);
@@ -124,7 +124,7 @@ QString recipePath(const QString &libraryRoot, const QString &tier, const QStrin
 }
 void ensureRecipeCatalog(const QString &libraryRoot) {
     const auto root = recipeRoot(libraryRoot);
-    for (const auto &tier : {"general", "engines", "games"})
+    for (const auto &tier : {"general", "games"})
         if (!QDir().mkpath(root + '/' + tier)) fail("Cannot create recipe directory.");
     // Migrate the old directory without overwriting either user's version of a recipe.
     const auto old = root + "/default";
@@ -150,17 +150,14 @@ void ensureRecipeCatalog(const QString &libraryRoot) {
     if (QFileInfo::exists(marker)) return;
     const QJsonArray ignored{"unins*", "*uninstall*", "setup.exe", "install.exe",
         "python*.exe", "zsync*.exe", "crashreporter.exe", "*/lib/*", "*/ost/*", "*/soundtrack/*"};
-    const QJsonObject native{{"backend", "native"}, {"ignore_executables", ignored}};
     const struct { const char *tier, *id, *name; QJsonObject match, settings; const char *parent, *category; } builtins[] = {
-        {"general", "general-game", "General Windows Game", {},
-            {{"backend", "umu"}, {"runner", "GE-Proton11-7"}, {"locale", "system"},
+        {"general", "general-game", "Game", {},
+            {{"backend", "umu"}, {"locale", "system"},
              {"environment", QJsonObject{}}, {"winetricks", QJsonArray{}}, {"save_candidates", QJsonArray{}},
              {"ignore_executables", ignored}}, "", "game"},
-        {"general", "general-vn", "General Visual Novel", {}, {}, "general-game", "visual_novel"},
-        {"engines", "renpy", "Ren'Py", {{"root", "executable_ancestor"},
-            {"all", QJsonArray{QJsonObject{{"file", "renpy/__init__.py"}}, QJsonObject{{"directory", "game"}}}}},
-            {{"engine", "renpy"}, {"save_strategy", "renpy"}}, "general-vn", ""},
-        {"engines", "native-linux-v1", "Native Linux", {{"all", QJsonArray{QJsonObject{{"native_executable", true}}}}}, native, "", "game"}
+        {"general", "general-vn", "Visual Novel", {},
+            {{"locale", "ja_JP.UTF-8"}, {"environment", QJsonObject{{"TZ", "Asia/Tokyo"}}}},
+            "general-game", "visual_novel"}
     };
     for (const auto &entry : builtins) {
         const auto path = recipePath(libraryRoot, entry.tier, entry.id);
@@ -173,7 +170,7 @@ void ensureRecipeCatalog(const QString &libraryRoot) {
     writeNew(marker, "Recipe catalog initialized. User edits are preserved.\n");
 }
 Recipe parseRecipe(const QByteArray &json, const QString &path, const QString &tier) {
-    if (!validTier(tier) || json.size() > 256 * 1024) fail("Invalid or oversized recipe: " + path);
+    if ((!validTier(tier) && tier != "engines") || json.size() > 256 * 1024) fail("Invalid or oversized recipe: " + path);
     QJsonParseError error;
     const auto document = QJsonDocument::fromJson(json, &error);
     if (error.error != QJsonParseError::NoError || !document.isObject()) fail("Invalid recipe JSON: " + path);
@@ -206,6 +203,10 @@ Recipe parseRecipe(const QByteArray &json, const QString &path, const QString &t
         if (!settings["setup_profile"].isString()) fail("Invalid legacy setup profile: " + path);
         settings.remove("setup_profile"); // Read existing recipes without carrying this obsolete setting forward.
     }
+    if (settings.contains("save_strategy")) {
+        if (!settings["save_strategy"].isString()) fail("Invalid legacy save strategy: " + path);
+        settings.remove("save_strategy"); // Existing recipes retain their explicit paths only.
+    }
     for (auto it = match.begin(); it != match.end(); ++it)
         if (it.key() != "root" && it.key() != "all" && it.key() != "any") fail("Unknown recipe match field: " + it.key());
     if ((match.contains("all") && !match["all"].isArray()) || (match.contains("any") && !match["any"].isArray()))
@@ -235,7 +236,7 @@ Recipe parseRecipe(const QByteArray &json, const QString &path, const QString &t
             fail("Invalid recipe match path: " + path);
     }
     const QSet<QString> allowedSettings{"engine", "executable", "working_directory", "runner", "umu_launcher", "umu_game_id",
-        "store", "backend", "ignore_executables", "saves", "save_candidates", "save_strategy", "arguments", "environment", "locale", "winetricks"};
+        "store", "backend", "ignore_executables", "saves", "save_candidates", "arguments", "environment", "locale", "winetricks"};
     for (auto it = settings.begin(); it != settings.end(); ++it)
         if (!allowedSettings.contains(it.key())) fail("Unknown recipe setting: " + it.key());
     for (const auto &key : {"engine", "executable", "working_directory", "runner", "umu_launcher", "umu_game_id", "store", "backend", "locale"})
@@ -267,8 +268,6 @@ Recipe parseRecipe(const QByteArray &json, const QString &path, const QString &t
         fail("A recipe runner must be a version or supported alias: " + path);
     if (settings.contains("backend") && !QStringList{"umu", "native", "steam"}.contains(settings["backend"].toString()))
         fail("Invalid recipe backend: " + path);
-    if (settings.contains("save_strategy") && settings["save_strategy"] != "renpy")
-        fail("Invalid recipe save strategy: " + path);
     if (settings.contains("winetricks")) {
         if (!settings["winetricks"].isArray()) fail("Winetricks must be an array: " + path);
         QStringList verbs;
@@ -301,7 +300,7 @@ Recipe parseRecipe(const QByteArray &json, const QString &path, const QString &t
 QList<Recipe> loadRecipes(const QString &libraryRoot) {
     ensureRecipeCatalog(libraryRoot);
     QList<Recipe> recipes;
-    for (const auto &tier : {"general", "engines", "games"}) {
+    for (const auto &tier : {"general", "games"}) {
         const auto directory = recipeRoot(libraryRoot) + '/' + tier;
         for (const auto &name : QDir(directory).entryList({"*.json"}, QDir::Files | QDir::NoSymLinks, QDir::Name)) {
             const auto path = directory + '/' + name;
@@ -312,6 +311,21 @@ QList<Recipe> loadRecipes(const QString &libraryRoot) {
             for (const auto &other : recipes) if (other.id == recipe.id) fail("Duplicate recipe ID: " + recipe.id);
             recipes.append(recipe);
         }
+    }
+    // Read an old engine file only when a current recipe inherits it. Engine
+    // files otherwise have no effect, including when they contain old JSON.
+    QSet<QString> known;
+    for (const auto &recipe : recipes) known.insert(recipe.id);
+    for (qsizetype i = 0; i < recipes.size(); ++i) {
+        const auto parentId = recipes[i].inherits;
+        if (parentId.isEmpty() || known.contains(parentId)) continue;
+        const auto path = recipeRoot(libraryRoot) + "/engines/" + parentId + ".json";
+        if (!QFileInfo(path).isFile() || QFileInfo(path).isSymbolicLink()) continue;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) fail("Cannot read recipe " + path);
+        auto parent = parseRecipe(file.read(256 * 1024 + 1), path, "engines");
+        if (parent.id != parentId) fail("Recipe filename and ID differ: " + path);
+        known.insert(parentId); recipes.append(parent);
     }
     QMap<QString, int> index;
     for (int i = 0; i < recipes.size(); ++i) index.insert(recipes[i].id, i);
@@ -374,7 +388,11 @@ QList<Recipe> loadRecipes(const QString &libraryRoot) {
         resolving.remove(recipe.id); resolved.insert(recipe.id);
     };
     for (int i = 0; i < recipes.size(); ++i) resolve(i, 0);
-    return recipes;
+    // Old engine files may still be parents of game recipes. Keep them readable
+    // for inheritance, but never offer or match them as presets.
+    QList<Recipe> available;
+    for (const auto &recipe : recipes) if (recipe.tier != "engines") available.append(recipe);
+    return available;
 }
 bool recipeMatches(const Recipe &recipe, const QString &gameFolder, const QStringList &executables) {
     const auto all = recipe.match["all"].toArray();
@@ -410,12 +428,10 @@ bool recipeMatches(const Recipe &recipe, const QString &gameFolder, const QStrin
 RecipeSelection selectRecipe(const QString &libraryRoot, const QString &gameFolder,
                              const QStringList &executables, const QString &defaultId) {
     const auto recipes = loadRecipes(libraryRoot);
-    for (const auto &tier : {"games", "engines"}) {
-        RecipeSelection selection; selection.tier = tier;
-        for (const auto &recipe : recipes) if (recipe.tier == tier && recipeMatches(recipe, gameFolder, executables))
-            selection.matches.append(recipe);
-        if (!selection.empty()) return selection;
-    }
+    RecipeSelection gameSelection; gameSelection.tier = "games";
+    for (const auto &recipe : recipes) if (recipe.tier == "games" && recipeMatches(recipe, gameFolder, executables))
+        gameSelection.matches.append(recipe);
+    if (!gameSelection.empty()) return gameSelection;
     RecipeSelection selection; selection.tier = "general";
     for (const auto &recipe : recipes) if (recipe.tier == "general" && recipe.id == defaultId)
         selection.matches.append(recipe);
@@ -446,7 +462,7 @@ void applyRecipeToGame(Game &game, const Recipe &recipe) {
     game.recipeId = recipe.id; game.recipeRevision = QString::fromLatin1(recipe.revision);
     game.recipeOverrides = {};
     game.recipeCandidates.clear(); game.category = recipe.category;
-    game.engine = settings["engine"].toString(recipe.tier == "engines" ? recipe.name : "Generic");
+    game.engine = settings["engine"].toString("Generic");
     game.evidence = "Recipe: " + recipe.name;
     game.backend = settings["backend"].toString("umu");
     game.runnerSelector = settings["runner"].toString();
@@ -458,7 +474,6 @@ void applyRecipeToGame(Game &game, const Recipe &recipe) {
     game.recipeSaves = settings.contains("save_candidates") ? settings["save_candidates"].toArray() : settings["saves"].toArray();
     game.winetricks.clear();
     for (const auto &value : settings["winetricks"].toArray()) game.winetricks.append(value.toString());
-    game.saveStrategy = settings["save_strategy"].toString();
     if (settings.contains("locale")) game.locale = settings["locale"] == "system" ? QString() : settings["locale"].toString();
     if (settings.contains("arguments")) {
         game.arguments.clear();
@@ -496,7 +511,6 @@ QJsonObject recipeSettingsSnapshot(const Game &game) {
     relative(game.executable, "executable");
     relative(game.workingDirectory, "working_directory");
     if (!game.runnerSelector.isEmpty()) settings["runner"] = game.runnerSelector;
-    if (!game.saveStrategy.isEmpty()) settings["save_strategy"] = game.saveStrategy;
     return settings;
 }
 QJsonObject portableGameSettings(const Game &game, QStringList *omissions) {
@@ -641,6 +655,8 @@ QJsonObject applyLibraryPreset(const QJsonObject &current, const QJsonObject &do
     return result;
 }
 void saveRecipe(const QString &libraryRoot, const QString &tier, const QByteArray &json) {
+    if (QJsonDocument::fromJson(json).object()["settings"].toObject().contains("save_strategy"))
+        fail("save_strategy is obsolete; remove it and declare save paths directly.");
     if (QJsonDocument::fromJson(json).object()["settings"].toObject().contains("setup_profile"))
         fail("setup_profile is obsolete; remove it and use the recipe settings directly.");
     const auto recipe = parseRecipe(json, {}, tier);

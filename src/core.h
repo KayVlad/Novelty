@@ -19,7 +19,7 @@ struct Game {
     bool installPending = false;
     QString folderIdentity, source = "manual";
     QString engine = "Generic", category = "game", evidence;
-    QString recipeId, recipeRevision, runnerSelector, umuLauncher, umuResolved, umuGameId, store, saveStrategy;
+    QString recipeId, recipeRevision, runnerSelector, umuLauncher, umuResolved, umuGameId, store;
     QStringList recipeCandidates, winetricks;
     QJsonArray recipeSaves;
     QJsonObject recipeBase, recipeOverrides; // Saved recommendation and explicit changes; launch uses materialized fields.

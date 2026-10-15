@@ -22,7 +22,7 @@ struct SaveConfig {
     QString saveCompatibility;     // Explicit compatibility group; equality is required for sync.
     QString serverGameKey;          // Optional explicit link for independent installations on one save server.
     QString discoveryState = "searching"; // searching, identified or explicitly unidentified.
-    QString discoverySource;       // manual, recipe, engine or observed.
+    QString discoverySource;       // manual, recipe or heuristic; older values are retained on load.
     QJsonArray candidates;         // Unconfirmed portable locations and evidence.
     QStringList folderAliases;     // Previous local folder names for first-time peer matching after a rename.
     QList<SaveMapping> mappings;
@@ -43,7 +43,6 @@ struct PeerTransferUndo { QString rollbackSnapshotId; QString installedSnapshotI
 SaveConfig loadSaveConfig(const Library &, const QString &gameId);
 // Plausible folders for an unmapped game; a choice is needed when more than one exists.
 QList<SaveMapping> saveDiscoveryCandidates(const Library &, const QString &gameId);
-QList<SaveMapping> suggestedSaveMappings(const Library &, const QString &gameId);
 void saveSaveConfig(Library &, const QString &gameId, const SaveConfig &);
 // Validate and normalize without writing. The caller holds the library and game locks when committing.
 QJsonObject validatedSaveConfig(const Library &, const Game &, const SaveConfig &);

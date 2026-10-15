@@ -123,16 +123,16 @@ void testEditableRecipes(const QString &base) {
     Library library(root);
     const QStringList executables{game + "/Folder/Story.exe"};
     auto selected = selectRecipe(root, game, executables, "general-vn");
-    require(!selected.ambiguous() && selected.selected().id == "renpy",
-            "nested Ren'Py structure matches an engine recipe");
+    require(!selected.ambiguous() && selected.selected().id == "general-vn",
+            "nested Ren'Py structure uses the selected general recipe");
     touch(game + "/Folder/game/saves/slot.sav", "progress");
     library.import({inspect(game, root)}, {});
     const auto nestedGame = library.games().first();
-    const auto suggested = suggestedSaveMappings(library, nestedGame.id);
+    const auto suggested = saveDiscoveryCandidates(library, nestedGame.id);
     require(std::any_of(suggested.begin(), suggested.end(), [](const SaveMapping &mapping) {
         return mapping.scope == "game" && mapping.path == "Folder/game/saves";
     }),
-            "nested Ren'Py saves remain relative to the imported game folder");
+            "generic nested save candidates remain relative to the imported game folder");
     const auto specific = [](const QString &id, const QJsonArray &conditions) {
         return QJsonDocument(QJsonObject{{"schema", 1}, {"id", id}, {"name", "Story settings"},
             {"match", QJsonObject{{"all", conditions}}},
@@ -144,10 +144,10 @@ void testEditableRecipes(const QString &base) {
     touch(game + "/Folder/assets.dat", "archive");
     saveRecipe(root, "games", specific("story", exact));
     selected = selectRecipe(root, game, executables, "general-vn");
-    require(selected.selected().id == "renpy", "every game recipe condition is required");
+    require(selected.selected().id == "general-vn", "every game recipe condition is required");
     touch(game + "/marker.txt");
     selected = selectRecipe(root, game, executables, "general-vn");
-    require(!selected.ambiguous() && selected.selected().id == "story", "specific game recipe precedes engine");
+    require(!selected.ambiguous() && selected.selected().id == "story", "specific game recipe precedes general");
     Game configured; configured.folder = game;
     applyRecipeToGame(configured, selected.selected());
     require(configured.executable == game + "/Folder/Story.exe" && configured.runnerSelector == "proton-experimental" &&
@@ -404,8 +404,8 @@ void testNestedGameDiscovery(const QString &base) {
     touch(title + "/.novelty/tools/Hidden.exe", "managed tool");
     const auto found = discover(root);
     require(found.size() == 1 && found.first().folder == title && found.first().name == "Title" &&
-            found.first().executables == QStringList{executable} && found.first().engine == "Ren'Py",
-            "nested Game executable and engine belong to top-level Title; OST utility is secondary");
+            found.first().executables == QStringList{executable} && found.first().engine == "Generic",
+            "nested executable belongs to top-level Title; OST utility is secondary");
     const auto scanned = scanDiscovery(root, {});
     require(scanned.candidates.size() == 1 && scanned.candidates.first().folder == title &&
             !scanned.folderIdentities.contains(root + "/.novelty") &&
@@ -416,9 +416,9 @@ void testNestedGameDiscovery(const QString &base) {
     require(library.import(found, {}) == 1, "nested game imports once");
     const auto game = library.games().first();
     require(game.folder == title && game.name == "Title" && game.executable == executable &&
-            game.workingDirectory == QFileInfo(executable).absolutePath() && game.engine == "renpy" &&
+            game.workingDirectory == QFileInfo(executable).absolutePath() && game.engine == "Generic" &&
             library.import(discover(root), {}) == 0,
-            "nested game keeps the top-level folder and correct launch directory without duplicates");
+            "nested game keeps the top-level folder and launch directory without an engine recipe");
 }
 void testNativeGameDiscovery(const QString &base) {
     const auto root = base + "/Native game discovery";
@@ -445,6 +445,8 @@ void testNativeGameDiscovery(const QString &base) {
     require(game.backend == "native" && game.executable == executable &&
             game.workingDirectory == QFileInfo(executable).absolutePath() && library.status(game) == "Ready",
             "native game keeps its executable, working directory, and ready status");
+    require(library.previewRecipe(game.id, "general-game").backend == "native",
+            "reapplying a general recipe keeps a detected native launcher direct");
     const auto command = launchCommand(library, game);
     require(command.program == executable && command.arguments.isEmpty() &&
             command.cwd == QFileInfo(executable).absolutePath(),
@@ -608,11 +610,6 @@ void testSaveSnapshots(const QString &base) {
     const auto recoveredPartial = recoverSaveRestores(lib);
     if (recoveredPartial.size() != 1 || QFileInfo::exists(partial) || contents(gameSave) != "progress after interrupted supervisor")
         throw std::runtime_error(("interrupted staged copy is removed without changing original saves: " + recoveredPartial.join(" | ")).toStdString());
-    touch(game.folder + "/renpy/__init__.py");
-    configured = lib.game(game.id); configured.saveStrategy = "renpy"; lib.save(configured);
-    const auto suggestions = suggestedSaveMappings(lib, game.id);
-    require(!suggestions.isEmpty() && suggestions.first().scope == "game" && suggestions.first().path == "game/saves",
-            "populated Ren'Py save folder can be suggested for confirmation");
 }
 void testSaveDiscovery(const QString &base) {
     const auto root = base + "/Save discovery";
@@ -795,12 +792,23 @@ void testSaveDiscovery(const QString &base) {
     touch(renpyRoot + "/Game/renpy/__init__.py");
     touch(renpyRoot + "/Game/game/options.rpy", "define config.save_directory = 'Example-123'\n");
     Library renpy(renpyRoot); renpy.import({inspect(renpyRoot + "/Game")}, {});
-    auto renpyGame = renpy.games().first(); renpyGame.saveStrategy = "renpy"; renpy.save(renpyGame);
+    const auto renpyGame = renpy.games().first();
     beginSaveObservation(renpy, renpyGame);
     const auto engine = loadSaveConfig(renpy, renpyGame.id);
-    require(engine.discoveryState == "identified" && engine.discoverySource == "engine" && engine.mappings.size() == 2 &&
-            engine.mappings.first().scope == "appdata" && engine.mappings.first().path == "RenPy/Example-123",
-            "verified Ren'Py literal resolves portable prefix and game paths before any save exists");
+    require(engine.discoveryState == "searching" && engine.mappings.isEmpty(),
+            "engine configuration files do not implicitly establish save mappings");
+    auto existing = engine;
+    existing.mappings = {{"appdata", "RenPy/Example-123"}, {"game", "game/saves"}};
+    existing.discoveryState = "identified"; existing.discoverySource = "engine";
+    saveSaveConfig(renpy, renpyGame.id, existing);
+    const auto existingPath = renpy.gamePath(renpyGame.id, "saves.json");
+    const auto existingBytes = contents(existingPath);
+    beginSaveObservation(renpy, renpyGame); finishSaveObservation(renpy, renpyGame);
+    const auto retained = loadSaveConfig(renpy, renpyGame.id);
+    require(retained.mappings.size() == 2 && retained.mappings.first().scope == "appdata" &&
+            retained.mappings.first().path == "RenPy/Example-123" && retained.discoverySource == "engine" &&
+            contents(existingPath) == existingBytes,
+            "previously configured engine save paths and provenance are preserved without rewriting");
 
     const auto sourceRoot = base + "/Portable source", targetRoot = base + "/Portable destination";
     touch(sourceRoot + "/Game/game.exe"); touch(targetRoot + "/Different folder/game.exe");
@@ -1117,7 +1125,7 @@ exit 0
     require(supervise(lib, g.id, false, {}, {}, true) == 0, "supervised installer completes");
     const auto installed = lib.game(g.id);
     require(!installed.installPending && installed.installer.isEmpty() && installed.id == g.id && installed.executable == g.folder + "/Novel/Story.exe", "detection selects installed game retaining ID");
-    require(installed.engine == "renpy" && installed.recipeId == "renpy", "nested installed engine selects recipe");
+    require(installed.engine == "Generic" && installed.recipeId == "general-game", "installed game uses the general recipe");
     require(canonicalPath(lib.prefix(g.id) + "/dosdevices/n:") == g.folder && setupComplete(lib, installed), "mapped destination and prepared prefix retained");
     QFile invocations(lib.prefix(g.id) + "/installer-invocations");
     require(invocations.open(QIODevice::ReadOnly) && invocations.readAll() == (source + '\n' + QFileInfo(source).absolutePath() + '\n').toUtf8(), "installer keeps external media working directory");
@@ -1496,11 +1504,11 @@ touch "$WINEPREFIX/played"; exit 0
     const auto recipes = loadRecipes(root);
     for (const auto &recipe : recipes) if (recipe.tier == "general")
         require(recipe.settings["winetricks"].toArray().isEmpty() &&
-                recipe.settings["runner"] == "GE-Proton11-7", "general recipes start clean with the tested GE pin");
+                !recipe.settings.contains("runner"), "general recipes start clean without a runner pin");
     lib.import(discover(root), runner);
     auto g = lib.games().first(); const auto id = g.id; const auto prefix = lib.prefix(id);
-    require(g.runner == runner && g.runnerSelector == "GE-Proton11-7",
-            "a valid library runner takes precedence over the general recipe recommendation");
+    require(g.runner == runner && g.runnerSelector.isEmpty(),
+            "a valid library runner is retained when the general recipe has no runner pin");
     require(pendingWinetricks(lib, g).isEmpty() && supervise(lib, id, false) == 0 &&
             !QFileInfo::exists(prefix + "/winetricks-calls"), "clean general game never runs Winetricks");
     auto legacyReceipt = readJson(lib.gamePath(id, "recipe.lock.json"));
@@ -1859,7 +1867,7 @@ int main(int argc, char **argv) {
         for (const auto &recipe : loadRecipes(root))
             require(!recipe.settings.contains("setup_profile"), "new recipes do not use compiled setup profiles");
         require(found.size() == 1, "ignore managed folder");
-        require(found[0].engine == "Ren'Py", "RPA must not be misidentified as XP3");
+        require(found[0].engine == "Generic", "import does not assign an engine preset");
         require(found[0].executables == QStringList{folder + "/Tenpure.exe"}, "exclude helpers/uninstallers");
         touch(root + "/Ambiguous/game.exe"); touch(root + "/Ambiguous/config.exe");
         found = discover(root); require(found.size() == 2, "discover second game");
@@ -1903,9 +1911,9 @@ int main(int argc, char **argv) {
             Game g; for (auto item : list) if (item.name == "Template!!") g = item;
             id = g.id;
             require(!id.isEmpty(), "stable ID");
-            require(g.recipeId == "renpy", "new RenPy imports select the engine recipe");
+            require(g.recipeId == "general-game", "new game imports use the general recipe");
             g.engine = "Manually corrected label"; lib.save(g);
-            require(lib.game(id).recipeId == "renpy", "engine label edits do not silently change the selected recipe");
+            require(lib.game(id).recipeId == "general-game", "engine label edits do not silently change the selected recipe");
             require(lib.status(g) == "New", "new prefix state");
             require(list[0].executable.isEmpty(), "ambiguous executable needs selection");
             g.arguments = {"argument with spaces", "$(do-not-execute)", "日本語"}; g.locale = "ja_JP.UTF-8";

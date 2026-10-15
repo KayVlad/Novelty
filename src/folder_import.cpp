@@ -173,6 +173,9 @@ FolderImportResult Library::addFolder(const QString &chosen, const QString &nati
                 for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
             } else {
                 applyRecipeToGame(g, choice.selected());
+                if (choice.selected().tier == "general" && candidate.native) {
+                    g.backend = "native"; g.runner.clear(); g.runnerRevision.clear(); g.runnerSelector.clear();
+                }
                 if (choice.selected().settings.contains("runner") &&
                     ((choice.selected().tier != "general" && choice.selected().runnerExplicit) ||
                      !QFileInfo(QDir(g.runner).filePath("proton")).isFile())) {

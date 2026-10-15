@@ -41,14 +41,29 @@ int main(int argc, char **argv) {
         check(QFileInfo::exists(root + "/.novelty/recipes/general/legacy.json") &&
               !QFileInfo::exists(root + "/.novelty/recipes/default/legacy.json"), "old directory migrated without deleting recipe");
         check(!QFileInfo::exists(recipePath(root, "general", "generic-game-v1")) &&
-              !QFileInfo::exists(recipePath(root, "engines", "renpy-bundled-v1")),
-              "fresh libraries do not seed deprecated profile recipes");
+              !QFileInfo::exists(root + "/.novelty/recipes/engines"),
+              "fresh libraries create only general and game recipe tiers");
+        const auto general = loadRecipes(root);
+        for (const auto &entry : general) {
+            if (entry.id == "general-game")
+                check(entry.name == "Game" && entry.settings["backend"] == "umu" &&
+                      !entry.settings.contains("runner") && entry.settings["locale"] == "system",
+                      "game general preset uses the supplied defaults");
+            if (entry.id == "general-vn")
+                check(entry.name == "Visual Novel" && entry.inherits == "general-game" &&
+                      !entry.settings.contains("runner") && entry.settings["locale"] == "ja_JP.UTF-8" &&
+                      entry.settings["environment"].toObject()["TZ"] == "Asia/Tokyo",
+                      "visual novel general preset inherits the game defaults and sets locale and time zone");
+        }
+        rejects([&] { saveRecipe(root, "engines", recipe("new-engine", {}, {})); });
         file(recipePath(root, "general", "legacy-profile"),
              recipe("legacy-profile", {{"category", "game"}}, {{"setup_profile", "generic-game-v1"}}));
         for (const auto &entry : loadRecipes(root)) if (entry.id == "legacy-profile")
             check(!entry.settings.contains("setup_profile"), "existing profile recipe loads without obsolete setting");
         rejects([&] { saveRecipe(root, "games", recipe("new-profile", {{"category", "game"}},
             {{"setup_profile", "generic-game-v1"}})); });
+        rejects([&] { saveRecipe(root, "games", recipe("new-strategy", {{"category", "game"}},
+            {{"save_strategy", "renpy"}})); });
         QTemporaryDir older; check(older.isValid(), "old recipe library fixture");
         const auto oldRoot = older.path(), oldFolder = oldRoot + "/Visual Novel";
         file(oldRoot + "/.novelty/recipes/catalog-v2", "older catalog");
@@ -58,61 +73,78 @@ int main(int argc, char **argv) {
         file(recipePath(oldRoot, "general", "generic-vn-v1"),
              recipe("generic-vn-v1", {{"inherits", "generic-game-v1"}, {"category", "visual_novel"}},
                     {{"setup_profile", "generic-proton-v1"}}));
-        file(recipePath(oldRoot, "engines", "renpy-bundled-v1"),
+        const auto legacyEngine = oldRoot + "/.novelty/recipes/engines/renpy-bundled-v1.json";
+        file(legacyEngine,
              recipe("renpy-bundled-v1", {{"inherits", "generic-vn-v1"},
                  {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"type", "file"}, {"path", "renpy/__init__.py"}},
                                                        QJsonObject{{"type", "directory"}, {"path", "game"}}}}}}},
-                    {{"setup_profile", "renpy-bundled-v1"}, {"save_strategy", "renpy"}}));
+                    {{"setup_profile", "renpy-bundled-v1"}, {"save_strategy", "renpy"},
+                     {"save_candidates", QJsonArray{QJsonObject{{"scope", "game"}, {"path", "game/saves"}}}}}));
         file(oldFolder + "/renpy/__init__.py");
         QDir().mkpath(oldFolder + "/game");
         Library olderLibrary(oldRoot);
         const auto oldChoice = selectRecipe(oldRoot, oldFolder, {}, "generic-vn-v1");
-        check(oldChoice.selected().id == "renpy-bundled-v1" &&
-              !oldChoice.selected().settings.contains("setup_profile") &&
-              oldChoice.selected().category == "visual_novel",
-              "older inherited catalog remains usable without compiled profiles");
-        const auto inherited = recipe("vn-engine", {{"inherits", "general-vn"},
+        check(oldChoice.selected().id == "generic-vn-v1" && QFileInfo::exists(legacyEngine),
+              "older engine recipes remain on disk but do not match automatically");
+        file(oldRoot + "/.novelty/recipes/engines/unused.json", "invalid old recipe");
+        check(selectRecipe(oldRoot, oldFolder, {}, "generic-vn-v1").selected().id == "generic-vn-v1",
+              "unused older engine files do not affect recipe loading");
+        bool legacyVisible = false;
+        for (const auto &entry : loadRecipes(oldRoot)) if (entry.id == "renpy-bundled-v1") legacyVisible = true;
+        check(!legacyVisible, "older engine recipes are not selectable");
+        saveRecipe(oldRoot, "games", recipe("legacy-game", {{"inherits", "renpy-bundled-v1"},
+            {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"file", "renpy/__init__.py"}}}}}}}, {}));
+        const auto inheritedChoice = selectRecipe(oldRoot, oldFolder, {}, "generic-vn-v1");
+        check(inheritedChoice.selected().id == "legacy-game" &&
+              !inheritedChoice.selected().settings.contains("save_strategy") &&
+              inheritedChoice.selected().settings["save_candidates"].toArray().size() == 1 &&
+              inheritedChoice.selected().category == "visual_novel",
+              "older recipes retain explicit save paths without the obsolete strategy");
+        const auto inherited = recipe("vn-game", {{"inherits", "general-vn"},
             {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"type", "file"}, {"path", "Story.exe"}}}},
                                    {"any", QJsonArray{QJsonObject{{"type", "directory"}, {"path", "assets"}},
                                                       QJsonObject{{"type", "file"}, {"path", "marker.dat"}}}}}}},
             {{"engine", "unknown"}, {"environment", QJsonObject{{"TZ", "Asia/Tokyo"}}}});
-        saveRecipe(root, "engines", inherited);
+        saveRecipe(root, "games", inherited);
         check(!recipeMatches(loadRecipes(root).last(), folder, {folder + "/Story.exe"}), "any clause requires evidence");
         file(folder + "/marker.dat");
         auto selection = selectRecipe(root, folder, {folder + "/Story.exe"}, "general-game");
-        check(selection.selected().id == "vn-engine" && selection.selected().category == "visual_novel" &&
+        check(selection.selected().id == "vn-game" && selection.selected().category == "visual_novel" &&
               selection.selected().settings["engine"] == "unknown", "JSON category independent of engine");
         library.import({inspect(folder, root)}, {});
         auto game = library.games().first();
         check(game.category == "visual_novel" && game.engine == "unknown", "import persists JSON category");
-        game.locale = "ja_JP.UTF-8"; game.environment["CUSTOM"] = "value"; library.save(game);
+        game.locale = "en_US.UTF-8"; game.environment["CUSTOM"] = "value"; library.save(game);
         game = library.game(game.id);
         check(game.recipeOverrides.contains("locale") && game.recipeOverrides.contains("environment"), "manual edits have explicit provenance");
-        saveRecipe(root, "engines", recipe("vn-engine", {{"inherits", "general-vn"},
+        saveRecipe(root, "games", recipe("vn-game", {{"inherits", "general-vn"},
             {"match", QJsonObject{{"all", QJsonArray{QJsonObject{{"type", "file"}, {"path", "Story.exe"}}}}}}},
             {{"engine", "unknown"}, {"environment", QJsonObject{{"TZ", "Europe/Dublin"}}}}));
-        const auto preview = library.previewRecipe(game.id, "vn-engine");
-        check(preview.locale == "ja_JP.UTF-8" && preview.environment["CUSTOM"] == "value", "preview preserves user edits");
-        library.applyRecipe(game.id, "vn-engine"); game = library.game(game.id);
-        check(game.environment["CUSTOM"] == "value" && game.locale == "ja_JP.UTF-8", "applying new revision preserves overrides");
+        const auto preview = library.previewRecipe(game.id, "vn-game");
+        check(preview.locale == "en_US.UTF-8" && preview.environment["CUSTOM"] == "value", "preview preserves user edits");
+        library.applyRecipe(game.id, "vn-game"); game = library.game(game.id);
+        check(game.environment["CUSTOM"] == "value" && game.locale == "en_US.UTF-8", "applying new revision preserves overrides");
         QStringList omissions;
         const auto recipes = loadRecipes(root);
         const Recipe *parent = nullptr;
-        for (const auto &entry : recipes) if (entry.id == "vn-engine") parent = &entry;
+        for (const auto &entry : recipes) if (entry.id == "vn-game") parent = &entry;
         check(parent, "parent recipe exists");
         const auto exported = gameRecipeDocument(game, "story-custom", root, parent, &omissions);
-        check(exported["inherits"] == "vn-engine" && exported["settings"].toObject()["locale"] == "ja_JP.UTF-8",
+        check(exported["inherits"] == "vn-game" && exported["settings"].toObject()["locale"] == "en_US.UTF-8",
               "portable game export records only changes");
         saveRecipe(root, "games", QJsonDocument(exported).toJson());
-        check(!recipeMatches(loadRecipes(root).last(), folder, {folder + "/Story.exe"}), "export remains manual without reviewed match");
+        bool exportedMatches = false;
+        for (const auto &entry : loadRecipes(root)) if (entry.id == "story-custom")
+            exportedMatches = recipeMatches(entry, folder, {folder + "/Story.exe"});
+        check(!exportedMatches, "export remains manual without reviewed match");
         QTemporaryDir second; check(second.isValid(), "second disposable library");
         const auto secondRoot = second.path(), secondFolder = secondRoot + "/Story";
         file(secondFolder + "/Story.exe", "game");
         file(secondFolder + "/marker.dat");
         Library another(secondRoot);
-        QFile parentFile(recipePath(root, "engines", "vn-engine"));
+        QFile parentFile(recipePath(root, "games", "vn-game"));
         check(parentFile.open(QIODevice::ReadOnly), "read exported parent");
-        saveRecipe(secondRoot, "engines", parentFile.readAll());
+        saveRecipe(secondRoot, "games", parentFile.readAll());
         saveRecipe(secondRoot, "games", QJsonDocument(exported).toJson());
         another.import({inspect(secondFolder, secondRoot)}, {});
         const auto transferred = another.games().first();
@@ -121,8 +153,8 @@ int main(int argc, char **argv) {
         check(roundTrip.category == game.category && roundTrip.engine == game.engine &&
               roundTrip.locale == game.locale && roundTrip.environment == game.environment,
               "portable game export applies on a second disposable library");
-        rejects([&] { removeRecipe(root, "engines", "vn-engine"); });
-        QFile::remove(recipePath(root, "engines", "vn-engine")); // Simulate a missing external source file.
+        rejects([&] { removeRecipe(root, "games", "vn-game"); });
+        QFile::remove(recipePath(root, "games", "vn-game")); // Simulate a missing external source file.
         check(library.game(game.id).executable == game.executable && library.game(game.id).locale == game.locale,
               "saved launch config survives missing recipe");
         QFile::remove(recipePath(root, "games", "story-custom"));

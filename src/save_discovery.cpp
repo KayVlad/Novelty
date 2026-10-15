@@ -167,35 +167,6 @@ QList<SaveMapping> recipeMappings(const Library &lib, const SaveConfig &config) 
     if (mappings.isEmpty()) fail("Save recipe declares no locations.");
     return mappings;
 }
-QString renpyRoot(const Game &game) {
-    if (game.saveStrategy != "renpy" && !(game.recipeId.isEmpty() && game.engine == "Ren'Py")) return {};
-    auto path = game.executable.isEmpty() ? game.folder : QFileInfo(game.executable).absolutePath();
-    while (path == game.folder || path.startsWith(game.folder + '/')) {
-        if (QFileInfo(path + "/renpy/__init__.py").isFile() && QFileInfo(path + "/game").isDir()) return path;
-        if (path == game.folder) break;
-        path = QFileInfo(path).absolutePath();
-    }
-    return {};
-}
-QList<SaveMapping> renpyMappings(const Game &game) {
-    const auto root = renpyRoot(game);
-    if (root.isEmpty()) return {};
-    for (const auto &argument : game.arguments) if (argument.contains("--savedir")) return {};
-    QFile options(root + "/game/options.rpy");
-    if (!options.open(QIODevice::ReadOnly) || options.size() > 256 * 1024) return {};
-    const auto source = QString::fromUtf8(options.readAll());
-    QStringList active;
-    for (const auto &line : source.split('\n')) if (!line.trimmed().startsWith('#')) active.append(line);
-    const auto text = active.join('\n');
-    if (text.contains(QRegularExpression(R"(\bconfig\.(?:savedir|extra_savedirs)\s*=)"))) return {};
-    static const QRegularExpression literal(R"(\bconfig\.save_directory\s*=\s*['\"]([^'\"\r\n]{1,120})['\"])");
-    const auto match = literal.match(text);
-    const auto gameSaves = QDir(game.folder).relativeFilePath(root + "/game/saves");
-    if (match.hasMatch()) return {{"appdata", "RenPy/" + match.captured(1)}, {"game", gameSaves}};
-    if (text.contains(QRegularExpression(R"(\bconfig\.save_directory\s*=\s*None\b)")))
-        return {{"game", gameSaves}};
-    return {};
-}
 void resolveDeclaredSavePaths(Library &lib, const Game &game, SaveConfig &config) {
     if (config.discoveryState != "searching" || !config.mappings.isEmpty()) return;
     if (!game.recipeSaves.isEmpty()) {
@@ -211,8 +182,6 @@ void resolveDeclaredSavePaths(Library &lib, const Game &game, SaveConfig &config
     auto recipe = recipeMappings(lib, config);
     if (!recipe.isEmpty()) {
         config.mappings = recipe; config.discoveryState = "identified"; config.discoverySource = "recipe";
-    } else if (auto engine = renpyMappings(game); !engine.isEmpty()) {
-        config.mappings = engine; config.discoveryState = "identified"; config.discoverySource = "engine";
     }
     validate(lib, game, config);
     if (config.discoveryState == "identified") writeJson(configPath(lib, game.id), configJson(config));
@@ -395,29 +364,6 @@ QStringList recoverSaveObservations(Library &lib) {
         }
     }
     return messages;
-}
-QList<SaveMapping> suggestedSaveMappings(const Library &lib, const QString &gameId) {
-    const auto game = lib.game(gameId);
-    QList<SaveMapping> suggestions;
-    const auto root = renpyRoot(game);
-    if (root.isEmpty()) return suggestions;
-    const auto populated = [](const QString &path) {
-        const QFileInfo info(path);
-        return info.isDir() && !info.isSymbolicLink() &&
-            !QDir(path).entryList(QDir::Files | QDir::NoSymLinks | QDir::Hidden).isEmpty();
-    };
-    if (populated(root + "/game/saves")) suggestions.append(SaveMapping{"game", QDir(game.folder).relativeFilePath(root + "/game/saves")});
-    const auto users = lib.prefix(gameId) + "/drive_c/users";
-    if (QFileInfo(users).isDir() && !QFileInfo(users).isSymbolicLink()) {
-        for (const auto &user : QDir(users).entryInfoList(QDir::Dirs | QDir::NoSymLinks | QDir::NoDotAndDotDot, QDir::Name)) {
-            const auto renpy = user.absoluteFilePath() + "/AppData/Roaming/RenPy";
-            if (!QFileInfo(renpy).isDir() || QFileInfo(renpy).isSymbolicLink()) continue;
-            for (const auto &folder : QDir(renpy).entryInfoList(QDir::Dirs | QDir::NoSymLinks | QDir::NoDotAndDotDot, QDir::Name))
-                if (populated(folder.absoluteFilePath()))
-                    suggestions.append(SaveMapping{"appdata", "RenPy/" + folder.fileName()});
-        }
-    }
-    return suggestions;
 }
 void saveSaveConfig(Library &lib, const QString &gameId, const SaveConfig &config) {
     SaveLocks locks(lib, gameId, 2000);

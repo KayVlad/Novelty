@@ -178,7 +178,7 @@ QJsonObject Game::json() const {
             {"winetricks", QJsonArray::fromStringList(winetricks)},
             {"recipe_saves", recipeSaves},
             {"runner_selector", runnerSelector}, {"umu_launcher", umuLauncher}, {"umu_resolved", umuResolved},
-            {"umu_game_id", umuGameId}, {"store", store}, {"save_strategy", saveStrategy},
+            {"umu_game_id", umuGameId}, {"store", store},
             {"arguments", QJsonArray::fromStringList(arguments)}, {"environment", env}, {"metadata", metadata}};
 }
 void Game::selectRunner(const QString &path) {
@@ -207,14 +207,15 @@ Game Game::fromJson(const QJsonObject &j) {
     g.metadata = j["metadata"].toObject();
     g.recipeId = j["recipe_id"].toString(); g.recipeRevision = j["recipe_revision"].toString();
     g.recipeBase = j["recipe_base"].toObject(); g.recipeBase.remove("setup_profile");
+    g.recipeBase.remove("save_strategy");
     g.recipeOverrides = j["recipe_overrides"].toObject(); g.recipeOverrides.remove("setup_profile");
+    g.recipeOverrides.remove("save_strategy");
     for (const auto &value : j["recipe_candidates"].toArray()) g.recipeCandidates.append(value.toString());
     for (const auto &value : j["winetricks"].toArray()) g.winetricks.append(value.toString());
     g.recipeSaves = j["recipe_saves"].toArray();
     g.runnerSelector = j["runner_selector"].toString(); g.umuLauncher = j["umu_launcher"].toString();
     g.umuResolved = j["umu_resolved"].toString();
     g.umuGameId = j["umu_game_id"].toString(); g.store = j["store"].toString();
-    g.saveStrategy = j["save_strategy"].toString();
     for (auto a : j["arguments"].toArray()) g.arguments.append(a.toString());
     const auto env = j["environment"].toObject();
     for (auto it = env.begin(); it != env.end(); ++it) g.environment.insert(it.key(), it.value().toString());
@@ -312,8 +313,10 @@ Candidate inspect(const QString &folder, const QString &libraryRoot) {
     if (!selection.empty() && !selection.ambiguous()) {
         const auto recipe = selection.selected();
         c.executables = recipeExecutables(recipe, c.folder, all);
-        c.native = recipe.settings["backend"] == "native";
-        c.engine = recipe.tier == "engines" ? recipe.name : "Generic";
+        c.native = recipe.settings["backend"] == "native" ||
+            (recipe.tier == "general" && !c.executables.isEmpty() &&
+             std::all_of(c.executables.begin(), c.executables.end(), nativeExecutable));
+        c.engine = recipe.settings["engine"].toString("Generic");
         c.evidence = "Recipe: " + recipe.name;
     } else {
         c.executables = all;
@@ -775,6 +778,9 @@ int Library::import(const QList<Candidate> &candidates, const QString &runner) {
             for (const auto &recipe : choice.matches) g.recipeCandidates.append(recipe.id);
         } else {
             applyRecipeToGame(g, choice.selected());
+            if (choice.selected().tier == "general" && c.native) {
+                g.backend = "native"; g.runner.clear(); g.runnerRevision.clear(); g.runnerSelector.clear();
+            }
             if (choice.selected().tier != "general" && choice.selected().runnerExplicit &&
                 (runner.isEmpty() || runner == settings()["runner"].toString())) g.runner.clear();
             c.executables = recipeExecutables(choice.selected(), c.folder, c.executables);
@@ -804,6 +810,9 @@ Game Library::previewRecipe(const QString &id, const QString &recipeId) const {
         updated.executable = canonicalPath(QDir(g.folder).filePath(relative));
     else if (candidates.size() == 1) updated.executable = candidates.first();
     else updated.executable.clear();
+    if (chosen.tier == "general" && nativeExecutable(updated.executable)) {
+        updated.backend = "native"; updated.runner.clear(); updated.runnerRevision.clear(); updated.runnerSelector.clear();
+    }
     updated.workingDirectory = chosen.settings["working_directory"].toString().isEmpty() ?
         (updated.executable.isEmpty() ? g.folder : QFileInfo(updated.executable).absolutePath()) :
         canonicalPath(QDir(g.folder).filePath(chosen.settings["working_directory"].toString()));
@@ -840,7 +849,6 @@ Game Library::previewRecipe(const QString &id, const QString &recipeId) const {
             updated.winetricks.clear();
             for (const auto &verb : value.toArray()) updated.winetricks.append(verb.toString());
         } else if (key == "save_candidates") updated.recipeSaves = value.toArray();
-        else if (key == "save_strategy") updated.saveStrategy = value.toString();
     }
     updated.recipeOverrides = overrides;
     return updated;

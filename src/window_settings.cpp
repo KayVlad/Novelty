@@ -315,13 +315,13 @@ void Window::recipes() {
     if (!library_) return;
     QDialog dialog(this); dialog.setObjectName("recipesDialog"); dialog.setWindowTitle("Recipes"); dialog.resize(800, 600);
     auto layout = new QVBoxLayout(&dialog);
-    auto note = new QLabel("Every recipe uses the same JSON structure. Games match first, then engines; Settings chooses the fallback from General. All conditions must pass; any needs one match when present. Paths are relative to the game folder.", &dialog);
+    auto note = new QLabel("Game recipes match first; Settings chooses the fallback from General. All conditions must pass; any needs one match when present. Paths are relative to the game folder.", &dialog);
     note->setWordWrap(true); layout->addWidget(note);
     auto row = new QHBoxLayout; layout->addLayout(row, 1);
     auto list = new QListWidget(&dialog); list->setObjectName("recipeList"); list->setMinimumWidth(220); row->addWidget(list, 1);
     auto right = new QVBoxLayout; row->addLayout(right, 3);
     auto tier = new QComboBox(&dialog); tier->setObjectName("recipeTier");
-    tier->addItem("General", "general"); tier->addItem("Engines", "engines"); tier->addItem("Games", "games"); right->addWidget(tier);
+    tier->addItem("General", "general"); tier->addItem("Games", "games"); right->addWidget(tier);
     auto editor = new QPlainTextEdit(&dialog); editor->setObjectName("recipeJson"); right->addWidget(editor, 1);
     auto error = new QLabel(&dialog); error->setTextFormat(Qt::PlainText); error->setWordWrap(true); right->addWidget(error);
     auto actions = new QHBoxLayout; right->addLayout(actions);
@@ -334,7 +334,7 @@ void Window::recipes() {
     const auto root = library_->root();
     const auto reload = [&] {
         list->clear();
-        for (const auto &folder : {"general", "engines", "games"}) {
+        for (const auto &folder : {"general", "games"}) {
             const auto directory = recipeRoot(root) + '/' + folder;
             for (const auto &file : QDir(directory).entryList({"*.json"}, QDir::Files | QDir::NoSymLinks, QDir::Name)) {
                 const auto id = file.left(file.size() - 5), path = directory + '/' + file;

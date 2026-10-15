@@ -54,8 +54,8 @@ int main(int argc, char **argv) {
         const auto sourceRoot = temp.path() + "/source", targetRoot = temp.path() + "/target";
         QDir().mkpath(sourceRoot); QDir().mkpath(targetRoot);
         Library source(sourceRoot), target(targetRoot);
-        // Receiver starts without a default runner. Use its locally installed profile
-        // runner, and prepare the prefix after transfer without starting the game.
+        // Receiver uses its selected local runner, and prepares the prefix after
+        // transfer without starting the game.
         const auto runner = target.dataRoot() + "/runners/GE-Proton11-7";
         file(runner + "/proton");
         file(runner + "/toolmanifest.vdf", "\"require_tool_appid\" \"4183110\"");
@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
              "esac\nmkdir -p \"$WINEPREFIX\"\ntouch \"$WINEPREFIX/system.reg\"\n"
              "if [ \"$2\" != \"/c\" ]; then touch \"$WINEPREFIX/played\"; fi\n");
         QFile::setPermissions(umu, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
-        target.setSettings({{"umu", umu}, {"runner", temp.path() + "/missing-runner"}});
+        target.setSettings({{"umu", umu}, {"runner", runner}});
         for (const auto &name : {"First", "Second"}) {
             const auto folder = sourceRoot + '/' + name;
             file(folder + "/game.exe", "game asset"); file(folder + "/save/slot.dat", "private progress");
