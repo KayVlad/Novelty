@@ -1745,6 +1745,14 @@ void testRemoval(const QString &base, const QString &runner) {
     require(clean.import(discover(cleanRoot), runner) == 0, "removed folder is not rediscovered");
     Game broad; broad.name = "Broad folder"; broad.folder = cleanRoot; broad.executable = cleanRoot + "/broad.exe"; broad.workingDirectory = cleanRoot; clean.save(broad);
     for (const auto &item : clean.games()) if (item.name == broad.name) rejects([&] { clean.planRemoval(item.id); }, "main Games directory protected");
+    for (const auto location : {QStandardPaths::PicturesLocation, QStandardPaths::MusicLocation,
+                                QStandardPaths::MoviesLocation, QStandardPaths::GenericConfigLocation}) {
+        Game personal; personal.name = "Personal folder"; personal.folder = QStandardPaths::writableLocation(location);
+        if (personal.folder.isEmpty()) continue;
+        personal.workingDirectory = personal.folder; clean.save(personal);
+        for (const auto &item : clean.games()) if (item.folder == personal.folder)
+            rejects([&] { clean.planRemoval(item.id); }, "personal root cannot be deleted after broad relinking");
+    }
     const auto missingRoot = base + "/Removal missing"; touch(missingRoot + "/Missing/game.exe");
     Library missing(missingRoot); missing.import(discover(missingRoot), runner); const auto absent = missing.games().first();
     touch(missing.prefix(absent.id) + "/save.dat"); QDir(absent.folder).removeRecursively();

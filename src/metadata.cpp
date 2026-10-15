@@ -170,10 +170,13 @@ void VndbClient::cover(const QJsonObject &metadata, std::function<void(QJsonObje
     const bool localTest = base_.host() == "127.0.0.1" && url.host() == base_.host();
     if (!official && !localTest) { done(metadata, {}, "VNDB supplied an unexpected cover URL."); return; }
     QNetworkRequest request(url); request.setTransferTimeout(15000);
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
     auto reply = network_.get(request);
     connect(reply, &QNetworkReply::downloadProgress, this, [reply](qint64 bytes, qint64) { if (bytes > 5 * 1024 * 1024) reply->abort(); });
     connect(reply, &QNetworkReply::finished, this, [reply, metadata, done = std::move(done)] {
-        const auto error = reply->error() == QNetworkReply::NoError ? QString() : reply->errorString();
+        const auto status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const auto error = reply->error() == QNetworkReply::NoError && status == 200 ? QString() :
+            "HTTP " + QString::number(status) + ": " + reply->errorString();
         const auto bytes = reply->readAll(); reply->deleteLater();
         done(metadata, error.isEmpty() ? bytes : QByteArray(), error.isEmpty() ? QString() : "Cover unavailable: " + error);
     });

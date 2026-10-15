@@ -56,6 +56,7 @@ class MetadataFixture : public QTcpServer {
 public:
     int requests = 0;
     QByteArray cover;
+    bool redirectCover = false;
     MetadataFixture() {
         QImage image(3, 4, QImage::Format_RGB32); image.fill(QColor("#456789"));
         QBuffer buffer(&cover); buffer.open(QIODevice::WriteOnly); image.save(&buffer, "PNG");
@@ -71,6 +72,11 @@ public:
                     if (bytes.size() < split + 4 + length) return;
                     const auto body = QJsonDocument::fromJson(bytes.mid(split + 4, length)).object();
                     const auto path = header.left(header.indexOf(" HTTP/"));
+                    if (redirectCover && path.startsWith("GET /cover.png")) {
+                        ++requests;
+                        socket->write("HTTP/1.1 302 Found\r\nLocation: /unexpected-cover\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        responded = true; socket->disconnectFromHost(); return;
+                    }
                     QByteArray payload;
                     if (path.startsWith("GET /cover.png")) payload = cover;
                     else if (path.contains("/release")) {
@@ -945,6 +951,16 @@ print(target)
             offline.show(); QCoreApplication::processEvents();
             if (offline.findChild<QLabel *>("gameOriginalTitle")->text() != "原題" || fixture.requests != 5)
                 throw std::runtime_error("Automatically linked metadata was not available offline");
+        }
+        {
+            MetadataFixture redirects; redirects.redirectCover = true;
+            VndbClient client(nullptr, QUrl(QString("http://127.0.0.1:%1/").arg(redirects.serverPort())));
+            bool done = false; QByteArray image; QString warning;
+            client.fetch("v123", [&](const QJsonObject &, const QByteArray &bytes, const QString &error) {
+                image = bytes; warning = error; done = true;
+            });
+            if (!waitFor([&] { return done; }) || !image.isEmpty() || !warning.contains("302") || redirects.requests != 4)
+                throw std::runtime_error("Cover redirect was followed or accepted as an image.");
         }
         std::puts("PASS: grid/list actions, recipes, runtime installers, metadata, Overview, Settings, removal recovery, search, launch survival, discovery, relink and reconnection"); return 0;
     } catch (const std::exception &e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }

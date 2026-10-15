@@ -29,7 +29,9 @@ bool within(const QString &path, const QString &directory) {
 void checkFolder(const Library &lib, const QString &folder) {
     if (folder.isEmpty() || !QDir::isAbsolutePath(folder) || folder == "/") fail("This is not a dedicated game folder.");
     QStringList protectedFolders{QDir::homePath(), lib.root(), lib.dataRoot(), "/tmp", "/var", "/usr", "/etc", "/opt", "/home", "/run", "/media", "/mnt"};
-    for (auto location : {QStandardPaths::DesktopLocation, QStandardPaths::DocumentsLocation, QStandardPaths::DownloadLocation})
+    for (auto location : {QStandardPaths::DesktopLocation, QStandardPaths::DocumentsLocation, QStandardPaths::DownloadLocation,
+                          QStandardPaths::PicturesLocation, QStandardPaths::MusicLocation, QStandardPaths::MoviesLocation,
+                          QStandardPaths::GenericConfigLocation, QStandardPaths::GenericDataLocation, QStandardPaths::GenericCacheLocation})
         protectedFolders.append(QStandardPaths::standardLocations(location));
     for (const auto &path : protectedFolders) if (within(canonicalPath(path), folder)) fail("Full removal requires a dedicated game folder; this path contains a library, system or personal folder: " + folder);
     if (within(folder, canonicalPath(lib.dataRoot()))) fail("A game inside Novelty's library data cannot be removed this way.");
