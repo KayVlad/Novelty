@@ -318,6 +318,15 @@ int main(int argc, char **argv) {
         check(!managedRunnerRemovalIssue(library, version).isEmpty(), "recipe pin blocks runner removal");
         rejects([&] { removeManagedRunner(library, version); });
         removeRecipe(root, "games", "pinned-runner");
+        // A registered game that has never launched need not have a state directory.
+        const auto untouchedRoot = root + "/Never launched";
+        file(untouchedRoot + "/game.exe", {});
+        library.import({inspect(untouchedRoot)}, {});
+        for (const auto &registered : library.games()) {
+            const auto lockParent = QFileInfo(library.gamePath(registered.id, "launch.lock")).absolutePath();
+            if (QDir(lockParent).entryList(QDir::Files | QDir::Hidden | QDir::NoDotAndDotDot).isEmpty())
+                QDir().rmdir(lockParent);
+        }
         removeManagedRunner(library, version);
         check(!QFileInfo::exists(runner) && QFileInfo::exists(folder + "/Story.exe"), "unused build removed without game data loss");
         {

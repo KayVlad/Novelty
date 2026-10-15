@@ -283,7 +283,7 @@ void removeManagedRunner(Library &lib, const QString &version) {
     for (const auto &game : lib.games()) {
         auto lock = std::make_unique<QLockFile>(lib.gamePath(game.id, "launch.lock"));
         lock->setStaleLockTime(0);
-        if (!lock->tryLock()) fail("A game started while checking this runner. Retry after it exits.");
+        if (!QDir().mkpath(QFileInfo(lock->fileName()).absolutePath()) || !lock->tryLock()) fail("A game started while checking this runner. Retry after it exits.");
         locks.push_back(std::move(lock));
     }
     if (const auto reason = issue(lib, version, false); !reason.isEmpty()) fail(reason);
