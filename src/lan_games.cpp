@@ -1,3 +1,4 @@
+#include "filesystem_checks.h"
 #include "filesystem_durability.h"
 #include "lan_games.h"
 #include "saves.h"
@@ -211,16 +212,25 @@ void validateLanGameManifest(const QJsonObject &item,
 
 LanGameExchange::LanGameExchange(Library &library, LanConnection &connection,
                                  LanSaveExchange &router, QObject *parent)
-    : QObject(parent), library_(library), connection_(connection), router_(router), timeout_(this), manifestPoll_(this), resumePoll_(this) {
+    : QObject(parent), library_(library), connection_(connection), router_(router), timeout_(this), manifestPoll_(this), resumePoll_(this), sendingTimeout_(this) {
     timeout_.setSingleShot(true);
     QObject::connect(&timeout_, &QTimer::timeout, this, [this] {
         fail("LAN game transfer stalled. Reconnect to retry completed files.");
     });
+    sendingTimeout_.setSingleShot(true);
+    QObject::connect(&sendingTimeout_, &QTimer::timeout, this, [this] { fail("Source game transfer stalled."); });
     QPointer<LanGameExchange> guard(this);
+    connection_.onClosed = [guard, previous = std::move(connection_.onClosed)] {
+        if (previous) previous();
+        if (guard) guard->releaseSending();
+    };
     router_.onOtherMessage = [guard](const QJsonObject &message) {
         if (guard) guard->handle(message);
     };
-    router_.onTransportDrain = [guard] { if (guard) guard->pump(); };
+    router_.onTransportDrain = [guard] { if (guard) {
+        if (!guard->sendingRequest_.isEmpty()) guard->sendingTimeout_.start(120000);
+        guard->pump();
+    } };
     manifestPoll_.setInterval(50);
     QObject::connect(&manifestPoll_, &QTimer::timeout, this, [this] {
         if (!manifestFuture_.valid()) return;
@@ -256,6 +266,10 @@ LanGameExchange::LanGameExchange(Library &library, LanConnection &connection,
         resumePoll_.stop();
         try {
             verifiedStagedFiles_ = resumeFuture_.get();
+            qint64 remaining = 0;
+            for (const auto &entry : entries_)
+                if (!entry.directory && !verifiedStagedFiles_.contains(entry.path)) remaining += entry.size;
+            requireAvailableSpace(stage_, remaining);
             if (resumeWorker_.joinable()) resumeWorker_.join();
             requestNext();
         } catch (const std::exception &e) { fail(QString::fromUtf8(e.what())); }
@@ -373,7 +387,7 @@ void LanGameExchange::sendManifest(const QJsonObject &request) {
         return;
     }
     if (manifestWorker_.joinable()) manifestWorker_.join();
-    sendingFolder_ = chosen.folder; sendingRequest_ = id;
+    sendingFolder_ = chosen.folder; sendingRequest_ = id; sendingTimeout_.start(120000);
     sendingDescriptor_ = descriptor(library_, chosen);
     const auto excluded = transferExclusions(loadSaveConfig(library_, chosen.id));
     if (!validDescriptor(sendingDescriptor_))
@@ -702,13 +716,26 @@ void LanGameExchange::finalize() {
     }
     if (config.mappings.isEmpty()) { config.discoveryState = "searching"; config.discoverySource.clear(); }
     library_.save(local, &config);
+    persistTree(library_.gamePath(local.id, "saves.json"));
+    persistParent(library_.gamePath(local.id, "saves.json"));
     if (!QFile::remove(destination + "/.novelty-transfer.json"))
         throw std::runtime_error("Game settings were saved, but transfer cleanup is pending. Retry the LAN installation.");
+    persistParent(destination + "/.novelty-transfer.json");
+    connection_.send({{"type", "game-received"}, {"request_id", requestId_}});
     timeout_.stop(); requestId_.clear();
     if (onInstalled) onInstalled(local.id);
 }
 
+void LanGameExchange::releaseSending() {
+    sendingTimeout_.stop(); manifestPoll_.stop();
+    if (manifestWorker_.joinable()) { manifestWorker_.request_stop(); manifestWorker_.join(); }
+    sendingFile_.close(); sendingGameLock_.reset();
+    sendingRequest_.clear(); sendingFolder_.clear(); sendingMap_.clear();
+    sendingManifest_ = false; sendingFileActive_ = false;
+}
+
 void LanGameExchange::fail(const QString &reason) {
+    releaseSending();
     if (!connection_.ready()) return;
     timeout_.stop(); manifestPoll_.stop(); resumePoll_.stop();
     if (manifestWorker_.joinable()) manifestWorker_.request_stop();
@@ -722,6 +749,11 @@ void LanGameExchange::fail(const QString &reason) {
 void LanGameExchange::handle(const QJsonObject &message) {
     const auto type = message["type"].toString();
     try {
+        if (type == "game-received") {
+            if (message.size() != 2 || sendingRequest_.isEmpty() || message["request_id"] != sendingRequest_)
+                throw std::runtime_error("Unexpected game transfer acknowledgement.");
+            releaseSending(); return;
+        }
         if (type == "game-list") { sendCatalogue(message); return; }
         if (type == "game-manifest") { sendManifest(message); return; }
         if (type == "game-file-get") { sendFile(message); return; }

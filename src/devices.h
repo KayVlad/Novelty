@@ -2,6 +2,7 @@
 #include "core.h"
 
 namespace novelty {
+bool validDeviceName(const QString &);
 
 struct DeviceIdentity {
     QString certificatePath;

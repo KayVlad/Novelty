@@ -26,7 +26,7 @@ public:
     void send(const QJsonObject &message);
     qint64 pendingBytes() const { return socket_.bytesToWrite(); }
     void close();
-    bool ready() const { return ready_; }
+    bool ready() const { return ready_ && !failed_; }
     QString peerFingerprint() const { return peerFingerprint_; }
     void setServicePort(quint16 port) { servicePort_ = port; }
     void usePairingCode(const QString &deviceName) { codePairing_ = true; deviceName_ = deviceName.left(80).trimmed(); }
@@ -34,6 +34,7 @@ public:
     QString peerName() const { return remoteName_; }
     QString pairingCode() const { return pairingCode_; }
     std::function<void()> onEndpoint;
+    std::function<void()> onClosed;
     std::function<void()> onRemoteApproval;
     PhraseCallback onPhrase;
     ReadyCallback onReady;

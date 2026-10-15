@@ -21,6 +21,10 @@
 #include <QtNetwork/qhostaddress.h>
 #include <cstdio>
 #include <stdexcept>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <cerrno>
 
 using namespace novelty;
 
@@ -28,10 +32,11 @@ static void codePairingTests(const QString &root) {
     QDir().mkpath(root + "/host"); QDir().mkpath(root + "/guest");
     Library host(root + "/host"), guest(root + "/guest");
     const auto hostId = ensureDeviceIdentity(host), guestId = ensureDeviceIdentity(guest);
-    for (int scenario = 0; scenario < 3; ++scenario) {
+    for (int scenario = 0; scenario < 6; ++scenario) {
         QEventLoop loop; QTimer timeout; timeout.setSingleShot(true);
         QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
         QString hostCode, guestCode, error;
+        bool remoteApprovalWithoutTrust = false;
         bool hostReady = false, guestReady = false, submitted = false;
         LanListener listener(host, true);
         if (!listener.listen(QHostAddress::LocalHost, 0)) throw std::runtime_error("Cannot listen for code pairing.");
@@ -55,6 +60,9 @@ static void codePairingTests(const QString &root) {
             connection->onRemoteApproval = [&, connection] {
                 if (!trustedPeers(host).isEmpty() || !trustedPeers(guest).isEmpty())
                     throw std::runtime_error("Displaying device must confirm before trust is saved.");
+                if (scenario == 5) {
+                    remoteApprovalWithoutTrust = true; loop.quit(); return;
+                }
                 connection->approvePairing(connection->peerName());
             };
             connection->onReady = [&](const QString &) { hostReady = true; if (guestReady) loop.quit(); };
@@ -65,15 +73,19 @@ static void codePairingTests(const QString &root) {
         client.onReady = [&](const QString &) { guestReady = true; if (hostReady) loop.quit(); };
         client.onError = [&](const QString &message) { error = message; loop.quit(); };
         QSslSocket malformed;
-        if (scenario == 2) {
+        if (scenario >= 2 && scenario != 5) {
             configureDeviceTls(malformed, guestId);
             QObject::connect(&malformed, &QSslSocket::sslErrors, &loop, [&](const QList<QSslError> &errors) {
                 acceptExpectedPeerTlsErrors(malformed, errors);
             });
             QObject::connect(&malformed, &QSslSocket::encrypted, &loop, [&] {
+                if (scenario == 4) {
+                    malformed.write(encodeControlFrame(QJsonDocument(QJsonObject{{"type", "pair-approve"}}).toJson()));
+                    return;
+                }
                 const auto commitment = QCryptographicHash::hash(QByteArray(32, 'a'), QCryptographicHash::Sha256).toHex();
                 malformed.write(encodeControlFrame(QJsonDocument(QJsonObject{{"type", "pair-hello"},
-                    {"nonce", QString::fromLatin1(commitment)}, {"verification", "code-v1"}, {"name", "Bazzite desk"}}).toJson()));
+                    {"nonce", QString::fromLatin1(commitment)}, {"verification", "code-v1"}, {"name", scenario == 3 ? QString("Bazzite\u202e desk") : QString("Bazzite desk")}}).toJson()));
                 malformed.write(encodeControlFrame(QJsonDocument(QJsonObject{{"type", "pair-code-nonce"},
                     {"nonce", QString::fromLatin1(QByteArray(32, 'b').toHex())}}).toJson()));
             });
@@ -84,6 +96,9 @@ static void codePairingTests(const QString &root) {
             if (!error.isEmpty() || !hostReady || !guestReady || trustedPeers(host).first().name != "Bazzite desk" ||
                 trustedPeers(guest).first().name != "Steam Deck") throw std::runtime_error(("Code pairing failed: " + error).toStdString());
             revokePeer(host, guestId.fingerprint); revokePeer(guest, hostId.fingerprint);
+        } else if (scenario == 5) {
+            if (!remoteApprovalWithoutTrust || hostReady || guestReady || !trustedPeers(host).isEmpty() || !trustedPeers(guest).isEmpty())
+                throw std::runtime_error("Remote approval or cancellation bypassed local human confirmation.");
         } else if (error.isEmpty() || hostReady || guestReady || !trustedPeers(host).isEmpty() || !trustedPeers(guest).isEmpty())
             throw std::runtime_error("Invalid code or nonce commitment was not rejected safely.");
         if (scenario == 2 && !error.contains("changed during")) throw std::runtime_error("Nonce commitment was not checked.");
@@ -123,6 +138,16 @@ int main(int argc, char **argv) {
         if (!listener.listen(QHostAddress::LocalHost, 0)) {
             std::puts("SKIP: localhost TCP binding is unavailable here");
             return 77;
+        }
+        {
+            QDir().mkpath(temp.path() + "/invalid-identity"); Library invalid(temp.path() + "/invalid-identity");
+            const auto identity = ensureDeviceIdentity(invalid);
+            QFile key(identity.privateKeyPath); if (!key.open(QIODevice::WriteOnly)) throw std::runtime_error("identity fault setup");
+            key.write("invalid key"); key.close();
+            int descriptors[2]; if (::socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors)) throw std::runtime_error("descriptor fixture");
+            LanConnection rejected(invalid, true); rejected.acceptDescriptor(descriptors[0]);
+            if (::fcntl(descriptors[0], F_GETFD) != -1 || errno != EBADF) throw std::runtime_error("Failed TLS configuration leaked accepted descriptor.");
+            ::close(descriptors[1]);
         }
         codePairingTests(temp.path() + "/code-pairing");
         QString firstPhrase, secondPhrase, error;
@@ -359,6 +384,13 @@ int main(int argc, char **argv) {
         if (!senderProtected || newDevice.games().size() != 1 || QFileInfo::exists(newDevice.root() + "/Game/.novelty-transfer.json") ||
             QFileInfo::exists(newDevice.game(installedId).folder + "/saves/slot1.sav"))
             throw std::runtime_error("Retry duplicated the game or transferred saves with installation files.");
+        QElapsedTimer unlockWait; unlockWait.start();
+        while (deck.supervisorActive(deckGame.id) && unlockWait.elapsed() < 2000) {
+            QCoreApplication::processEvents(); QThread::msleep(5);
+        }
+        QLockFile unlocked(deck.gamePath(deckGame.id, "launch.lock")); unlocked.setStaleLockTime(0);
+        if (!unlocked.tryLock()) throw std::runtime_error("Successful/disconnected game transfer retained the source launch lock.");
+        unlocked.unlock();
         rememberPeerEndpoint(newDevice, ensureDeviceIdentity(deck).fingerprint,
                              "127.0.0.1", trustedListener.serverPort());
         const auto gameSaves = refreshLinkedPeerSaves(newDevice, installedId);

@@ -47,9 +47,9 @@ void LanConnection::connectTo(const QString &host, quint16 port) {
 }
 
 void LanConnection::acceptDescriptor(qintptr descriptor) {
-    if (socket_.state() != QAbstractSocket::UnconnectedState) { fail("Peer connection already started."); return; }
+    if (socket_.state() != QAbstractSocket::UnconnectedState) { ::close(descriptor); fail("Peer connection already started."); return; }
     try { configureDeviceTls(socket_, ensureDeviceIdentity(library_)); }
-    catch (const std::exception &e) { fail(QString::fromUtf8(e.what())); return; }
+    catch (const std::exception &e) { ::close(descriptor); fail(QString::fromUtf8(e.what())); return; }
     if (!socket_.setSocketDescriptor(descriptor)) { ::close(descriptor); fail("Cannot accept peer socket."); return; }
     timeout_.start(30000);
     socket_.startServerEncryption();
@@ -128,8 +128,7 @@ void LanConnection::process(const QJsonObject &message) {
             }
             if (code) {
                 remoteName_ = message["name"].toString();
-                if (remoteName_.trimmed().isEmpty() || remoteName_.size() > 80 ||
-                    std::any_of(remoteName_.begin(), remoteName_.end(), [](QChar c) { return c.unicode() < 32 || c.unicode() == 127; })) {
+                if (!validDeviceName(remoteName_)) {
                     fail("Invalid device name."); return;
                 }
                 remoteCommitment_ = nonce;
@@ -163,8 +162,8 @@ void LanConnection::process(const QJsonObject &message) {
     if (!ready_ || type.isEmpty() || type.startsWith("pair-")) { fail("Unauthorized peer message."); return; }
     try {
         if (!isTrustedPeer(library_, peerFingerprint_)) { fail("Peer access was revoked."); return; }
-        // Optional post-pairing message: older pairing screens ignore application
-        // messages. The temporary pairing socket is never a transfer endpoint.
+        // Post-approval endpoint announcement. The temporary pairing socket
+        // is never a file-transfer endpoint.
         if (pairing_ && type == "service-endpoint") {
             const auto port = message["port"].toInt();
             if (message.size() != 2 || port < 1 || port > 65535)
@@ -200,7 +199,7 @@ bool LanConnection::submitPairingCode(const QString &code) {
 }
 
 void LanConnection::approvePairing(const QString &peerName) {
-    if (!pairing_ || !helloReceived_ || localApproved_ || ready_ || failed_ || peerName.trimmed().isEmpty()) {
+    if (!pairing_ || !helloReceived_ || localApproved_ || ready_ || failed_ || !validDeviceName(peerName)) {
         fail("Pairing approval is not available yet."); return;
     }
     if (codePairing_ && outgoing_ && !codeVerified_) {
@@ -235,11 +234,16 @@ void LanConnection::send(const QJsonObject &message) {
         throw std::runtime_error("Cannot write peer message.");
 }
 
-void LanConnection::close() { timeout_.stop(); failed_ = true; socket_.abort(); }
+void LanConnection::close() {
+    if (failed_) return;
+    timeout_.stop(); failed_ = true; socket_.abort();
+    if (onClosed) onClosed();
+}
 
 void LanConnection::fail(const QString &reason) {
     if (failed_) return;
     failed_ = true; timeout_.stop(); socket_.abort();
+    if (onClosed) onClosed();
     if (onError) onError(reason);
 }
 

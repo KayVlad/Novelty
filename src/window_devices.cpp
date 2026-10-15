@@ -62,7 +62,7 @@ void Window::devices() {
             QMessageBox::warning(&pair, "Cannot pair", "Cannot listen for LAN peers: " + listener.errorString()); return;
         }
         auto addresses = localLanAddresses();
-        auto instructions = new QLabel("Open this screen on both devices. Select the other device below and connect. Enter its six-digit code here, then confirm on the device displaying the code.", &pair);
+        auto instructions = new QLabel("Open this screen on both devices. Select the other device below and connect. Check that both devices show the same six-digit code. Names are unverified until you pair. Confirm only with your own device in front of you.", &pair);
         instructions->setWordWrap(true); column->addWidget(instructions);
         auto local = new QLabel("This device: " + QSysInfo::machineHostName() + " · " + (addresses.isEmpty() ? QString("Find its IP in network settings") : addresses.join(", ")) +
                                 "  ·  port " + QString::number(listener.serverPort()), &pair);
@@ -141,14 +141,16 @@ void Window::devices() {
         auto code = new QLineEdit(&pair); code->setObjectName("pairingCode"); code->setMaxLength(6);
         code->setPlaceholderText("Six-digit code"); code->setValidator(new QIntValidator(0, 999999, code));
         code->hide(); column->addWidget(code);
+        auto checkedCode = new QCheckBox("I checked the matching code on my other device", &pair);
+        column->addWidget(checkedCode); checkedCode->hide();
         auto approve = new QPushButton("Pair", &pair); approve->setObjectName("approvePairing");
         approve->setEnabled(false); column->addWidget(approve);
-        auto state = new QLabel(&pair); state->setWordWrap(true); column->addWidget(state);
+        auto state = new QLabel(&pair); state->setTextFormat(Qt::PlainText); state->setWordWrap(true); column->addWidget(state);
         column->addStretch();
         LanConnection *active = nullptr;
         bool enteringCode = false;
         auto attach = [&](LanConnection *connection, bool outgoing) {
-            enteringCode = outgoing; code->clear(); code->setEnabled(true); code->setVisible(outgoing);
+            enteringCode = outgoing; checkedCode->setChecked(false); checkedCode->setVisible(!outgoing); code->clear(); code->setEnabled(true); code->setVisible(outgoing);
             connection->usePairingCode(QSysInfo::machineHostName());
             connection->setServicePort(saveListener_ ? saveListener_->serverPort() : 0);
             connection->onEndpoint = [&, this] { render(); refreshPeerGames(); };
@@ -156,16 +158,17 @@ void Window::devices() {
             connection->onPhrase = [&, connection](const QString &fingerprint, const QString &value) {
                 if (active != connection) return;
                 phrase->setToolTip("Device certificate: " + fingerprint);
-                phrase->setText(enteringCode ? "Enter the code displayed on " + connection->peerName() + "." :
-                    "Pairing code: " + value);
-                state->setText(enteringCode ? QString() : "Enter this code on " + connection->peerName() +
-                    ", then confirm here after that device says the code matches.");
+                phrase->setText("Pairing code: " + value + "\nUnverified device: " + connection->peerName());
+                phrase->setTextFormat(Qt::PlainText);
+                state->setText(enteringCode ? "Enter the code you read on your other device." :
+                    "Compare both screens yourself before checking the box and allowing this device.");
                 approve->setText(enteringCode ? "Pair" : "Allow " + connection->peerName());
                 approve->setEnabled(enteringCode);
                 if (enteringCode) code->setFocus();
             };
             connection->onRemoteApproval = [&, connection] {
-                if (active == connection && !enteringCode) approve->setEnabled(true);
+                if (active == connection && !enteringCode)
+                    state->setText("The other device sent approval. You must still check the code on both screens yourself.");
             };
             connection->onReady = [&, connection](const QString &) {
                 if (active != connection) return;
@@ -195,6 +198,9 @@ void Window::devices() {
             if (!validPort || number == 0) { state->setText("Enter a valid port."); connection->deleteLater(); active = nullptr; return; }
             connection->connectTo(host->text().trimmed(), number);
         });
+        connect(checkedCode, &QCheckBox::toggled, &pair, [&](bool checked) {
+            if (!enteringCode) approve->setEnabled(checked && active && !active->pairingCode().isEmpty());
+        });
         connect(approve, &QPushButton::clicked, &pair, [&] {
             if (!active) return;
             if (enteringCode) {
@@ -204,7 +210,7 @@ void Window::devices() {
                 }
                 approve->setEnabled(false); code->setEnabled(false);
                 state->setText("Code matches. Confirm pairing on " + active->peerName() + ".");
-            } else { approve->setEnabled(false); active->approvePairing(active->peerName()); }
+            } else if (checkedCode->isChecked()) { approve->setEnabled(false); active->approvePairing(active->peerName()); }
         });
         connect(code, &QLineEdit::returnPressed, approve, &QPushButton::click);
         connect(&pair, &QDialog::finished, &pair, [&] { listener.close(); if (active) active->close(); });

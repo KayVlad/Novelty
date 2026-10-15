@@ -19,6 +19,14 @@
 #include <stdexcept>
 
 namespace novelty {
+bool validDeviceName(const QString &name) {
+    if (name.isEmpty() || name.size() > 80 || name != name.trimmed()) return false;
+    for (const auto c : name)
+        if (c.category() == QChar::Other_Control || c.category() == QChar::Other_Format ||
+            c.category() == QChar::Other_Surrogate || c.unicode() == 0x034f ||
+            (c.unicode() >= 0xfe00 && c.unicode() <= 0xfe0f)) return false;
+    return true;
+}
 namespace {
 [[noreturn]] void fail(const QString &s) { throw std::runtime_error(s.toStdString()); }
 template <typename T, void (*Free)(T *)> using Owned = std::unique_ptr<T, decltype(Free)>;
@@ -27,11 +35,6 @@ bool validFingerprint(const QString &fingerprint) {
     for (const auto c : fingerprint)
         if (!((c >= QLatin1Char('0') && c <= QLatin1Char('9')) ||
               (c >= QLatin1Char('a') && c <= QLatin1Char('f')))) return false;
-    return true;
-}
-bool validName(const QString &name) {
-    if (name.isEmpty() || name.size() > 80 || name != name.trimmed()) return false;
-    for (const auto c : name) if (c.unicode() < 0x20) return false;
     return true;
 }
 QByteArray pemKey(EVP_PKEY *key) {
@@ -136,7 +139,7 @@ QList<TrustedPeer> readPeers(const Library &lib) {
         const auto record = entry.toObject();
         TrustedPeer peer{record["fingerprint"].toString(), record["name"].toString(), record["approved_at"].toString(),
                          record["address"].toString(), quint16(record["port"].toInt())};
-        if (!validFingerprint(peer.fingerprint) || !validName(peer.name) ||
+        if (!validFingerprint(peer.fingerprint) || !validDeviceName(peer.name) ||
             !QDateTime::fromString(peer.approvedAt, Qt::ISODateWithMs).isValid())
             fail("Trusted-device record is damaged.");
         if ((!peer.address.isEmpty() || peer.port != 0) &&
@@ -196,7 +199,7 @@ bool isTrustedPeer(const Library &lib, const QString &fingerprint) {
     return false;
 }
 void approvePairedPeer(const Library &lib, const QString &fingerprint, const QString &name) {
-    if (!validFingerprint(fingerprint) || !validName(name) || ensureDeviceIdentity(lib).fingerprint == fingerprint)
+    if (!validFingerprint(fingerprint) || !validDeviceName(name) || ensureDeviceIdentity(lib).fingerprint == fingerprint)
         fail("Choose a valid, distinct paired device and name.");
     QLockFile lock(peersPath(lib) + ".lock"); lock.setStaleLockTime(0);
     if (!lock.tryLock(5000)) fail("Trusted-device records are busy.");

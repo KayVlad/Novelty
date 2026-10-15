@@ -45,10 +45,11 @@ private:
     void receiveFileEnd(const QJsonObject &);
     void finalize();
     void fail(const QString &);
+    void releaseSending();
     Library &library_;
     LanConnection &connection_;
     LanSaveExchange &router_;
-    QTimer timeout_, manifestPoll_, resumePoll_;
+    QTimer timeout_, manifestPoll_, resumePoll_, sendingTimeout_;
     QString requestId_, remoteGameId_, stage_, sendingFolder_, sendingRequest_;
     QString previewId_;
     QJsonObject descriptor_;
