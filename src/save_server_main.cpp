@@ -1,3 +1,6 @@
+#include "core.h"
+#include "filesystem_checks.h"
+#include "filesystem_durability.h"
 #include "save_bundle_archive.h"
 #include "save_server_store.h"
 #include <QtCore/qcommandlineparser.h>
@@ -7,8 +10,12 @@
 #include <QtCore/qjsondocument.h>
 #include <QtCore/qjsonobject.h>
 #include <QtCore/qmap.h>
+#include <QtCore/qlockfile.h>
+#include <QtCore/qregularexpression.h>
 #include <QtCore/qtemporarydir.h>
 #include <QtCore/qtimer.h>
+#include <QtCore/qthread.h>
+#include <functional>
 #include <QtNetwork/qhostaddress.h>
 #include <QtNetwork/qtcpserver.h>
 #include <QtNetwork/qtcpsocket.h>
@@ -40,6 +47,7 @@ QByteArray tokenFor(const QString &root) {
         const bool durable = written == value.size() && ::fsync(descriptor) == 0;
         ::close(descriptor);
         if (!durable) { QFile::remove(path); fail("Cannot store server access token."); }
+        persistParent(path);
         return value;
     }
     if (!info.isFile() || (info.permissions() & (QFileDevice::ReadGroup | QFileDevice::WriteGroup |
@@ -52,24 +60,43 @@ QByteArray tokenFor(const QString &root) {
     return value;
 }
 QByteArray json(const QJsonObject &object) { return QJsonDocument(object).toJson(QJsonDocument::Compact); }
+// At most two heavyweight jobs, even if clients disconnect during verification.
+// Worker ownership is independent of Request; disconnect never joins on the event loop.
+int activeWork = 0;
+class ServerWork final : public QThread {
+public:
+    std::function<ServerSaveRevision()> action;
+    ServerSaveRevision result;
+    std::exception_ptr error;
+    void run() override { try { result = action(); } catch (...) { error = std::current_exception(); } }
+};
 class Request final : public QObject {
 public:
-    Request(QTcpSocket *socket, SaveServerStore &store, const QByteArray &token)
+    Request(QTcpSocket *socket, std::shared_ptr<SaveServerStore> store, const QByteArray &token)
         : socket_(socket), store_(store), token_(token),
-          stage_(store.rootPath() + "/.request-XXXXXX") {
+          stage_(std::make_shared<QTemporaryDir>(store->rootPath() + "/.request-XXXXXX")) {
         socket_->setParent(this);
         socket_->setReadBufferSize(128 * 1024);
         timeout_.setSingleShot(true);
         timeout_.setInterval(30000);
-        connect(&timeout_, &QTimer::timeout, this, [this] { reply(408, "Request Timeout", {}); });
+        connect(&timeout_, &QTimer::timeout, this, [this] {
+            if (answered_) socket_->abort(); else reply(408, "Request Timeout", {});
+        });
         connect(socket_, &QTcpSocket::readyRead, this, [this] { consume(); });
-        connect(socket_, &QTcpSocket::bytesWritten, this, [this](qint64) { sendDownload(); });
+        connect(socket_, &QTcpSocket::bytesWritten, this, [this](qint64 bytes) {
+            if (bytes > 0) timeout_.start(30000);
+            sendDownload();
+        });
         connect(socket_, &QTcpSocket::disconnected, this, &QObject::deleteLater);
         timeout_.start();
         deadline_.setSingleShot(true);
         connect(&deadline_, &QTimer::timeout, this, [this] { socket_->abort(); });
         deadline_.start(10000); // Header deadline is absolute, even if bytes keep arriving.
-        if (!stage_.isValid()) reply(500, "Internal Server Error", {});
+        if (!stage_->isValid()) reply(500, "Internal Server Error", {});
+        else try {
+            writeJson(stage_->path() + "/request-owner.json", {{"schema", 1},
+                {"server_id", store_->serverId()}, {"directory", QFileInfo(stage_->path()).fileName()}});
+        } catch (const std::exception &) { reply(500, "Internal Server Error", {}); }
     }
 private:
     void reply(int status, const QByteArray &label, const QByteArray &body,
@@ -146,7 +173,7 @@ private:
             error(400, "Bad Request", "unsupported_encoding"); return false;
         }
         if (target == "/v1/identity" && method == "GET") {
-            reply(200, "OK", json({{"schema", 1}, {"server_id", store_.serverId()}})); return false;
+            reply(200, "OK", json({{"schema", 1}, {"server_id", store_->serverId()}})); return false;
         }
         constexpr char prefix[] = "/v1/games/";
         const auto encoded = target.mid(sizeof(prefix) - 1);
@@ -164,7 +191,7 @@ private:
         if (gameKey_.toUtf8() != decoded) { error(400, "Bad Request", "bad_game_key"); return false; }
         try {
             if (method == "GET" || method == "HEAD") {
-                const auto current = store_.current(gameKey_);
+                const auto current = store_->current(gameKey_, false);
                 if (method == "HEAD") {
                     QByteArray fields = "X-Novelty-Server-Id: " + current.serverId.toLatin1() + "\r\n";
                     fields += "X-Novelty-Revision: " + QByteArray::number(current.revision) + "\r\n";
@@ -181,18 +208,12 @@ private:
                           "application/json", false, fields);
                     return false;
                 }
-                download_.setFileName(stage_.path() + "/download.nvsb");
-                writePortableSaveArchive(current.bundleDirectory, download_.fileName());
-                if (!download_.open(QIODevice::ReadOnly)) fail("Cannot open server download.");
-                answered_ = true; timeout_.stop();
-                QByteArray message = "HTTP/1.1 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\n";
-                message += "Content-Type: application/vnd.novelty.save-bundle-v1\r\n";
-                message += "Content-Length: " + QByteArray::number(download_.size()) + "\r\n";
-                message += "X-Novelty-Server-Id: " + current.serverId.toLatin1() + "\r\n";
-                message += "X-Novelty-Revision: " + QByteArray::number(current.revision) + "\r\n";
-                message += "X-Novelty-Snapshot-Id: " + current.snapshotId.toLatin1() + "\r\n";
-                message += "X-Novelty-Files: " + QByteArray::number(current.files) + "\r\n\r\n";
-                socket_->write(message); sendDownload(); return false;
+                const auto stage = stage_;
+                startWork([stage, current] {
+                    writePortableSaveArchive(current.bundleDirectory, stage->path() + "/download.nvsb");
+                    return current;
+                }, [this](const ServerSaveRevision &revision) { beginDownload(revision); });
+                return false;
             }
             if (!headers.contains("content-length") || !headers.contains("x-expected-revision")) {
                 error(400, "Bad Request", "missing_upload_header"); return false;
@@ -203,7 +224,14 @@ private:
             if (!sizeOk || remaining_ < 12 || remaining_ > maxArchive || !revisionOk || expected_ < 0) {
                 error(413, "Content Too Large", "bad_upload_size_or_revision"); return false;
             }
-            upload_.setFileName(stage_.path() + "/upload.nvsb");
+            if (headers.contains("x-novelty-reconcile")) {
+                if (headers.value("x-novelty-reconcile") != store_->serverId().toLatin1()) {
+                    error(409, "Conflict", "server_identity_changed"); return false;
+                }
+                reconcile_ = true;
+            }
+            requireAvailableSpace(store_->rootPath(), remaining_ * 3);
+            upload_.setFileName(stage_->path() + "/upload.nvsb");
             if (!upload_.open(QIODevice::WriteOnly | QIODevice::NewOnly)) fail("Cannot stage server upload.");
             return true;
         } catch (const std::exception &) {
@@ -223,19 +251,49 @@ private:
         }
         remaining_ -= data.size();
     }
+    void startWork(std::function<ServerSaveRevision()> action,
+                   std::function<void(const ServerSaveRevision &)> done) {
+        if (activeWork >= 2) { error(503, "Service Unavailable", "storage_busy"); return; }
+        ++activeWork;
+        auto *work = new ServerWork;
+        work->action = std::move(action);
+        connect(work, &QThread::finished, this, [this, work, done = std::move(done)] {
+            if (answered_) return;
+            try {
+                if (work->error) std::rethrow_exception(work->error);
+                done(work->result);
+            } catch (const ServerRevisionConflict &conflict) {
+                reply(409, "Conflict", json({{"error", "stale_revision"}, {"current_revision", conflict.currentRevision}}));
+            } catch (const std::exception &) { error(422, "Unprocessable Content", "invalid_save_bundle"); }
+        });
+        connect(work, &QThread::finished, work, [work] { --activeWork; work->deleteLater(); });
+        work->start();
+    }
     void finishUpload() {
         upload_.close();
-        try {
-            const auto destination = stage_.path() + "/extracted";
-            extractPortableSaveArchive(upload_.fileName(), destination);
-            const auto current = store_.put(gameKey_, expected_, destination);
+        const auto stage = stage_; const auto store = store_;
+        const auto key = gameKey_; const auto expected = expected_; const auto reconcile = reconcile_;
+        startWork([stage, store, key, expected, reconcile] {
+            const auto destination = stage->path() + "/extracted";
+            extractPortableSaveArchive(stage->path() + "/upload.nvsb", destination);
+            return store->put(key, expected, destination, reconcile);
+        }, [this](const ServerSaveRevision &current) {
             reply(200, "OK", json({{"schema", 1}, {"server_id", current.serverId},
-                                   {"revision", current.revision}, {"snapshot_id", current.snapshotId},
-                                   {"files", current.files}}));
-        } catch (const ServerRevisionConflict &conflict) {
-            reply(409, "Conflict", json({{"error", "stale_revision"},
-                                         {"current_revision", conflict.currentRevision}}));
-        } catch (const std::exception &) { error(422, "Unprocessable Content", "invalid_save_bundle"); }
+                {"revision", current.revision}, {"snapshot_id", current.snapshotId}, {"files", current.files}}));
+        });
+    }
+    void beginDownload(const ServerSaveRevision &current) {
+        download_.setFileName(stage_->path() + "/download.nvsb");
+        if (!download_.open(QIODevice::ReadOnly)) fail("Cannot open server download.");
+        answered_ = true; timeout_.start(30000);
+        QByteArray message = "HTTP/1.1 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\n";
+        message += "Content-Type: application/vnd.novelty.save-bundle-v1\r\n";
+        message += "Content-Length: " + QByteArray::number(download_.size()) + "\r\n";
+        message += "X-Novelty-Server-Id: " + current.serverId.toLatin1() + "\r\n";
+        message += "X-Novelty-Revision: " + QByteArray::number(current.revision) + "\r\n";
+        message += "X-Novelty-Snapshot-Id: " + current.snapshotId.toLatin1() + "\r\n";
+        message += "X-Novelty-Files: " + QByteArray::number(current.files) + "\r\n\r\n";
+        socket_->write(message); sendDownload();
     }
     void sendDownload() {
         if (!download_.isOpen()) return;
@@ -246,15 +304,15 @@ private:
         if (download_.atEnd()) { download_.close(); socket_->disconnectFromHost(); }
     }
     QTcpSocket *socket_;
-    SaveServerStore &store_;
+    std::shared_ptr<SaveServerStore> store_;
     QByteArray token_, header_;
-    QTemporaryDir stage_;
+    std::shared_ptr<QTemporaryDir> stage_;
     QTimer timeout_, deadline_;
     QFile upload_, download_;
     QString gameKey_;
     qint64 remaining_ = 0;
     int expected_ = 0;
-    bool headersReady_ = false, answered_ = false;
+    bool headersReady_ = false, answered_ = false, reconcile_ = false;
 };
 }
 
@@ -271,7 +329,22 @@ int main(int argc, char **argv) {
         bool okay = false;
         const auto port = parser.value("port").toUShort(&okay);
         if (!okay || port == 0) fail("Server port must be between 1 and 65535.");
-        SaveServerStore store(parser.value("data"));
+        auto store = std::make_shared<SaveServerStore>(parser.value("data"));
+        QLockFile service(store->rootPath() + "/service.lock"); service.setStaleLockTime(0);
+        if (!service.tryLock()) fail("A save server is already using this storage directory.");
+        store->recover();
+        for (const auto &entry : checkedDirectoryEntries(store->rootPath(), 0)) {
+            if (!QRegularExpression("^\\.request-[A-Za-z0-9]{6}$").match(entry.fileName()).hasMatch() ||
+                entry.isSymbolicLink() || !entry.isDir()) continue;
+            const auto marker = entry.absoluteFilePath() + "/request-owner.json";
+            if (QFileInfo(marker).isSymbolicLink() || !QFileInfo(marker).isFile() || QFileInfo(marker).size() > 4096) continue;
+            QJsonObject owner;
+            try { owner = readJson(marker); } catch (const std::exception &) { continue; }
+            if (owner["schema"].toInt() != 1 || owner["server_id"] != store->serverId() || owner["directory"] != entry.fileName()) continue;
+            // Revision journals never reference a request directory. Store recovery ran first.
+            if (!QDir(entry.absoluteFilePath()).removeRecursively()) fail("Cannot clean abandoned server request stage.");
+            persistParent(entry.absoluteFilePath());
+        }
         const auto token = tokenFor(parser.value("data"));
         int activeRequests = 0;
         QTcpServer listener;

@@ -566,7 +566,8 @@ void Window::manage() {
                 ". The replaced local state stays in Backup history. The choice is checked again before anything changes.");
             auto useLocal = choice.addButton("Keep local saves", QMessageBox::AcceptRole);
             auto useServer = choice.addButton("Use server saves", QMessageBox::DestructiveRole);
-            useServer->setEnabled(preview.remote.revision > 0);
+            useServer->setEnabled(preview.remoteCompatible);
+            if (!preview.remoteCompatible) choice.setInformativeText(choice.informativeText() + "\n" + preview.remoteIssue);
             choice.addButton(QMessageBox::Cancel);
             choice.exec();
             if (choice.clickedButton() != useLocal && choice.clickedButton() != useServer) return;

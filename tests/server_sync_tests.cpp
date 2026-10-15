@@ -106,6 +106,25 @@ void retryAndConflict(const QString &binary) {
     resolveServerSaveConflict(f.library, f.game.id, config, preview, true);
     require(f.library.status(f.game) == "Ready" && client.current(key).revision == 5,
             "explicit conflict resolution publishes the chosen local state");
+    auto changed = loadSaveConfig(f.library, f.game.id);
+    changed.mappings = {{"game", "different-save"}}; changed.gameIdentity = "new-edition";
+    saveSaveConfig(f.library, f.game.id, changed);
+    put(f.game.folder + "/different-save/slot", "new mapping progress");
+    require(retryPendingServerSave(f.library, f.game.id, config).status == ServerSyncStatus::Conflict,
+            "mapping and identity changes require explicit reconciliation");
+    const auto changedPreview = reviewServerSaveConflict(f.library, f.game.id, config);
+    require(!changedPreview.remoteCompatible && !changedPreview.remoteIssue.isEmpty(),
+            "incompatible remote action has a clear explanation before user confirmation");
+    resolveServerSaveConflict(f.library, f.game.id, config, changedPreview, true);
+    require(client.current(key).revision == 6 && get(f.game.folder + "/different-save/slot") == "new mapping progress" &&
+            get(f.game.folder + "/save/slot") == "local change", "explicit local choice reconciles identity and mappings without deleting either local location");
+    auto changedIdentity = config; changedIdentity.serverId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    require(syncServerBeforePlay(f.library, f.game.id, changedIdentity).status == ServerSyncStatus::Conflict,
+            "an unrecognized server identity blocks automatic synchronization");
+    const auto identityPreview = reviewServerSaveConflict(f.library, f.game.id, changedIdentity);
+    resolveServerSaveConflict(f.library, f.game.id, changedIdentity, identityPreview, true);
+    require(client.current(key).revision == 7 && loadSaveServerConfig(f.library).serverId == config.serverId,
+            "explicit reconciliation rebinds the accepted server identity");
     server.stop();
     require(retryPendingServerSave(f.library, f.game.id, config).status == ServerSyncStatus::Pending &&
             f.library.status(f.game) == "Sync pending" && !f.library.busy(f.game.id),
@@ -148,6 +167,7 @@ void recoveryDuringSync() {
 }
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
+    QTemporaryDir appData; qputenv("NOVELTY_TEST_APP_DATA_DIR", QFile::encodeName(appData.path()));
     try {
         require(argc == 2, "server executable argument");
         retryAndConflict(QString::fromLocal8Bit(argv[1]));

@@ -93,7 +93,7 @@ ServerSyncResult retryPendingServerSave(Library &library, const QString &gameId,
     QLockFile mutation(library.dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
     if (!mutation.tryLock(2000)) return {ServerSyncStatus::Pending, "Library maintenance is in progress."};
     QLockFile launch(library.gamePath(gameId, "launch.lock")); launch.setStaleLockTime(0);
-    if (!launch.tryLock()) return {ServerSyncStatus::Pending, "Game is still running."};
+    if (!QDir().mkpath(QFileInfo(launch.fileName()).absolutePath()) || !launch.tryLock()) return {ServerSyncStatus::Pending, "Game is still running."};
     if (!library.recoveryIssue(gameId).isEmpty() || !saveRestoreIssue(library, gameId).isEmpty())
         return {ServerSyncStatus::Pending, "Resolve game or save recovery before server sync."};
     // Both locks are already held; the public post-exit helper acquires mutation.lock.
@@ -122,7 +122,21 @@ ServerConflictPreview reviewServerSaveConflict(const Library &library, const QSt
         chooseServerSaveAction(accepted, remote, live) != ServerSaveAction::Conflict &&
         remote.serverId == config.serverId)
         fail("The server conflict has changed. Retry the ordinary sync check.");
-    return {remote, live};
+    ServerConflictPreview preview{remote, live, false, "The server has no revision to restore."};
+    if (remote.revision > 0) {
+        QTemporaryDir temporary(library.dataRoot() + "/.server-review-XXXXXX");
+        if (!temporary.isValid()) fail("Cannot stage conflict review.");
+        const auto received = client.download(key, temporary.path() + "/bundle");
+        if (received.serverId != remote.serverId || received.revision != remote.revision || received.snapshotId != remote.snapshotId)
+            fail("Server saves changed during review. Review them again.");
+        const auto manifest = verifyPortableSaveBundle(temporary.path() + "/bundle");
+        const auto saves = loadSaveConfig(library, gameId);
+        preview.remoteCompatible = save_detail::profileGameMatches(saves, manifest["profile_game_id"].toString()) &&
+            save_detail::labelsCompatible(saves, manifest) && save_detail::mappingsMatch(saves, manifest);
+        preview.remoteIssue = preview.remoteCompatible ? QString() :
+            "Server mappings or game identity differ. Keep local saves, or restore the matching configuration before choosing server saves. Old server revisions are retained.";
+    }
+    return preview;
 }
 void resolveServerSaveConflict(Library &library, const QString &gameId, const SaveServerConfig &config,
                                const ServerConflictPreview &preview, bool chooseLocal) {
@@ -130,7 +144,7 @@ void resolveServerSaveConflict(Library &library, const QString &gameId, const Sa
     QLockFile mutation(library.dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
     if (!mutation.tryLock(2000)) fail("Library maintenance is in progress. Retry shortly.");
     QLockFile launch(library.gamePath(gameId, "launch.lock")); launch.setStaleLockTime(0);
-    if (!launch.tryLock()) fail("Wait until the game closes before resolving server saves.");
+    if (!QDir().mkpath(QFileInfo(launch.fileName()).absolutePath()) || !launch.tryLock()) fail("Wait until the game closes before resolving server saves.");
     if (!library.recoveryIssue(gameId).isEmpty() || !saveRestoreIssue(library, gameId).isEmpty() ||
         !pendingSaveSnapshotIssue(library, gameId).isEmpty())
         fail("Finish game and save recovery before resolving server saves.");
@@ -149,9 +163,10 @@ void resolveServerSaveConflict(Library &library, const QString &gameId, const Sa
         const auto bundle = verifiedSaveSnapshotBundle(library, gameId, snapshot.id);
         if (fingerprint(verifyPortableSaveBundle(bundle)) != live)
             fail("Local saves changed while preparing the upload. Review them again.");
-        accepted = client.upload(key, remote.revision, bundle);
+        accepted = client.upload(key, remote.revision, bundle, 30000, remote.serverId);
         applied = live;
     } else {
+        if (!preview.remoteCompatible) fail(preview.remoteIssue);
         if (remote.revision == 0)
             fail("This server has no revision to restore. Choose local saves or disable sync and restore an empty local snapshot.");
         QTemporaryDir temporary(library.dataRoot() + "/.server-transfer-XXXXXX");

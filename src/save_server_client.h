@@ -25,9 +25,10 @@ public:
     QString identity(int timeoutMs = 5000) const;
     RemoteSaveRevision current(const QString &gameKey, int timeoutMs = 5000) const;
     RemoteSaveRevision download(const QString &gameKey, const QString &destinationDirectory,
-                                int timeoutMs = 120000) const;
+                                int timeoutMs = 30000) const;
     RemoteSaveRevision upload(const QString &gameKey, int expectedRevision,
-                              const QString &bundleDirectory, int timeoutMs = 120000) const;
+                              const QString &bundleDirectory, int timeoutMs = 30000,
+                              const QString &reconcileServerId = {}) const;
 private:
     QUrl endpoint(const QString &gameKey) const;
     QUrl base_;

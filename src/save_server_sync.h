@@ -9,7 +9,7 @@ namespace novelty {
 
 enum class ServerSyncStatus { Synced, Pending, Conflict, Unavailable };
 struct ServerSyncResult { ServerSyncStatus status; QString detail; };
-struct ServerConflictPreview { RemoteSaveRevision remote; QJsonObject verifiedLive; };
+struct ServerConflictPreview { RemoteSaveRevision remote; QJsonObject verifiedLive; bool remoteCompatible = false; QString remoteIssue; };
 
 // The detached launch supervisor calls these while holding launch.lock.
 // Network errors leave local Play available and never advance acceptance.

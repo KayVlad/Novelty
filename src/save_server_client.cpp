@@ -14,6 +14,7 @@
 #include <QtNetwork/qnetworkreply.h>
 #include <QtNetwork/qnetworkrequest.h>
 #include <memory>
+#include <algorithm>
 #include <climits>
 #include <stdexcept>
 
@@ -37,10 +38,20 @@ QNetworkRequest requestFor(const QUrl &url, const QByteArray &token, int timeout
 int status(const QNetworkReply &reply) {
     return reply.attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
 }
-void await(QNetworkReply &reply, int timeoutMs, QFile *download = nullptr) {
+void await(QNetworkReply &reply, int timeoutMs, QFile *download = nullptr, bool transfer = false) {
     QEventLoop loop;
-    QTimer timeout;
-    timeout.setSingleShot(true);
+    QTimer timeout, lifetime;
+    timeout.setSingleShot(true); lifetime.setSingleShot(true);
+    transfer = transfer || download;
+    qint64 downloaded = 0, uploaded = 0;
+    const auto progress = [&](qint64 bytes, qint64 &prior) {
+        if (transfer && bytes > prior) { prior = bytes; timeout.start(timeoutMs); }
+    };
+    QObject::connect(&reply, &QNetworkReply::downloadProgress, &loop, [&](qint64 bytes, qint64) { progress(bytes, downloaded); });
+    QObject::connect(&reply, &QNetworkReply::requestSent, &loop, [&] { if (transfer) timeout.start(timeoutMs); });
+    QObject::connect(&reply, &QNetworkReply::uploadProgress, &loop, [&](qint64 bytes, qint64) { progress(bytes, uploaded); });
+    QObject::connect(&lifetime, &QTimer::timeout, &loop, [&] { reply.abort(); loop.quit(); });
+    if (transfer) lifetime.start(600000);
     bool writeFailed = false;
     qint64 received = 0;
     const auto drain = [&] {
@@ -65,11 +76,11 @@ void await(QNetworkReply &reply, int timeoutMs, QFile *download = nullptr) {
     });
     QObject::connect(&reply, &QNetworkReply::finished, &loop, [&] { if (download) drain(); loop.quit(); });
     QObject::connect(&timeout, &QTimer::timeout, &loop, [&] { reply.abort(); loop.quit(); });
-    timeout.start(timeoutMs);
+    timeout.start(transfer ? std::min(timeoutMs, 5000) : timeoutMs);
     if (!reply.isFinished()) loop.exec();
     else if (download) drain();
     if (writeFailed) fail("Save server download exceeded its limit or could not be staged.");
-    if (!timeout.isActive()) fail("Save server request timed out.");
+    if (!timeout.isActive() || (transfer && !lifetime.isActive())) fail("Save server request timed out.");
     if (status(reply) < 200 || status(reply) >= 300) {
         if (status(reply) == 409) {
             const auto object = QJsonDocument::fromJson(reply.readAll()).object();
@@ -177,7 +188,7 @@ RemoteSaveRevision SaveServerClient::download(const QString &gameKey, const QStr
     return metadata;
 }
 RemoteSaveRevision SaveServerClient::upload(const QString &gameKey, int expectedRevision,
-                                            const QString &bundleDirectory, int timeoutMs) const {
+                                            const QString &bundleDirectory, int timeoutMs, const QString &reconcileServerId) const {
     if (expectedRevision < 0 || expectedRevision == INT_MAX) fail("Expected server revision is invalid.");
     QTemporaryDir temporary(QFileInfo(bundleDirectory).absolutePath() + "/.server-upload-XXXXXX");
     if (!temporary.isValid()) fail("Cannot stage save server upload.");
@@ -189,9 +200,14 @@ RemoteSaveRevision SaveServerClient::upload(const QString &gameKey, int expected
     auto request = requestFor(endpoint(gameKey), token_, timeoutMs);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/vnd.novelty.save-bundle-v1");
     request.setRawHeader("X-Expected-Revision", QByteArray::number(expectedRevision));
+    if (!reconcileServerId.isEmpty()) {
+        if (QUuid(reconcileServerId).toString(QUuid::WithoutBraces) != reconcileServerId)
+            fail("Invalid server identity for conflict resolution.");
+        request.setRawHeader("X-Novelty-Reconcile", reconcileServerId.toLatin1());
+    }
     request.setHeader(QNetworkRequest::ContentLengthHeader, archive.size());
     std::unique_ptr<QNetworkReply, void(*)(QNetworkReply *)> reply(manager.put(request, &archive), [](QNetworkReply *p) { p->deleteLater(); });
-    await(*reply, timeoutMs);
+    await(*reply, timeoutMs, nullptr, true);
     const auto accepted = response(reply->readAll());
     const auto source = verifyPortableSaveBundle(bundleDirectory);
     if (accepted.revision != expectedRevision + 1 || accepted.snapshotId != source["id"].toString() ||

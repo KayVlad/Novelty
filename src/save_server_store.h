@@ -23,9 +23,10 @@ struct ServerRevisionConflict : std::runtime_error {
 class SaveServerStore {
 public:
     explicit SaveServerStore(const QString &root);
-    ServerSaveRevision current(const QString &gameKey) const;
+    ServerSaveRevision current(const QString &gameKey, bool verifyContents = true) const;
     ServerSaveRevision put(const QString &gameKey, int expectedRevision,
-                           const QString &bundleDirectory);
+                           const QString &bundleDirectory, bool reconcile = false);
+    void recover(); // exclusive startup recovery and legacy metadata upgrade
     QString serverId() const { return serverId_; }
     QString rootPath() const { return root_; }
 private:

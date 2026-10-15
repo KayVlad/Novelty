@@ -72,13 +72,15 @@ ServerSaveRevision readCurrent(const QString &root, const QString &serverId, con
     const auto nonce = record["storage_id"].toString();
     if (record["schema"].toInt() != 1 || record["game_key"].toString() != key ||
         record["server_id"].toString() != serverId || revision <= 0 ||
-        QUuid(id).isNull() || QUuid(nonce).isNull())
+        QUuid(id).isNull() || QUuid(id).toString(QUuid::WithoutBraces) != id ||
+        QUuid(nonce).isNull() || QUuid(nonce).toString(QUuid::WithoutBraces) != nonce)
         fail("Current server save pointer is invalid.");
     const auto bundle = revisionFolder(game, revision, nonce);
     noLinks(bundle);
     if (!QFileInfo(bundle).isDir()) fail("Current server save bundle is missing.");
-    int files = -1;
-    if (verifyContents) {
+    int files = record["files"].toInt(-1);
+    if (files > 20000) fail("Current server save file count is invalid.");
+    if (verifyContents || files < 0) {
         const auto manifest = verifyPortableSaveBundle(bundle);
         if (manifest["id"].toString() != id) fail("Current server save bundle does not match its pointer.");
         files = manifest["files"].toInt(-1);
@@ -86,9 +88,9 @@ ServerSaveRevision readCurrent(const QString &root, const QString &serverId, con
     return {serverId, revision, id, bundle, files};
 }
 QJsonObject pointerRecord(const QString &key, const QString &serverId, int revision,
-                          const QString &snapshotId, const QString &storageId) {
+                          const QString &snapshotId, const QString &storageId, int files) {
     return {{"schema", 1}, {"game_key", key}, {"server_id", serverId},
-            {"revision", revision}, {"snapshot_id", snapshotId}, {"storage_id", storageId}};
+            {"revision", revision}, {"snapshot_id", snapshotId}, {"storage_id", storageId}, {"files", files}};
 }
 void recoverPending(const QString &root, const QString &serverId, const QString &key) {
     const auto game = gameRoot(root, key);
@@ -125,6 +127,8 @@ void recoverPending(const QString &root, const QString &serverId, const QString 
     if (current.revision == revision) {
         if (current.snapshotId != snapshotId || current.bundleDirectory != final || exists(stage))
             fail("Server save publication intent disagrees with the current revision.");
+        persistTree(final); persistParent(final);
+        writeDurableJson(game + "/current.json", readJson(game + "/current.json"));
         removeDurableFile(intent);
         return;
     }
@@ -152,7 +156,7 @@ void recoverPending(const QString &root, const QString &serverId, const QString 
     if (source == stage && !QDir().rename(stage, final))
         fail("Cannot finish publishing verified server save payload.");
     persistParent(final);
-    writeDurableJson(game + "/current.json", pointerRecord(key, serverId, revision, snapshotId, storageId));
+    writeDurableJson(game + "/current.json", pointerRecord(key, serverId, revision, snapshotId, storageId, manifest["files"].toInt()));
     const auto published = readCurrent(root, serverId, key, true);
     if (published.revision != revision || published.snapshotId != snapshotId || published.bundleDirectory != final)
         fail("Cannot verify recovered server save publication.");
@@ -188,7 +192,37 @@ SaveServerStore::SaveServerStore(const QString &root) : root_(QDir::cleanPath(QF
     }
 }
 
-ServerSaveRevision SaveServerStore::current(const QString &gameKey) const {
+void SaveServerStore::recover() {
+    QLockFile lock(root_ + "/store.lock"); lock.setStaleLockTime(0);
+    if (!lock.tryLock(5000)) fail("Save server storage is busy.");
+    if (!exists(root_ + "/games")) return;
+    for (const auto &entry : checkedDirectoryEntries(root_ + "/games", 0)) {
+        noLinks(entry.absoluteFilePath());
+        const auto game = entry.absoluteFilePath();
+        const auto source = exists(game + "/.inProgress") ? game + "/.inProgress" : game + "/current.json";
+        if (!exists(source)) continue; // ambiguous legacy stages are retained
+        noLinks(source);
+        const auto record = readJson(source);
+        const auto key = record["game_key"].toString();
+        if (gameRoot(root_, key) != game) fail("Server game directory does not match its identity.");
+        recoverPending(root_, serverId_, key);
+        if (exists(game + "/current.json")) {
+            auto pointer = readJson(game + "/current.json");
+            const auto verified = readCurrent(root_, serverId_, key, true);
+            if (!pointer.contains("files")) {
+                pointer["files"] = verified.files;
+                writeDurableJson(game + "/current.json", pointer);
+            }
+        }
+    }
+}
+
+ServerSaveRevision SaveServerStore::current(const QString &gameKey, bool verifyContents) const {
+    if (!verifyContents) {
+        // Immutable payloads and atomic current.json publication permit a concurrent
+        // HEAD to see the complete old or new revision, including during a PUT.
+        return readCurrent(root_, serverId_, gameKey, false, exists(gameRoot(root_, gameKey) + "/.inProgress"));
+    }
     noLinks(root_ + "/store.lock");
     QLockFile lock(root_ + "/store.lock"); lock.setStaleLockTime(0);
     if (!lock.tryLock(5000)) fail("Save server storage is busy.");
@@ -197,7 +231,7 @@ ServerSaveRevision SaveServerStore::current(const QString &gameKey) const {
 }
 
 ServerSaveRevision SaveServerStore::put(const QString &gameKey, int expectedRevision,
-                                        const QString &bundleDirectory) {
+                                        const QString &bundleDirectory, bool reconcile) {
     if (expectedRevision < 0) fail("Expected server revision is invalid.");
     noLinks(root_ + "/store.lock");
     QLockFile lock(root_ + "/store.lock"); lock.setStaleLockTime(0);
@@ -207,7 +241,7 @@ ServerSaveRevision SaveServerStore::put(const QString &gameKey, int expectedRevi
     if (previous.revision != expectedRevision) throw ServerRevisionConflict(previous.revision);
     if (previous.revision == INT_MAX) fail("Server revision limit reached.");
     const auto source = verifyPortableSaveBundle(bundleDirectory);
-    if (previous.revision > 0) {
+    if (previous.revision > 0 && !reconcile) {
         const auto old = verifyPortableSaveBundle(previous.bundleDirectory);
         if (source["items"].toArray().size() != old["items"].toArray().size() ||
             source["game_identity"] != old["game_identity"] ||
@@ -221,6 +255,7 @@ ServerSaveRevision SaveServerStore::put(const QString &gameKey, int expectedRevi
                 fail("Server save mappings changed; explicitly reconcile before uploading.");
     }
     const auto game = gameRoot(root_, gameKey);
+    requireAvailableSpace(game, static_cast<qint64>(source["bytes"].toDouble()));
     const auto nonce = freshId();
     const auto stage = game + "/.stage-" + nonce;
     const auto final = revisionFolder(game, previous.revision + 1, nonce);
@@ -245,7 +280,7 @@ ServerSaveRevision SaveServerStore::put(const QString &gameKey, int expectedRevi
         if (!QDir().rename(stage, final)) fail("Cannot publish verified server save payload.");
         persistParent(final); persistParent(stage);
         writeDurableJson(game + "/current.json", pointerRecord(gameKey, serverId_, previous.revision + 1,
-                                                       source["id"].toString(), nonce));
+                                                       source["id"].toString(), nonce, source["files"].toInt()));
         const auto published = readCurrent(root_, serverId_, gameKey, true);
         if (published.revision != previous.revision + 1 ||
             published.snapshotId != source["id"].toString() || published.bundleDirectory != final)
