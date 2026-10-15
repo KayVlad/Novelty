@@ -368,6 +368,14 @@ int main(int argc, char **argv) {
         };
         gameClient.connectTo("127.0.0.1", trustedListener.serverPort());
         gameTimeout.start(15000); gameTransfer.exec(); gameTimeout.stop();
+        if (!installedId.isEmpty()) {
+            QElapsedTimer acknowledged; acknowledged.start();
+            while (deck.supervisorActive(deckGame.id) && acknowledged.elapsed() < 2000) {
+                QCoreApplication::processEvents(); QThread::msleep(5);
+            }
+            if (!gameClient.ready() || deck.supervisorActive(deckGame.id))
+                throw std::runtime_error("Completion acknowledgement did not release source lock on the live connection.");
+        }
         gameClient.close();
         };
         registrationSql("CREATE TRIGGER fail_game_update BEFORE UPDATE ON games BEGIN SELECT RAISE(ABORT,'injected registration failure'); END");

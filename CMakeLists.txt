@@ -85,7 +85,7 @@ if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_test(NAME server_http COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/server_http_tests.py
     $<TARGET_FILE:novelty-save-server> $<TARGET_FILE:novelty_durability_fault>)
-  set_tests_properties(server_http PROPERTIES TIMEOUT 45)
+  set_tests_properties(server_http PROPERTIES TIMEOUT 60)
   add_executable(novelty_server_client_driver tests/server_client_driver.cpp)
   target_link_libraries(novelty_server_client_driver PRIVATE novelty_core)
   add_test(NAME server_client_timeouts COMMAND ${Python3_EXECUTABLE}

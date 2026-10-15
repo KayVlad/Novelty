@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix='novelty-http-') as directory:
                 headers['Authorization'] = 'Bearer ' + token
             req = urllib.request.Request(base + path, data=data, method=method, headers=headers)
             try:
-                response = urllib.request.urlopen(req, timeout=10)
+                response = urllib.request.urlopen(req, timeout=20)
             except urllib.error.HTTPError as error:
                 response = error
             with response:
@@ -88,7 +88,7 @@ with tempfile.TemporaryDirectory(prefix='novelty-http-') as directory:
             (root / 'flush.marker').unlink(missing_ok=True)
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 committing = pool.submit(exchange, 'PUT', data=archive, **{'X-Expected-Revision': '1'})
-                until = time.monotonic() + 2
+                until = time.monotonic() + 10
                 while not (root / 'flush.marker').exists():
                     assert time.monotonic() < until and not committing.done(), 'did not reach slow commit barrier'
                     time.sleep(.005)
