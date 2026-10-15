@@ -25,3 +25,12 @@ extern "C" int syncfs(int fd) noexcept {
     if (mode && std::strcmp(mode, "cleanup") == 0 && source && chmod(source, 0) != 0) _exit(93);
     return result;
 }
+
+extern "C" int unlink(const char *path) noexcept {
+    const char *mode = std::getenv("NOVELTY_TEST_IMPORT_FAULT");
+    const auto length = std::strlen(path);
+    if (mode && std::strcmp(mode, "journal-cleanup") == 0 && std::strstr(path, "/imports/") &&
+        length > 5 && std::strcmp(path + length - 5, ".json") == 0) { errno = EIO; return -1; }
+    const auto real = reinterpret_cast<int (*)(const char *)>(dlsym(RTLD_NEXT, "unlink"));
+    return real(path);
+}

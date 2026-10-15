@@ -1,3 +1,4 @@
+#include "filesystem_checks.h"
 #include "filesystem_durability.h"
 #include "core.h"
 #include "recipes.h"
@@ -29,12 +30,13 @@ QString movedPath(const QString &path, const QString &oldFolder, const QString &
 }
 QMap<QString, QFileInfo> tree(const QString &root) {
     QMap<QString, QFileInfo> entries;
-    QDirIterator it(root, QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
-                    QDirIterator::Subdirectories);
-    while (it.hasNext()) {
-        const auto info = it.nextFileInfo();
-        entries.insert(QDir(root).relativeFilePath(info.absoluteFilePath()), info);
-    }
+    const auto walk = [&](auto &&self, const QString &directory) -> void {
+        for (const auto &info : checkedDirectoryEntries(directory, 0)) {
+            entries.insert(QDir(root).relativeFilePath(info.absoluteFilePath()), info);
+            if (info.isDir() && !info.isSymLink()) self(self, info.absoluteFilePath());
+        }
+    };
+    walk(walk, root);
     return entries;
 }
 QByteArray linkText(const QString &path) {
@@ -55,6 +57,7 @@ bool sameContents(const QString &a, const QString &b) {
         QFile first(x.absoluteFilePath()), second(y.absoluteFilePath());
         if (!first.open(QIODevice::ReadOnly) || !second.open(QIODevice::ReadOnly)) fail("Cannot verify copied game files.");
         while (!first.atEnd()) if (first.read(1024 * 1024) != second.read(1024 * 1024)) return false;
+        if (first.error() != QFile::NoError || second.error() != QFile::NoError) fail("Cannot finish verifying copied game files.");
         if (!second.atEnd()) return false;
     }
     return true;
@@ -158,6 +161,7 @@ FolderImportResult Library::addFolder(const QString &chosen, const QString &nati
             writeDurableJson(journal, {{"schema", 1}, {"source", source}, {"source_identity", identity},
                 {"destination", destination}, {"stage", stage}, {"stage_identity", stageIdentity}});
             QProcess copy;
+            copy.setProcessEnvironment(externalToolEnvironment());
             copy.start("cp", {"-a", "--reflink=auto", "--", source + "/.", stage});
             if (!copy.waitForStarted() || !copy.waitForFinished(-1) || copy.exitStatus() != QProcess::NormalExit || copy.exitCode() != 0)
                 fail("Could not copy the game into Games. The source was kept. Temporary copy: " + stage + "\n" + QString::fromUtf8(copy.readAllStandardError()));
@@ -231,7 +235,11 @@ FolderImportResult Library::addFolder(const QString &chosen, const QString &nati
                     warning = "Game added, but the original copy remains for review: " + retired + "\n" + QString::fromUtf8(error.what());
                 }
             }
-            removeDurableFile(journal);
+            try { removeDurableFile(journal); }
+            catch (const std::exception &error) {
+                warning += (warning.isEmpty() ? QString() : "\n") +
+                    "Game added; import recovery cleanup needs attention: " + QString::fromUtf8(error.what());
+            }
         }
         return {g, warning, move};
     } catch (...) {
