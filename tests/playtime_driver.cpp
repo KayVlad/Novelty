@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
         } else if (action != "stats") return 2;
         const auto stats = readPlaytime(root, id);
         const QJsonObject result{{"total_ms", double(stats.totalMs)}, {"sessions", double(stats.sessions)},
-            {"active", stats.active}, {"current_ms", double(stats.currentMs)},
+            {"foreground_ms", double(stats.foregroundMs)}, {"incomplete_foreground", stats.incompleteForeground}, {"active", stats.active}, {"current_ms", double(stats.currentMs)},
             {"last_played", stats.lastPlayed.toString(Qt::ISODateWithMs)}};
         const auto bytes = QJsonDocument(result).toJson(QJsonDocument::Compact);
         std::puts(bytes.constData()); return 0;

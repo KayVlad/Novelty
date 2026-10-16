@@ -74,6 +74,7 @@ int runTrackedWorker(const Library &lib, const QString &id, const Command &cmd, 
         const auto remaining = 1024 * 1024 - written;
         if (remaining > 0) { auto part = bytes.left(remaining); log.write(part); written += part.size(); }
     };
+    if (trackPlaytime) playtime.prepareFocus(); // Compositor setup is outside opened-time measurement.
     process.start();
     if (!process.waitForStarted(10000))
         throw std::runtime_error(("Could not start " + cmd.program + ": " + process.errorString()).toStdString());

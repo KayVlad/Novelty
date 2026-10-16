@@ -347,7 +347,7 @@ int main(int argc, char **argv) {
                         error = "Runtime controls are missing or obsolete profile controls remain";
                         if (dialog) dialog->reject(); return;
                     }
-                    tabs->setCurrentIndex(3);
+                    for (int tab = 0; tab < tabs->count(); ++tab) if (tabs->tabText(tab) == "Runtime") tabs->setCurrentIndex(tab);
                     if (pass == 0) {
                         auto debug = window.findChild<QPushButton *>("debugLaunchButton");
                         auto exportButton = window.findChild<QPushButton *>("exportDiagnosticButton");

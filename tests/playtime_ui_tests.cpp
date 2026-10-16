@@ -1,5 +1,7 @@
 #include "window.h"
 #include "playtime.h"
+#include "playtime_chart.h"
+#include <QtWidgets/qtabwidget.h>
 #include "app_settings.h"
 #include <QtWidgets/qapplication.h>
 #include <QtWidgets/qlabel.h>
@@ -55,18 +57,33 @@ int main(int argc, char **argv) {
         {
             Window reopened(root, QString::fromLocal8Bit(argv[1])); reopened.show();
             require(waitFor([&] { return label(reopened, "gameLastPlayed") == "Today"; }), "reopened GUI did not read tracked history");
-            require(label(reopened, "gameTimePlayed") == "<1m" && label(reopened, "metadataPlaytime") == "12 hours", "reopened totals or expected time changed");
+            require(label(reopened, "gameOpenedTime") == "<1m" && label(reopened, "gameTimePlayed") == "0m" && label(reopened, "metadataPlaytime") == "12 hours", "reopened totals or expected time changed");
             bool inspected = false;
             QTimer::singleShot(0, &reopened, [&] {
                 auto dialog = reopened.findChild<QDialog *>("manageDialog");
                 if (dialog) {
                     const auto count = dialog->findChild<QLabel *>("statisticsCount");
                     const auto history = dialog->findChild<QListWidget *>("statisticsHistory");
-                    inspected = count && count->text() == "1" && history && history->count() == 1 && history->item(0)->text().contains("completed");
+                    const auto tabs = dialog->findChild<QTabWidget *>("manageTabs");
+                    const auto chart = dialog->findChild<QWidget *>("playtimeChart");
+                    const auto heatmap = dialog->findChild<QWidget *>("playtimeHeatmap");
+                    bool playtimeTab = false;
+                    for (int i = 0; tabs && i < tabs->count(); ++i) if (tabs->tabText(i) == "Playtime") { tabs->setCurrentIndex(i); playtimeTab = true; }
+                    inspected = playtimeTab && chart && heatmap && count && count->text() == "1" && history && history->count() == 1 && history->item(0)->text().contains("completed");
+                    const auto preview = qEnvironmentVariable("NOVELTY_UI_PREVIEW_DIR");
+                    if (!preview.isEmpty()) { dialog->resize(1000,900); QCoreApplication::processEvents(); dialog->grab().save(preview+"/manage-playtime.png"); }
                     dialog->reject();
                 }
             });
             reopened.manage(); require(inspected, "Manage statistics/history missing");
+        }
+        {
+            PlaytimeChart chart; chart.resize(700,300);
+            chart.setDays({{QDate(2026,1,1),3600000,360000000},{QDate(2026,1,2),0,360000000}});
+            require(chart.dailyAxisHours() == 1 && chart.cumulativeAxisHours() == 100, "chart axes must scale independently");
+            require(!chart.grab().isNull(), "native chart painting failed");
+            PlaytimeHeatmap heatmap; heatmap.resize(800,160); heatmap.setDays(readPlaytime(root,game.id).heatmap);
+            require(!heatmap.grab().isNull(), "native heatmap painting failed");
         }
         game = library.game(game.id); game.backend = "steam"; game.steamId = "123"; library.save(game);
         {

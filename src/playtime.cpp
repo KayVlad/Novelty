@@ -64,9 +64,10 @@ public:
         } catch (...) { close(); throw; }
     }
     ~Database() { close(); }
-    bool hasTable() {
+    bool hasTable(const QString &name = "play_sessions") {
         QSqlQuery query(db);
-        if (!query.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='play_sessions'")) fail(query.lastError().text());
+        query.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?");
+        query.addBindValue(name); execute(query);
         return query.next();
     }
     void ensureTable() {
@@ -78,6 +79,14 @@ public:
             "checkpoint_utc TEXT NOT NULL, start_monotonic_ms INTEGER NOT NULL, "
             "boot_id TEXT NOT NULL, owner_pid INTEGER NOT NULL, owner_start_ticks TEXT NOT NULL)")) fail(query.lastError().text());
         if (!query.exec("CREATE INDEX IF NOT EXISTS play_sessions_game ON play_sessions(game_id,started_utc DESC)")) fail(query.lastError().text());
+    }
+    void ensureFocusTables() {
+        QSqlQuery query(db);
+        if (!query.exec("CREATE TABLE IF NOT EXISTS play_focus (session_id TEXT PRIMARY KEY, "
+            "foreground_ms INTEGER NOT NULL CHECK(foreground_ms>=0), observed_ms INTEGER NOT NULL CHECK(observed_ms>=foreground_ms), "
+            "status TEXT NOT NULL)")) fail(query.lastError().text());
+        if (!query.exec("CREATE TABLE IF NOT EXISTS play_focus_days (session_id TEXT NOT NULL, local_day TEXT NOT NULL, "
+            "elapsed_ms INTEGER NOT NULL CHECK(elapsed_ms>=0), PRIMARY KEY(session_id,local_day))")) fail(query.lastError().text());
     }
     QSqlDatabase db;
 private:
@@ -112,17 +121,23 @@ void recoverPlaytime(const QString &root, const QString &gameId) {
         query.addBindValue(id); execute(query);
     }
 }
-PlaytimeStats readPlaytime(const QString &root, const QString &id, int recentLimit) {
+PlaytimeStats readPlaytime(const QString &root, const QString &id, int recentLimit, QDate today) {
     if (recentLimit < 0 || recentLimit > 100) fail("Invalid playtime history limit.");
     recoverPlaytime(root, id);
     Database database(root, false);
     PlaytimeStats result;
+    for (int i = 29; i >= 0; --i) result.days.append({today.addDays(-i), 0, 0});
+    for (int i = 364; i >= 0; --i) result.heatmap.append({today.addDays(-i), 0, 0});
     if (!database.hasTable()) return result;
+    if (!database.db.transaction()) fail(database.db.lastError().text());
+    const bool hasFocus = database.hasTable("play_focus");
     const auto boot = currentBoot(); const auto now = monotonicMs();
     QSqlQuery query(database.db);
-    query.prepare("SELECT session_id,state,started_utc,elapsed_ms,ended_utc,checkpoint_utc,"
-                  "start_monotonic_ms,boot_id,owner_pid,owner_start_ticks FROM play_sessions "
-                  "WHERE game_id=? ORDER BY started_utc DESC,session_id DESC");
+    query.prepare("SELECT s.session_id,s.state,s.started_utc,s.elapsed_ms,s.ended_utc,s.checkpoint_utc,"
+                  "s.start_monotonic_ms,s.boot_id,s.owner_pid,s.owner_start_ticks," +
+                  (hasFocus ? QString("f.foreground_ms,f.observed_ms,f.status FROM play_sessions s LEFT JOIN play_focus f ON f.session_id=s.session_id ") :
+                              QString("NULL,NULL,NULL FROM play_sessions s ")) +
+                  "WHERE s.game_id=? ORDER BY s.started_utc DESC,s.session_id DESC");
     query.addBindValue(id); execute(query);
     while (query.next()) {
         PlaySession session{query.value(0).toString(), query.value(1).toString(),
@@ -135,14 +150,53 @@ PlaytimeStats readPlaytime(const QString &root, const QString &id, int recentLim
             session.durationMs = std::max(session.durationMs, now - query.value(6).toLongLong());
             result.active = true; result.currentMs += session.durationMs;
         }
+        session.foregroundRecorded = !query.value(10).isNull();
+        session.foregroundMs = session.foregroundRecorded ? query.value(10).toLongLong() : 0;
+        if (session.foregroundMs < 0 || session.foregroundMs > session.durationMs) fail("Invalid foreground playtime duration.");
+        result.foregroundMs += session.foregroundMs;
+        if (session.state == "active") {
+            result.currentForegroundMs += session.foregroundMs;
+            result.focusStatus = query.value(12).toString();
+        }
+        if (!session.foregroundRecorded || query.value(11).toLongLong() < session.durationMs) result.incompleteForeground = true;
+        if (session.durationMs > 300000 && (!result.firstPlay.isValid() || session.started < result.firstPlay)) result.firstPlay = session.started;
         result.totalMs += session.durationMs; ++result.sessions;
         if (session.started > result.lastPlayed) result.lastPlayed = session.started;
         if (result.recent.size() < recentLimit) result.recent.append(session);
     }
+    query.finish();
+    if (database.hasTable("play_focus_days")) {
+        query.prepare("SELECT d.local_day,SUM(d.elapsed_ms) FROM play_focus_days d JOIN play_sessions s ON s.session_id=d.session_id "
+                      "WHERE s.game_id=? GROUP BY d.local_day ORDER BY d.local_day");
+        query.addBindValue(id); execute(query);
+        QMap<QDate, qint64> days;
+        while (query.next()) days[QDate::fromString(query.value(0).toString(), Qt::ISODate)] = query.value(1).toLongLong();
+        for (auto &day : result.heatmap) day.foregroundMs = days.value(day.day);
+        qint64 cumulative = 0;
+        auto entry = days.cbegin();
+        for (auto &day : result.days) {
+            while (entry != days.cend() && entry.key() <= day.day) { cumulative += entry.value(); ++entry; }
+            day.foregroundMs = days.value(day.day); day.cumulativeMs = cumulative;
+        }
+    }
+    query.finish();
+    if (!database.db.commit()) fail(database.db.lastError().text());
     return result;
 }
 PlaytimeSession::PlaytimeSession(QString root, QString game, QFile &log)
     : root_(std::move(root)), game_(std::move(game)), log_(log) {}
+PlaytimeSession::~PlaytimeSession() = default;
+void PlaytimeSession::prepareFocus() noexcept {
+    try {
+        monitor_ = std::make_unique<FocusMonitor>(log_, [this](bool known, bool foreground) {
+            if (startMs_ < 0) return;
+            timespec boot{};
+            if (::clock_gettime(CLOCK_BOOTTIME, &boot) != 0) { focus_.invalidate(); return; }
+            focus_.observe(monotonicMs(), qint64(boot.tv_sec)*1000 + boot.tv_nsec/1000000,
+                           QDateTime::currentDateTimeUtc(), known, foreground);
+        });
+    } catch (const std::exception &error) { log_.write("Foreground tracking unavailable: "); log_.write(error.what()); log_.write("\n"); }
+}
 void PlaytimeSession::start() noexcept {
     if (startMs_ >= 0) return;
     try {
@@ -155,15 +209,23 @@ void PlaytimeSession::start() noexcept {
 }
 void PlaytimeSession::checkpoint() noexcept {
     if (startMs_ < 0) return;
-    try { if (monotonicMs() - lastAttemptMs_ >= checkpointMs) persist(false); }
+    try {
+        if (monitor_) monitor_->poll();
+        if (monotonicMs() - lastAttemptMs_ >= checkpointMs) persist(false);
+    }
     catch (...) { /* Optional statistics must not interrupt descendant supervision. */ }
 }
-void PlaytimeSession::complete() noexcept { if (startMs_ >= 0) { persist(true); startMs_ = -1; } }
+void PlaytimeSession::complete() noexcept {
+    if (startMs_ >= 0) { persist(true); startMs_ = -1; }
+    monitor_.reset();
+}
 void PlaytimeSession::persist(bool completed) noexcept {
     try {
         const auto now = monotonicMs(); lastAttemptMs_ = now;
         const auto stamp = utc(QDateTime::currentDateTimeUtc());
         Database database(root_, true); database.ensureTable();
+        database.ensureFocusTables();
+        if (!database.db.transaction()) fail(database.db.lastError().text());
         QSqlQuery query(database.db);
         query.prepare("INSERT INTO play_sessions(session_id,game_id,started_utc,elapsed_ms,ended_utc,state,"
                       "checkpoint_utc,start_monotonic_ms,boot_id,owner_pid,owner_start_ticks) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
@@ -175,6 +237,16 @@ void PlaytimeSession::persist(bool completed) noexcept {
         query.addBindValue(completed ? stamp : QVariant()); query.addBindValue(completed ? "completed" : "active");
         query.addBindValue(stamp); query.addBindValue(startMs_); query.addBindValue(boot_);
         query.addBindValue(owner_); query.addBindValue(ownerStart_); execute(query);
+        // Both counters and all midnight slices are one FULL-synchronous transaction.
+        query.prepare("INSERT INTO play_focus VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
+                      "foreground_ms=excluded.foreground_ms,observed_ms=excluded.observed_ms,status=excluded.status");
+        query.addBindValue(id_); query.addBindValue(focus_.foregroundMs); query.addBindValue(focus_.observedMs);
+        query.addBindValue(monitor_ ? monitor_->status() : "Foreground state not observed"); execute(query);
+        for (auto day = focus_.days.cbegin(); day != focus_.days.cend(); ++day) {
+            query.prepare("INSERT INTO play_focus_days VALUES(?,?,?) ON CONFLICT(session_id,local_day) DO UPDATE SET elapsed_ms=excluded.elapsed_ms");
+            query.addBindValue(id_); query.addBindValue(day.key().toString(Qt::ISODate)); query.addBindValue(day.value()); execute(query);
+        }
+        if (!database.db.commit()) fail(database.db.lastError().text());
     } catch (const std::exception &error) {
         if (!warned_) { log_.write("Playtime recording needs attention: "); log_.write(error.what()); log_.write("\n"); log_.flush(); warned_ = true; }
     }

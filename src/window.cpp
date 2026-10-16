@@ -200,9 +200,10 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
         auto value = new QLabel("—", content); value->setObjectName(name); value->setTextFormat(Qt::PlainText);
         value->setWordWrap(true); row->addWidget(value, 1); info->addLayout(row); return value;
     };
-    timePlayed_ = statistic("Time played", "gameTimePlayed");
+    timePlayed_ = statistic("Playtime", "gameTimePlayed");
+    openedTime_ = statistic("Opened time", "gameOpenedTime");
     lastPlayed_ = statistic("Last played", "gameLastPlayed");
-    currentSession_ = statistic("Current session", "gameCurrentSession");
+    currentSession_ = statistic("Current opened session", "gameCurrentSession");
     detail_ = new QLabel(content); detail_->setWordWrap(true); detail_->setTextFormat(Qt::PlainText); detail_->setProperty("muted", true); info->addWidget(detail_); info->addStretch();
     scroll->setWidget(content); p->addWidget(scroll, 1); body->addWidget(panel); layout->addLayout(body, 1);
     auto footer = new QHBoxLayout; notice_ = new QLabel("", this); notice_->setObjectName("libraryNotice"); notice_->setTextFormat(Qt::PlainText); notice_->setWordWrap(true); footer->addWidget(notice_, 1);
@@ -508,11 +509,13 @@ void Window::refresh() {
 }
 void Window::updatePlaytime() {
     const auto game = selected();
-    for (auto label : {timePlayed_, lastPlayed_, currentSession_}) { label->setText("—"); label->setToolTip({}); }
+    for (auto label : {timePlayed_, openedTime_, lastPlayed_, currentSession_}) { label->setText("—"); label->setToolTip({}); }
     if (!library_ || game.id.isEmpty() || !rootAvailable() || model_->remoteGames.contains(game.id)) return;
     try {
         const auto stats = readPlaytime(library_->root(), game.id, 0);
-        timePlayed_->setText(game.backend == "steam" && stats.sessions == 0 ? "Unavailable for Steam" : formatTrackedTime(stats.totalMs));
+        timePlayed_->setText(game.backend == "steam" && stats.sessions == 0 ? "Unavailable for Steam" : formatTrackedTime(stats.foregroundMs));
+        openedTime_->setText(game.backend == "steam" && stats.sessions == 0 ? "Unavailable for Steam" : formatTrackedTime(stats.totalMs));
+        if (stats.incompleteForeground) timePlayed_->setToolTip("Only verified foreground time is included. Some history has no foreground measurements.");
         lastPlayed_->setText(formatLastPlayed(stats.lastPlayed));
         currentSession_->setText(game.backend == "steam" ? "Unavailable for Steam" : stats.active ? formatTrackedTime(stats.currentMs, true) : "—");
     } catch (const std::exception &error) {

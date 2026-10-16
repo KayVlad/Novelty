@@ -1,4 +1,5 @@
 #pragma once
+#include "playtime_focus.h"
 #include <QtCore/qdatetime.h>
 #include <QtCore/qfile.h>
 #include <QtCore/qlist.h>
@@ -8,17 +9,26 @@ namespace novelty {
 struct PlaySession {
     QString id, state;
     QDateTime started, ended, checkpoint;
-    qint64 durationMs = 0;
+    qint64 durationMs = 0, foregroundMs = 0;
+    bool foregroundRecorded = false;
+};
+struct PlaytimeDay {
+    QDate day;
+    qint64 foregroundMs = 0, cumulativeMs = 0;
 };
 struct PlaytimeStats {
     qint64 totalMs = 0, sessions = 0, currentMs = 0;
-    QDateTime lastPlayed;
+    qint64 foregroundMs = 0, currentForegroundMs = 0;
+    QDateTime lastPlayed, firstPlay;
+    bool incompleteForeground = false;
+    QString focusStatus;
+    QList<PlaytimeDay> days, heatmap;
     bool active = false;
     QList<PlaySession> recent;
 };
 // Own short-lived SQLite connections: these never use Library's inherited connection.
 void recoverPlaytime(const QString &libraryRoot, const QString &gameId = {});
-PlaytimeStats readPlaytime(const QString &libraryRoot, const QString &gameId, int recentLimit = 8);
+PlaytimeStats readPlaytime(const QString &libraryRoot, const QString &gameId, int recentLimit = 8, QDate today = QDate::currentDate());
 QString formatTrackedTime(qint64 milliseconds, bool seconds = false);
 QString formatLastPlayed(const QDateTime &);
 
@@ -27,6 +37,8 @@ QString formatLastPlayed(const QDateTime &);
 class PlaytimeSession {
 public:
     PlaytimeSession(QString libraryRoot, QString gameId, QFile &log);
+    ~PlaytimeSession();
+    void prepareFocus() noexcept;
     void start() noexcept;
     void checkpoint() noexcept;
     void complete() noexcept;
@@ -37,5 +49,7 @@ private:
     qint64 startMs_ = -1, lastAttemptMs_ = -1, owner_ = 0;
     QFile &log_;
     bool warned_ = false;
+    FocusLedger focus_;
+    std::unique_ptr<FocusMonitor> monitor_;
 };
 }

@@ -22,7 +22,7 @@ def get(url):
         return response.read().decode()
 
 def module(path):
-    return {"corelib": "QtCore", "gui": "QtGui", "widgets": "QtWidgets", "sql": "QtSql", "network": "QtNetwork"}[path.split("/")[1]]
+    return {"corelib": "QtCore", "gui": "QtGui", "widgets": "QtWidgets", "sql": "QtSql", "network": "QtNetwork", "dbus": "QtDBus"}[path.split("/")[1]]
 
 def main():
     host_version = subprocess.check_output(["qmake6", "-query", "QT_VERSION"], text=True).strip()
@@ -34,7 +34,7 @@ def main():
     mapping = {}
     for entry in tree["tree"]:
         path = entry["path"]
-        if entry["type"] == "blob" and re.match(r"src/(corelib|gui|widgets|sql|network)/", path) and path.endswith(".h"):
+        if entry["type"] == "blob" and re.match(r"src/(corelib|gui|widgets|sql|network|dbus)/", path) and path.endswith(".h"):
             if "/private/" in path or "/3rdparty/" in path:
                 continue
             name = Path(path).name
@@ -60,8 +60,8 @@ def main():
                 break
             for name, source in zip(batch, pool.map(fetch, batch)):
                 completed.add(name)
-                needed.update(re.findall(r'#\s*include\s*[<"](?:Qt(?:Core|Gui|Widgets|Sql|Network)/)?(q[\w-]+\.h)[>"]', source))
-    for mod in ["Core", "Gui", "Widgets", "Sql", "Network"]:
+                needed.update(re.findall(r'#\s*include\s*[<"](?:Qt(?:Core|Gui|Widgets|Sql|Network|DBus)/)?(q[\w-]+\.h)[>"]', source))
+    for mod in ["Core", "Gui", "Widgets", "Sql", "Network", "DBus"]:
         folder = INCLUDE / ("Qt" + mod)
         folder.mkdir(parents=True, exist_ok=True)
         pri = Path(f"/usr/lib/qt6/mkspecs/modules/qt_lib_{mod.lower()}.pri").read_text()
@@ -78,7 +78,7 @@ def main():
     (core / "qconfig.h").write_text('#pragma once\n#define QT_VERSION_MAJOR 6\n#define QT_VERSION_MINOR 9\n#define QT_VERSION_PATCH 1\n#include <QtCore/qtcore-config.h>\n')
     (core / "qtversion.h").write_text('#pragma once\n#include <QtCore/qtversionchecks.h>\n#define QT_VERSION_STR "6.9.1"\n')
     template = get(BASE + "cmake/modulecppexports.h.in")
-    for mod in ["Core", "Gui", "Widgets", "Sql", "Network"]:
+    for mod in ["Core", "Gui", "Widgets", "Sql", "Network", "DBus"]:
         name = "qt" + mod.lower() + "exports"
         text = template.replace("@header_base_name_upper@", name.upper()).replace("@module_define_infix@", mod.upper())
         (INCLUDE / ("Qt" + mod) / (name + ".h")).write_text(text)

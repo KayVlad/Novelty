@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build dependencies
-        run: sudo apt-get update && sudo apt-get install -y ninja-build g++ libssl-dev libgl1-mesa-dev libxkbcommon-dev python3
+        run: sudo apt-get update && sudo apt-get install -y ninja-build g++ libssl-dev libgl1-mesa-dev libxkbcommon-dev python3 dbus
       - uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.3'

@@ -8,7 +8,7 @@ if command -v cmake >/dev/null && command -v c++ >/dev/null; then
 else
   novelty_sdk=${NOVELTY_SDK:-$HOME/.local/share/flatpak/runtime/org.freedesktop.Sdk/x86_64/25.08/active/files}
   if [[ ! -x "$novelty_sdk/bin/g++" || ! -f "$novelty_project/.tools/qt-include/QtWidgets/qapplication.h" ]]; then
-    echo 'Install CMake, a C++20 compiler and Qt6 Core/Widgets/Sql development packages in your build environment.' >&2
+    echo 'Install CMake, a C++20 compiler and Qt6 Core/Widgets/Sql/Network/DBus development packages in your build environment.' >&2
     echo 'The local Deck fallback additionally needs scripts/bootstrap-qt-headers.py.' >&2
     exit 1
   fi

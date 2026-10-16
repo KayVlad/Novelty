@@ -1,4 +1,5 @@
 #include "playtime.h"
+#include "playtime_chart.h"
 #include <QtCore/qlocale.h>
 #include "window_internal.h"
 #include <QtCore/qregularexpression.h>
@@ -55,36 +56,57 @@ void Window::manage() {
     overviewRow("Steam launch ID", g.steamId); overviewRow("Arguments", g.arguments.join('\n'));
     QStringList overviewEnvironment; for (auto it = g.environment.begin(); it != g.environment.end(); ++it) overviewEnvironment.append(it.key() + '=' + it.value());
     overviewRow("Environment", overviewEnvironment.join('\n')); overviewRow("Engine evidence", g.evidence);
-    auto statisticsTitle = new QLabel("Playtime / Statistics", overview);
-    statisticsTitle->setStyleSheet("font-weight: bold; margin-top: 12px;"); overviewForm->addRow(statisticsTitle);
-    auto statisticsTotal = overviewRow("Time played", "0m"); statisticsTotal->setObjectName("statisticsTotal");
-    auto statisticsCount = overviewRow("Recorded sessions", "0"); statisticsCount->setObjectName("statisticsCount");
-    auto statisticsLast = overviewRow("Last played", "Never"); statisticsLast->setObjectName("statisticsLastPlayed");
-    auto statisticsCurrent = overviewRow("Current session", "—"); statisticsCurrent->setObjectName("statisticsCurrentSession");
-    auto history = new QListWidget(overview); history->setObjectName("statisticsHistory"); history->setMaximumHeight(150);
-    overviewForm->addRow("Recent sessions", history);
-    auto statisticsNote = overviewRow({}, g.backend == "steam" ?
-        "Tracking is unavailable for Steam shortcuts: Novelty cannot monitor the actual Steam game process." :
-        "Recorded on this device. Interrupted sessions include only their last committed checkpoint.");
+    auto statisticsScroll = new QScrollArea(&d); statisticsScroll->setWidgetResizable(true); statisticsScroll->setFrameShape(QFrame::NoFrame);
+    auto statisticsTab = new QWidget(statisticsScroll); auto statisticsLayout = new QVBoxLayout(statisticsTab);
+    auto statisticsForm = new QFormLayout; statisticsLayout->addLayout(statisticsForm);
+    const auto statisticsRow = [&](const QString &caption, const QString &name) {
+        auto label = new QLabel("—", statisticsTab); label->setObjectName(name); label->setTextFormat(Qt::PlainText);
+        label->setWordWrap(true); label->setTextInteractionFlags(Qt::TextSelectableByMouse); statisticsForm->addRow(caption, label); return label;
+    };
+    auto statisticsTotal = statisticsRow("Playtime", "statisticsTotal");
+    auto statisticsOpened = statisticsRow("Opened time", "statisticsOpened");
+    auto statisticsFirst = new QLabel(statisticsTab); statisticsFirst->setObjectName("statisticsFirstPlay"); statisticsForm->addRow(statisticsFirst);
+    auto statisticsLast = statisticsRow("Last played", "statisticsLastPlayed");
+    auto statisticsCount = statisticsRow("Recorded sessions", "statisticsCount");
+    auto statisticsCurrent = statisticsRow("Current opened session", "statisticsCurrentSession");
+    auto statisticsNote = new QLabel(statisticsTab); statisticsNote->setObjectName("statisticsNote");
+    statisticsNote->setWordWrap(true); statisticsNote->setTextFormat(Qt::PlainText); statisticsLayout->addWidget(statisticsNote);
+    auto chart = new PlaytimeChart(statisticsTab); statisticsLayout->addWidget(chart);
+    auto heatmap = new PlaytimeHeatmap(statisticsTab); statisticsLayout->addWidget(heatmap);
+    statisticsLayout->addWidget(new QLabel("Recent sessions", statisticsTab));
+    auto history = new QListWidget(statisticsTab); history->setObjectName("statisticsHistory"); history->setMinimumHeight(100);
+    statisticsLayout->addWidget(history);
     const auto renderStatistics = [&] {
         try {
             const auto stats = readPlaytime(library_->root(), g.id);
-            statisticsTotal->setText(formatTrackedTime(stats.totalMs));
+            statisticsTotal->setText(formatTrackedTime(stats.foregroundMs)); statisticsOpened->setText(formatTrackedTime(stats.totalMs));
+            statisticsFirst->setText("First play: " + (stats.firstPlay.isValid() ? stats.firstPlay.toLocalTime().date().toString("dd-MM-yyyy") : "—"));
+            statisticsFirst->setToolTip("Earliest recorded session with opened time strictly greater than five minutes.");
             statisticsCount->setText(QString::number(stats.sessions)); statisticsLast->setText(formatLastPlayed(stats.lastPlayed));
             statisticsCurrent->setText(g.backend == "steam" ? "Unavailable for Steam" : stats.active ? formatTrackedTime(stats.currentMs, true) : "—");
+            auto note = QString("Playtime counts active, visible game windows. Opened time counts the game’s process lifetime. Playtime updates every 30 seconds. ");
+            if (g.backend == "steam") note += "Tracking is unavailable for Steam shortcuts. ";
+            else if (gamescopeSession()) note += "Foreground tracking is unavailable in Steam Deck Game Mode. ";
+            if (!stats.focusStatus.isEmpty() && stats.active) note += stats.focusStatus + ". ";
+            if (stats.incompleteForeground) note += "Some history has no foreground measurements; its opened time is preserved. ";
+            if (!stats.sessions) note += "No recorded sessions yet. ";
+            note += "Daily dates use the local calendar when measured. Interrupted sessions include only time saved before the interruption.";
+            statisticsNote->setText(note); chart->setDays(stats.days); heatmap->setDays(stats.heatmap);
             QStringList lines;
             for (const auto &session : stats.recent)
-                lines.append(QLocale().toString(session.started.toLocalTime(), QLocale::ShortFormat) + " · " +
-                    formatTrackedTime(session.durationMs, true) + " · " + session.state);
+                lines.append(QLocale().toString(session.started.toLocalTime(), QLocale::ShortFormat) + " · Playtime " +
+                    (session.foregroundRecorded ? formatTrackedTime(session.foregroundMs, true) : "unmeasured") +
+                    " · Opened " + formatTrackedTime(session.durationMs, true) + " · " + session.state);
             if (lines.isEmpty()) lines.append("No recorded sessions yet.");
             QStringList previous; for (int i = 0; i < history->count(); ++i) previous.append(history->item(i)->text());
             if (previous != lines) { history->clear(); history->addItems(lines); }
         } catch (const std::exception &error) {
-            statisticsTotal->setText("Unavailable"); statisticsNote->setText(QString::fromUtf8(error.what()));
+            statisticsTotal->setText("Unavailable"); statisticsOpened->setText("Unavailable"); statisticsNote->setText(QString::fromUtf8(error.what()));
         }
     };
     renderStatistics(); QTimer statisticsPoll(&d); statisticsPoll.setInterval(1000);
     connect(&statisticsPoll, &QTimer::timeout, &d, renderStatistics); statisticsPoll.start();
+    statisticsScroll->setWidget(statisticsTab);
     overviewScroll->setWidget(overview); tabs->addTab(overviewScroll, "Overview");
     auto metadataScroll = new QScrollArea(&d); metadataScroll->setWidgetResizable(true); metadataScroll->setFrameShape(QFrame::NoFrame);
     auto metadataTab = new QWidget(metadataScroll); auto metadataLayout = new QVBoxLayout(metadataTab);
@@ -125,6 +147,7 @@ void Window::manage() {
     auto attribution = new QLabel("Metadata from VNDB. New games are matched automatically; search, relink or refresh here to correct a result. Cached details work offline.", metadataTab);
     attribution->setWordWrap(true); attribution->setProperty("muted", true); metadataLayout->addWidget(attribution);
     metadataLayout->addStretch(); metadataScroll->setWidget(metadataTab); tabs->addTab(metadataScroll, "Metadata");
+    tabs->addTab(statisticsScroll, "Playtime");
     auto client = new VndbClient(&d, metadataApiBase_);
     auto updateMetadata = [&] {
         const auto data = g.metadata;
