@@ -105,6 +105,7 @@ private:
     GameGrid *grid_;
     QStackedWidget *views_;
     Cover *cover_;
+    QWidget *playedTimeRow_;
     QLabel *status_, *setupState_, *syncState_, *description_, *playtimeValue_, *tags_;
     QLabel *timePlayed_, *openedTime_, *lastPlayed_, *currentSession_;
     QLabel *rootLabel_, *title_, *originalTitle_, *detail_, *notice_;

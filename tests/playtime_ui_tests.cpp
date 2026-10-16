@@ -46,6 +46,7 @@ int main(int argc, char **argv) {
             Window window(root, QString::fromLocal8Bit(argv[1])); window.show();
             require(waitFor([&] { return label(window, "gameLastPlayed") == "Never"; }), "new game last played");
             require(label(window, "gameTimePlayed") == "0m" && label(window, "metadataPlaytime") == "12 hours", "actual/expected playtime are distinct");
+            require(!window.findChild<QLabel *>("gameTimePlayed")->isVisible(), "unplayed game must hide time played");
             window.launch();
             require(waitFor([&] { return readPlaytime(root, game.id).active; }), "GUI did not start a tracked session");
             const auto initial = label(window, "gameCurrentSession");
@@ -58,6 +59,7 @@ int main(int argc, char **argv) {
             Window reopened(root, QString::fromLocal8Bit(argv[1])); reopened.show();
             require(waitFor([&] { return label(reopened, "gameLastPlayed") == "Today"; }), "reopened GUI did not read tracked history");
             require(label(reopened, "gameOpenedTime") == "<1m" && label(reopened, "gameTimePlayed") == "0m" && label(reopened, "metadataPlaytime") == "12 hours", "reopened totals or expected time changed");
+            require(!reopened.findChild<QLabel *>("gameTimePlayed")->isVisible(), "opened time alone must not show measured playtime");
             bool inspected = false;
             QTimer::singleShot(0, &reopened, [&] {
                 auto dialog = reopened.findChild<QDialog *>("manageDialog");
