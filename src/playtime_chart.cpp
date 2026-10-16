@@ -10,21 +10,29 @@ namespace {
 constexpr double hourMs = 3600000.0;
 const QColor barColor("#3b82d0"), lineColor("#e69337"), green("#36a269");
 QRectF plotRect(const QWidget *widget) { return QRectF(76, 40, std::max(1, widget->width()-172), std::max(1, widget->height()-92)); }
-double scale(qint64 maximum) {
-    const double hours = maximum / hourMs;
-    if (hours <= 0) return 1;
-    const auto magnitude = std::pow(10.0, std::floor(std::log10(hours)));
-    return std::ceil(hours / magnitude * 2) * magnitude / 2;
+struct Axis {
+    double maximum, unitMs;
+    QString unit;
+    double hours() const { return maximum * unitMs / hourMs; }
+};
+Axis axisFor(const QList<PlaytimeDay> &days, bool cumulative) {
+    qint64 maximum = 0;
+    for (const auto &day : days) maximum = std::max(maximum, cumulative ? day.cumulativeMs : day.foregroundMs);
+    const bool minutes = maximum < hourMs;
+    const double unitMs = minutes ? 60000.0 : hourMs;
+    const double value = std::max(1.0, maximum / unitMs);
+    const auto magnitude = std::pow(10.0, std::floor(std::log10(value)));
+    return {std::ceil(value / magnitude * 2) * magnitude / 2, unitMs, minutes ? "minutes" : "hours"};
 }
-QString duration(qint64 ms) { return QString::number(ms/hourMs, 'f', 2) + " hours"; }
+QString duration(qint64 ms) { return formatTrackedTime(ms, true); }
 }
 PlaytimeChart::PlaytimeChart(QWidget *parent) : QWidget(parent) {
     setObjectName("playtimeChart"); setMinimumSize(360, 260);
     setAccessibleName("Daily and cumulative foreground playtime over the last 30 local calendar days");
 }
 void PlaytimeChart::setDays(const QList<PlaytimeDay> &days) { days_ = days; update(); }
-double PlaytimeChart::dailyAxisHours() const { qint64 maximum = 0; for (const auto &day : days_) maximum = std::max(maximum, day.foregroundMs); return scale(maximum); }
-double PlaytimeChart::cumulativeAxisHours() const { qint64 maximum = 0; for (const auto &day : days_) maximum = std::max(maximum, day.cumulativeMs); return scale(maximum); }
+double PlaytimeChart::dailyAxisHours() const { return axisFor(days_, false).hours(); }
+double PlaytimeChart::cumulativeAxisHours() const { return axisFor(days_, true).hours(); }
 void PlaytimeChart::paintEvent(QPaintEvent *) {
     QPainter p(this); p.setRenderHint(QPainter::Antialiasing);
     const auto plot = plotRect(this); const auto text = palette().color(QPalette::Text);
@@ -32,32 +40,32 @@ void PlaytimeChart::paintEvent(QPaintEvent *) {
     p.drawText(QRectF(plot.left()+18, 5, 120, 24), "Daily playtime");
     p.setPen(QPen(lineColor, 2)); p.drawLine(QPointF(plot.left()+150, 17), QPointF(plot.left()+170, 17));
     p.drawText(QRectF(plot.left()+178, 5, 180, 24), "Cumulative playtime");
-    const auto left = dailyAxisHours(), right = cumulativeAxisHours();
+    const auto left = axisFor(days_, false), right = axisFor(days_, true);
     for (int tick = 0; tick <= 4; ++tick) {
         const auto y = plot.bottom() - plot.height()*tick/4;
         auto grid = text; grid.setAlpha(45); p.setPen(grid); p.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
         p.setPen(text);
-        p.drawText(QRectF(29, y-10, 40, 20), Qt::AlignRight|Qt::AlignVCenter, QString::number(left*tick/4, 'g', 3));
-        p.drawText(QRectF(plot.right()+7, y-10, 43, 20), Qt::AlignLeft|Qt::AlignVCenter, QString::number(right*tick/4, 'g', 3));
+        p.drawText(QRectF(29, y-10, 40, 20), Qt::AlignRight|Qt::AlignVCenter, QString::number(left.maximum*tick/4, 'g', 3));
+        p.drawText(QRectF(plot.right()+7, y-10, 43, 20), Qt::AlignLeft|Qt::AlignVCenter, QString::number(right.maximum*tick/4, 'g', 3));
     }
     p.save(); p.translate(18, plot.center().y()); p.rotate(-90);
-    p.drawText(QRectF(-plot.height()/2, -20, plot.height(), 40), Qt::AlignCenter, "Daily playtime\n(hours)"); p.restore();
+    p.drawText(QRectF(-plot.height()/2, -20, plot.height(), 40), Qt::AlignCenter, "Daily playtime\n(" + left.unit + ")"); p.restore();
     p.save(); p.translate(width()-20, plot.center().y()); p.rotate(90);
-    p.drawText(QRectF(-plot.height()/2, -20, plot.height(), 40), Qt::AlignCenter, "Cumulative playtime\n(hours)"); p.restore();
+    p.drawText(QRectF(-plot.height()/2, -20, plot.height(), 40), Qt::AlignCenter, "Cumulative playtime\n(" + right.unit + ")"); p.restore();
     if (days_.isEmpty()) return;
     const auto step = plot.width()/days_.size(); QPainterPath line;
     for (int i = 0; i < days_.size(); ++i) {
         const auto &day = days_[i]; const auto x = plot.left() + step*(i+.5);
-        const auto barHeight = plot.height()*day.foregroundMs/hourMs/left;
+        const auto barHeight = plot.height()*day.foregroundMs/left.unitMs/left.maximum;
         p.fillRect(QRectF(x-step*.34, plot.bottom()-barHeight, step*.68, barHeight), barColor);
-        const QPointF point(x, plot.bottom()-plot.height()*day.cumulativeMs/hourMs/right);
+        const QPointF point(x, plot.bottom()-plot.height()*day.cumulativeMs/right.unitMs/right.maximum);
         if (i == 0) line.moveTo(point); else line.lineTo(point);
         if (i == 0 || i == days_.size()-1 || (i % 7 == 0 && i < days_.size()-3)) {
             p.setPen(text); p.drawText(QRectF(x-30, plot.bottom()+7, 60, 20), Qt::AlignCenter, day.day.toString("dd MMM"));
         }
     }
     p.setPen(QPen(lineColor, 2.5)); p.setBrush(Qt::NoBrush); p.drawPath(line);
-    p.setPen(text); p.drawText(QRectF(plot.left(), height()-24, plot.width(), 20), Qt::AlignCenter, "Last 30 local calendar days · cumulative includes earlier history");
+    p.setPen(text); p.drawText(QRectF(plot.left(), height()-24, plot.width(), 20), Qt::AlignCenter, "Last 30 days");
 }
 bool PlaytimeChart::event(QEvent *event) {
     if (event->type() == QEvent::ToolTip && !days_.isEmpty()) {

@@ -192,23 +192,20 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
     timePlayed_ = new QLabel(playedTimeRow_); timePlayed_->setObjectName("gameTimePlayed"); timePlayed_->setTextFormat(Qt::PlainText);
     playedTimeLayout->addWidget(playedTimeCaption); playedTimeLayout->addWidget(timePlayed_, 1);
     playedTimeRow_->hide(); info->addWidget(playedTimeRow_);
-    setupState_ = new QLabel(content); setupState_->setObjectName("gameSetupStatus");
-    setupState_->setWordWrap(true); setupState_->setTextFormat(Qt::PlainText); setupState_->hide(); info->addWidget(setupState_);
-    syncState_ = new QLabel(content); syncState_->setObjectName("gameSyncStatus");
-    syncState_->setWordWrap(true); syncState_->setTextFormat(Qt::PlainText); info->addWidget(syncState_);
-    description_ = new QLabel("No description yet.", content); description_->setObjectName("gameDescription"); description_->setWordWrap(true); description_->setTextFormat(Qt::PlainText); info->addWidget(description_);
-    tags_ = new QLabel("No tags yet", content); tags_->setObjectName("metadataTags"); tags_->setTextFormat(Qt::PlainText); tags_->setWordWrap(true); info->addWidget(tags_);
-    auto time = new QHBoxLayout; auto timeLabel = new QLabel("Expected play time", content); timeLabel->setProperty("muted", true); time->addWidget(timeLabel);
-    playtimeValue_ = new QLabel("—", content); playtimeValue_->setObjectName("metadataPlaytime"); time->addWidget(playtimeValue_, 1); info->addLayout(time);
     const auto statistic = [&](const QString &label, const QString &name) {
         auto row = new QHBoxLayout;
         auto caption = new QLabel(label, content); caption->setProperty("muted", true); row->addWidget(caption);
         auto value = new QLabel("—", content); value->setObjectName(name); value->setTextFormat(Qt::PlainText);
         value->setWordWrap(true); row->addWidget(value, 1); info->addLayout(row); return value;
     };
-    openedTime_ = statistic("Opened time", "gameOpenedTime");
+    playtimeValue_ = statistic("Expected play time", "metadataPlaytime");
     lastPlayed_ = statistic("Last played", "gameLastPlayed");
-    currentSession_ = statistic("Current opened session", "gameCurrentSession");
+    setupState_ = new QLabel(content); setupState_->setObjectName("gameSetupStatus");
+    setupState_->setWordWrap(true); setupState_->setTextFormat(Qt::PlainText); setupState_->hide(); info->addWidget(setupState_);
+    syncState_ = new QLabel(content); syncState_->setObjectName("gameSyncStatus");
+    syncState_->setWordWrap(true); syncState_->setTextFormat(Qt::PlainText); info->addWidget(syncState_);
+    description_ = new QLabel("No description yet.", content); description_->setObjectName("gameDescription"); description_->setWordWrap(true); description_->setTextFormat(Qt::PlainText); info->addWidget(description_);
+    tags_ = new QLabel("No tags yet", content); tags_->setObjectName("metadataTags"); tags_->setTextFormat(Qt::PlainText); tags_->setWordWrap(true); info->addWidget(tags_);
     detail_ = new QLabel(content); detail_->setWordWrap(true); detail_->setTextFormat(Qt::PlainText); detail_->setProperty("muted", true); info->addWidget(detail_); info->addStretch();
     scroll->setWidget(content); p->addWidget(scroll, 1); body->addWidget(panel); layout->addLayout(body, 1);
     auto footer = new QHBoxLayout; notice_ = new QLabel("", this); notice_->setObjectName("libraryNotice"); notice_->setTextFormat(Qt::PlainText); notice_->setWordWrap(true); footer->addWidget(notice_, 1);
@@ -515,16 +512,14 @@ void Window::refresh() {
 void Window::updatePlaytime() {
     const auto game = selected();
     playedTimeRow_->hide();
-    for (auto label : {timePlayed_, openedTime_, lastPlayed_, currentSession_}) { label->setText("—"); label->setToolTip({}); }
+    for (auto label : {timePlayed_, lastPlayed_}) { label->setText("—"); label->setToolTip({}); }
     if (!library_ || game.id.isEmpty() || !rootAvailable() || model_->remoteGames.contains(game.id)) return;
     try {
         const auto stats = readPlaytime(library_->root(), game.id, 0);
         timePlayed_->setText(formatTrackedTime(stats.foregroundMs));
         playedTimeRow_->setVisible(stats.foregroundMs > 0);
-        openedTime_->setText(game.backend == "steam" && stats.sessions == 0 ? "Unavailable for Steam" : formatTrackedTime(stats.totalMs));
         if (stats.incompleteForeground) timePlayed_->setToolTip("Only verified foreground time is included. Some history has no foreground measurements.");
         lastPlayed_->setText(formatLastPlayed(stats.lastPlayed));
-        currentSession_->setText(game.backend == "steam" ? "Unavailable for Steam" : stats.active ? formatTrackedTime(stats.currentMs, true) : "—");
     } catch (const std::exception &error) {
         timePlayed_->setText("Unavailable"); timePlayed_->setToolTip(QString::fromUtf8(error.what()));
     }

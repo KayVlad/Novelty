@@ -49,8 +49,7 @@ int main(int argc, char **argv) {
             require(!window.findChild<QLabel *>("gameTimePlayed")->isVisible(), "unplayed game must hide time played");
             window.launch();
             require(waitFor([&] { return readPlaytime(root, game.id).active; }), "GUI did not start a tracked session");
-            const auto initial = label(window, "gameCurrentSession");
-            require(waitFor([&] { const auto current = label(window, "gameCurrentSession"); return current != "—" && current != initial; }), "current session does not update live");
+            require(waitFor([&] { return label(window, "gameLastPlayed") == "Today"; }), "last played does not update live");
         } // Close the GUI while the existing detached monitor and real subprocess run.
         require(readPlaytime(root, game.id).active, "closing GUI stopped tracking");
         require(waitFor([&] { const auto stats = readPlaytime(root, game.id); return stats.sessions == 1 && !stats.active; }), "session did not complete after GUI shutdown");
@@ -58,7 +57,7 @@ int main(int argc, char **argv) {
         {
             Window reopened(root, QString::fromLocal8Bit(argv[1])); reopened.show();
             require(waitFor([&] { return label(reopened, "gameLastPlayed") == "Today"; }), "reopened GUI did not read tracked history");
-            require(label(reopened, "gameOpenedTime") == "<1m" && label(reopened, "gameTimePlayed") == "0m" && label(reopened, "metadataPlaytime") == "12 hours", "reopened totals or expected time changed");
+            require(label(reopened, "gameTimePlayed") == "0m" && label(reopened, "metadataPlaytime") == "12 hours", "reopened totals or expected time changed");
             require(!reopened.findChild<QLabel *>("gameTimePlayed")->isVisible(), "opened time alone must not show measured playtime");
             bool inspected = false;
             QTimer::singleShot(0, &reopened, [&] {
@@ -71,7 +70,7 @@ int main(int argc, char **argv) {
                     const auto heatmap = dialog->findChild<QWidget *>("playtimeHeatmap");
                     bool playtimeTab = false;
                     for (int i = 0; tabs && i < tabs->count(); ++i) if (tabs->tabText(i) == "Playtime") { tabs->setCurrentIndex(i); playtimeTab = true; }
-                    inspected = playtimeTab && chart && heatmap && count && count->text() == "1" && history && history->count() == 1 && history->item(0)->text().contains("completed");
+                    inspected = playtimeTab && chart && heatmap && count && count->text() == "1" && history && history->count() == 1 && !history->item(0)->text().contains("completed");
                     const auto preview = qEnvironmentVariable("NOVELTY_UI_PREVIEW_DIR");
                     if (!preview.isEmpty()) { dialog->resize(1000,900); QCoreApplication::processEvents(); dialog->grab().save(preview+"/manage-playtime.png"); }
                     dialog->reject();
@@ -90,7 +89,7 @@ int main(int argc, char **argv) {
         game = library.game(game.id); game.backend = "steam"; game.steamId = "123"; library.save(game);
         {
             Window steam(root, QString::fromLocal8Bit(argv[1])); steam.show();
-            require(waitFor([&] { return label(steam, "gameCurrentSession") == "Unavailable for Steam"; }), "Steam tracking must be explicitly unavailable");
+            require(waitFor([&] { return label(steam, "gameLastPlayed") == "Today"; }), "Steam selection lost recorded history");
         }
         std::puts("PASS: live actual playtime, expected metadata, GUI shutdown/restart, Manage history and Steam availability");
         return 0;

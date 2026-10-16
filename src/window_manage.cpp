@@ -65,13 +65,11 @@ void Window::manage() {
     };
     auto statisticsTotal = statisticsRow("Playtime", "statisticsTotal");
     auto statisticsOpened = statisticsRow("Opened time", "statisticsOpened");
-    auto statisticsFirst = new QLabel(statisticsTab); statisticsFirst->setObjectName("statisticsFirstPlay"); statisticsForm->addRow(statisticsFirst);
+    auto statisticsFirst = statisticsRow("First play", "statisticsFirstPlay");
     auto statisticsLast = statisticsRow("Last played", "statisticsLastPlayed");
     auto statisticsCount = statisticsRow("Recorded sessions", "statisticsCount");
-    auto statisticsCurrent = statisticsRow("Current opened session", "statisticsCurrentSession");
-    auto statisticsNote = new QLabel(statisticsTab); statisticsNote->setObjectName("statisticsNote");
-    statisticsNote->setWordWrap(true); statisticsNote->setTextFormat(Qt::PlainText); statisticsLayout->addWidget(statisticsNote);
     auto chart = new PlaytimeChart(statisticsTab); statisticsLayout->addWidget(chart);
+    statisticsLayout->addSpacing(16);
     auto heatmap = new PlaytimeHeatmap(statisticsTab); statisticsLayout->addWidget(heatmap);
     statisticsLayout->addWidget(new QLabel("Recent sessions", statisticsTab));
     auto history = new QListWidget(statisticsTab); history->setObjectName("statisticsHistory"); history->setMinimumHeight(100);
@@ -80,28 +78,27 @@ void Window::manage() {
         try {
             const auto stats = readPlaytime(library_->root(), g.id);
             statisticsTotal->setText(formatTrackedTime(stats.foregroundMs)); statisticsOpened->setText(formatTrackedTime(stats.totalMs));
-            statisticsFirst->setText("First play: " + (stats.firstPlay.isValid() ? stats.firstPlay.toLocalTime().date().toString("dd-MM-yyyy") : "—"));
+            statisticsFirst->setText(stats.firstPlay.isValid() ? stats.firstPlay.toLocalTime().date().toString("dd-MM-yyyy") : "—");
             statisticsFirst->setToolTip("Earliest recorded session with opened time strictly greater than five minutes.");
             statisticsCount->setText(QString::number(stats.sessions)); statisticsLast->setText(formatLastPlayed(stats.lastPlayed));
-            statisticsCurrent->setText(g.backend == "steam" ? "Unavailable for Steam" : stats.active ? formatTrackedTime(stats.currentMs, true) : "—");
-            auto note = QString("Playtime counts active, visible game windows. Opened time counts the game’s process lifetime. Playtime updates every 30 seconds. ");
-            if (g.backend == "steam") note += "Tracking is unavailable for Steam shortcuts. ";
-            else if (gamescopeSession()) note += "Foreground tracking is unavailable in Steam Deck Game Mode. ";
-            if (!stats.focusStatus.isEmpty() && stats.active) note += stats.focusStatus + ". ";
-            if (stats.incompleteForeground) note += "Some history has no foreground measurements; its opened time is preserved. ";
-            if (!stats.sessions) note += "No recorded sessions yet. ";
-            note += "Daily dates use the local calendar when measured. Interrupted sessions include only time saved before the interruption.";
-            statisticsNote->setText(note); chart->setDays(stats.days); heatmap->setDays(stats.heatmap);
+            QString hint;
+            if (g.backend == "steam") hint = "Tracking is unavailable for Steam shortcuts.";
+            else if (gamescopeSession()) hint = "Foreground tracking is unavailable in Steam Deck Game Mode.";
+            else if (stats.active) hint = stats.focusStatus;
+            if (stats.incompleteForeground) hint += (hint.isEmpty() ? "" : "\n") + QString("Some history has no foreground measurements; its opened time is preserved.");
+            statisticsTotal->setToolTip(hint);
+            chart->setDays(stats.days); heatmap->setDays(stats.heatmap);
             QStringList lines;
             for (const auto &session : stats.recent)
                 lines.append(QLocale().toString(session.started.toLocalTime(), QLocale::ShortFormat) + " · Playtime " +
                     (session.foregroundRecorded ? formatTrackedTime(session.foregroundMs, true) : "unmeasured") +
-                    " · Opened " + formatTrackedTime(session.durationMs, true) + " · " + session.state);
+                    " · Opened " + formatTrackedTime(session.durationMs, true) +
+                    (session.state == "completed" ? QString() : " · " + session.state));
             if (lines.isEmpty()) lines.append("No recorded sessions yet.");
             QStringList previous; for (int i = 0; i < history->count(); ++i) previous.append(history->item(i)->text());
             if (previous != lines) { history->clear(); history->addItems(lines); }
         } catch (const std::exception &error) {
-            statisticsTotal->setText("Unavailable"); statisticsOpened->setText("Unavailable"); statisticsNote->setText(QString::fromUtf8(error.what()));
+            statisticsTotal->setText("Unavailable"); statisticsOpened->setText("Unavailable"); statisticsTotal->setToolTip(QString::fromUtf8(error.what()));
         }
     };
     renderStatistics(); QTimer statisticsPoll(&d); statisticsPoll.setInterval(1000);
