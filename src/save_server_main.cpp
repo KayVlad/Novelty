@@ -349,6 +349,7 @@ int main(int argc, char **argv) {
         int activeRequests = 0;
         QTcpServer listener;
         listener.setMaxPendingConnections(64);
+        listener.setListenBacklogSize(128); // Accept a full request burst plus overflow before enforcing the active cap.
         if (!listener.listen(QHostAddress::LocalHost, port)) fail("Cannot bind local save server port.");
         QObject::connect(&listener, &QTcpServer::newConnection, &app, [&] {
             while (auto *socket = listener.nextPendingConnection()) {

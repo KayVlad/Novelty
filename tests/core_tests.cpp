@@ -1207,6 +1207,12 @@ void testSchemaAndManagedRunners(const QString &base) {
     Library lib(root);
     require(lib.game(g.id).json() == g.json(), "schema migration preserves game configuration");
     require(lib.recoverRemovals().isEmpty(), "new recovery table is empty after migration");
+    {
+        QLockFile mutation(lib.dataRoot() + "/mutation.lock");
+        require(mutation.tryLock(), "hold mutation lock while checking empty recovery queues");
+        require(lib.recoverRemovals().isEmpty() && lib.recoverFolderImports().isEmpty(),
+                "empty background recovery must not contend with user mutations");
+    }
     const auto managed = root + "/.novelty/runners/GE-Proton11-7";
     const auto incomplete = root + "/.novelty/runners/.install-GE-Proton11-7";
     touch(managed + "/proton"); touch(incomplete + "/proton");

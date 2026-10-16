@@ -214,6 +214,10 @@ bool Library::removalReservedFolder(const QString &folder) const {
 }
 QStringList Library::recoverRemovals() {
     QStringList messages;
+    QSqlQuery pending(db_);
+    if (!pending.exec("SELECT 1 FROM removals LIMIT 1")) fail(pending.lastError().text());
+    if (!pending.next()) return messages;
+    pending.finish();
     QLockFile mutation(dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
     if (!mutation.tryLock()) return {"Library maintenance is active elsewhere. Use Rescan to retry recovery."};
     struct Job { QString id, phase, manifest; }; QList<Job> jobs;

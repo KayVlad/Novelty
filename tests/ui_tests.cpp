@@ -108,6 +108,18 @@ int main(int argc, char **argv) {
     QApplication app(argc, argv);
     if (argc < 3) return 1;
     const QString launcher = argv[1];
+    QTimer fixtureWatchdog; fixtureWatchdog.setSingleShot(true);
+    QObject::connect(&fixtureWatchdog, &QTimer::timeout, &app, [&] {
+        const auto modal = QApplication::activeModalWidget();
+        std::fprintf(stderr, "FAIL: UI lifecycle stalled in %s %s: %s\n",
+            modal ? modal->metaObject()->className() : "none",
+            modal ? qPrintable(modal->objectName()) : "no modal dialog",
+            modal ? qPrintable(modal->windowTitle()) : "");
+        if (modal) for (const auto label : modal->findChildren<QLabel *>())
+            std::fprintf(stderr, "  %s\n", qPrintable(label->text()));
+        std::_Exit(2);
+    });
+    fixtureWatchdog.start(25000);
     QTemporaryDir t;
     QSettings::setDefaultFormat(QSettings::IniFormat); QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, t.path());
     QCoreApplication::setOrganizationName("NoveltyTests"); QCoreApplication::setApplicationName("NoveltyTests");

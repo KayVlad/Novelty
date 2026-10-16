@@ -254,9 +254,10 @@ FolderImportResult Library::addFolder(const QString &chosen, const QString &nati
 
 QStringList Library::recoverFolderImports() {
     QStringList messages;
+    const QDir jobs(dataRoot() + "/imports");
+    if (jobs.entryList({"*.json"}, QDir::Files | QDir::NoSymLinks).isEmpty()) return messages;
     QLockFile mutation(dataRoot() + "/mutation.lock"); mutation.setStaleLockTime(0);
     if (!mutation.tryLock()) return {"Library maintenance is active elsewhere. Use Rescan to retry folder import recovery."};
-    const QDir jobs(dataRoot() + "/imports");
     for (const auto &name : jobs.entryList({"*.json"}, QDir::Files | QDir::NoSymLinks, QDir::Name)) {
         const auto path = jobs.filePath(name);
         try {

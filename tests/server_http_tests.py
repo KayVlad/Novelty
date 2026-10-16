@@ -8,6 +8,7 @@ import struct
 import uuid
 import urllib.error
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -105,11 +106,18 @@ with tempfile.TemporaryDirectory(prefix='novelty-http-') as directory:
         exchange('PUT', data=corrupt, expected=422, **{'X-Expected-Revision': revision})
         assert exchange('HEAD')[0]['X-Novelty-Revision'] == revision
         # HEAD uses committed metadata; GET still verifies payload bytes before sending.
-        for _ in range(64):
-            connection = socket.create_connection(('127.0.0.1', port), timeout=1)
-            connection.sendall(b'GET /')
-            connections.append(connection)
-        overflow = socket.create_connection(('127.0.0.1', port), timeout=1)
+        # Force the whole burst into the kernel backlog before Qt accepts it.
+        # This also covers runners where durable request setup temporarily delays accept().
+        os.kill(server.pid, signal.SIGSTOP)
+        try:
+            for _ in range(64):
+                connection = socket.create_connection(('127.0.0.1', port), timeout=1)
+                connection.sendall(b'GET /')
+                connections.append(connection)
+            overflow = socket.create_connection(('127.0.0.1', port), timeout=1)
+        finally:
+            os.kill(server.pid, signal.SIGCONT)
+        overflow.settimeout(5)
         try:
             assert overflow.recv(1) == b'', 'request limit did not close excess connection'
         except ConnectionResetError:
