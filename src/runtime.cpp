@@ -1,3 +1,4 @@
+#include "playtime.h"
 #include "runtime.h"
 #include <QtCore/qcoreapplication.h>
 #include <QtCore/qdatetime.h>
@@ -20,7 +21,8 @@ QString bootId() {
 }
 class RuntimeGuard {
 public:
-    RuntimeGuard(const Library &lib, const QString &id) : path_(lib.gamePath(id, "runtime.json")) {
+    RuntimeGuard(const Library &lib, const QString &id, PlaytimeSession *playtime)
+        : path_(lib.gamePath(id, "runtime.json")), playtime_(playtime) {
 #ifdef __linux__
         if (prctl(PR_GET_CHILD_SUBREAPER, &previous_) != 0 || prctl(PR_SET_CHILD_SUBREAPER, 1L) != 0)
             throw std::runtime_error("Cannot enable descendant process tracking; launch was not started.");
@@ -35,11 +37,20 @@ public:
         // A killed monitor cannot execute this cleanup; its marker remains.
         bool stopped = false;
         for (;;) {
-            if (waitpid(-1, nullptr, 0) >= 0) continue;
+            const auto child = waitpid(-1, nullptr, playtime_ ? WNOHANG : 0);
+            if (child > 0) continue;
+            if (child == 0) {
+                if (playtime_) playtime_->checkpoint();
+                ::usleep(250000);
+                continue;
+            }
             if (errno == EINTR) continue;
             stopped = errno == ECHILD; break;
         }
-        if (stopped) QFile::remove(path_);
+        if (stopped) {
+            if (playtime_) playtime_->complete();
+            QFile::remove(path_);
+        }
         prctl(PR_SET_CHILD_SUBREAPER, static_cast<long>(previous_));
 #endif
     }
@@ -47,10 +58,12 @@ public:
     RuntimeGuard &operator=(const RuntimeGuard &) = delete;
 private:
     QString path_;
+    PlaytimeSession *playtime_;
     int previous_ = 0;
 };
-int runTrackedWorker(const Library &lib, const QString &id, const Command &cmd, QFile &log) {
-    RuntimeGuard guard(lib, id);
+int runTrackedWorker(const Library &lib, const QString &id, const Command &cmd, QFile &log, bool trackPlaytime) {
+    PlaytimeSession playtime(lib.root(), id, log);
+    RuntimeGuard guard(lib, id, trackPlaytime ? &playtime : nullptr);
     QProcess process;
     process.setProgram(cmd.program); process.setArguments(cmd.arguments);
     process.setWorkingDirectory(cmd.cwd); process.setProcessEnvironment(cmd.environment);
@@ -64,7 +77,11 @@ int runTrackedWorker(const Library &lib, const QString &id, const Command &cmd, 
     process.start();
     if (!process.waitForStarted(10000))
         throw std::runtime_error(("Could not start " + cmd.program + ": " + process.errorString()).toStdString());
-    while (process.state() != QProcess::NotRunning) { process.waitForReadyRead(250); drain(); }
+    if (trackPlaytime) playtime.start(); // exec succeeded; preparation and sync are outside this invocation.
+    while (process.state() != QProcess::NotRunning) {
+        process.waitForReadyRead(250); drain();
+        if (trackPlaytime) playtime.checkpoint();
+    }
     drain(); log.flush();
     if (process.exitStatus() == QProcess::CrashExit)
         throw std::runtime_error("The launch process crashed. See the launch log.");
@@ -88,7 +105,7 @@ QString runtimeRecoveryIssue(const Library &lib, const QString &id) {
         return "Process recovery data is unreadable or damaged. Game operations are blocked until this record can be inspected and recovered.";
     }
 }
-int executeTracked(const Library &lib, const QString &id, const Command &cmd, QFile &log) {
+int executeTracked(const Library &lib, const QString &id, const Command &cmd, QFile &log, bool trackPlaytime) {
 #ifdef __linux__
     // The worker is the backend's parent and subreaper. If the headless caller is
     // killed, this worker still owns descendants and can clear the barrier safely.
@@ -110,7 +127,7 @@ int executeTracked(const Library &lib, const QString &id, const Command &cmd, QF
         int code = 1;
         try {
             if (setsid() < 0) throw std::runtime_error("Could not detach the process monitor.");
-            code = runTrackedWorker(lib, id, cmd, log);
+            code = runTrackedWorker(lib, id, cmd, log, trackPlaytime);
         }
         catch (const std::exception &e) { log.write("Novelty monitor: "); log.write(e.what()); log.write("\n"); log.flush(); }
         _exit(code >= 0 && code <= 255 ? code : 1);
@@ -123,7 +140,7 @@ int executeTracked(const Library &lib, const QString &id, const Command &cmd, QF
     if (!WIFEXITED(status)) throw std::runtime_error("The process monitor stopped unexpectedly; recovery evidence was kept.");
     return WEXITSTATUS(status);
 #else
-    Q_UNUSED(lib); Q_UNUSED(id); Q_UNUSED(cmd); Q_UNUSED(log);
+    Q_UNUSED(lib); Q_UNUSED(id); Q_UNUSED(cmd); Q_UNUSED(log); Q_UNUSED(trackPlaytime);
     throw std::runtime_error("Descendant process tracking requires Linux.");
 #endif
 }

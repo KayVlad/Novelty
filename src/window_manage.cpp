@@ -1,3 +1,5 @@
+#include "playtime.h"
+#include <QtCore/qlocale.h>
 #include "window_internal.h"
 #include <QtCore/qregularexpression.h>
 
@@ -53,6 +55,36 @@ void Window::manage() {
     overviewRow("Steam launch ID", g.steamId); overviewRow("Arguments", g.arguments.join('\n'));
     QStringList overviewEnvironment; for (auto it = g.environment.begin(); it != g.environment.end(); ++it) overviewEnvironment.append(it.key() + '=' + it.value());
     overviewRow("Environment", overviewEnvironment.join('\n')); overviewRow("Engine evidence", g.evidence);
+    auto statisticsTitle = new QLabel("Playtime / Statistics", overview);
+    statisticsTitle->setStyleSheet("font-weight: bold; margin-top: 12px;"); overviewForm->addRow(statisticsTitle);
+    auto statisticsTotal = overviewRow("Time played", "0m"); statisticsTotal->setObjectName("statisticsTotal");
+    auto statisticsCount = overviewRow("Recorded sessions", "0"); statisticsCount->setObjectName("statisticsCount");
+    auto statisticsLast = overviewRow("Last played", "Never"); statisticsLast->setObjectName("statisticsLastPlayed");
+    auto statisticsCurrent = overviewRow("Current session", "—"); statisticsCurrent->setObjectName("statisticsCurrentSession");
+    auto history = new QListWidget(overview); history->setObjectName("statisticsHistory"); history->setMaximumHeight(150);
+    overviewForm->addRow("Recent sessions", history);
+    auto statisticsNote = overviewRow({}, g.backend == "steam" ?
+        "Tracking is unavailable for Steam shortcuts: Novelty cannot monitor the actual Steam game process." :
+        "Recorded on this device. Interrupted sessions include only their last committed checkpoint.");
+    const auto renderStatistics = [&] {
+        try {
+            const auto stats = readPlaytime(library_->root(), g.id);
+            statisticsTotal->setText(formatTrackedTime(stats.totalMs));
+            statisticsCount->setText(QString::number(stats.sessions)); statisticsLast->setText(formatLastPlayed(stats.lastPlayed));
+            statisticsCurrent->setText(g.backend == "steam" ? "Unavailable for Steam" : stats.active ? formatTrackedTime(stats.currentMs, true) : "—");
+            QStringList lines;
+            for (const auto &session : stats.recent)
+                lines.append(QLocale().toString(session.started.toLocalTime(), QLocale::ShortFormat) + " · " +
+                    formatTrackedTime(session.durationMs, true) + " · " + session.state);
+            if (lines.isEmpty()) lines.append("No recorded sessions yet.");
+            QStringList previous; for (int i = 0; i < history->count(); ++i) previous.append(history->item(i)->text());
+            if (previous != lines) { history->clear(); history->addItems(lines); }
+        } catch (const std::exception &error) {
+            statisticsTotal->setText("Unavailable"); statisticsNote->setText(QString::fromUtf8(error.what()));
+        }
+    };
+    renderStatistics(); QTimer statisticsPoll(&d); statisticsPoll.setInterval(1000);
+    connect(&statisticsPoll, &QTimer::timeout, &d, renderStatistics); statisticsPoll.start();
     overviewScroll->setWidget(overview); tabs->addTab(overviewScroll, "Overview");
     auto metadataScroll = new QScrollArea(&d); metadataScroll->setWidgetResizable(true); metadataScroll->setFrameShape(QFrame::NoFrame);
     auto metadataTab = new QWidget(metadataScroll); auto metadataLayout = new QVBoxLayout(metadataTab);

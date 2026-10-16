@@ -343,7 +343,7 @@ int supervise(Library &lib, const QString &id, bool prepareOnly, const QString &
             catch (const std::exception &e) { snapshotIssue = QString::fromUtf8(e.what()); log.write(("Save snapshot pending: " + snapshotIssue + "\n").toUtf8()); }
         };
         int result = 0;
-        try { result = executeTracked(lib, id, cmd, log); }
+        try { result = executeTracked(lib, id, cmd, log, ordinaryPlay && !installing); }
         catch (...) {
             finishSaves();
             throw;

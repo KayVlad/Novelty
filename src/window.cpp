@@ -1,3 +1,4 @@
+#include "playtime.h"
 #include "window_internal.h"
 
 namespace novelty {
@@ -193,6 +194,15 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
     tags_ = new QLabel("No tags yet", content); tags_->setObjectName("metadataTags"); tags_->setTextFormat(Qt::PlainText); tags_->setWordWrap(true); info->addWidget(tags_);
     auto time = new QHBoxLayout; auto timeLabel = new QLabel("Expected play time", content); timeLabel->setProperty("muted", true); time->addWidget(timeLabel);
     playtimeValue_ = new QLabel("—", content); playtimeValue_->setObjectName("metadataPlaytime"); time->addWidget(playtimeValue_, 1); info->addLayout(time);
+    const auto statistic = [&](const QString &label, const QString &name) {
+        auto row = new QHBoxLayout;
+        auto caption = new QLabel(label, content); caption->setProperty("muted", true); row->addWidget(caption);
+        auto value = new QLabel("—", content); value->setObjectName(name); value->setTextFormat(Qt::PlainText);
+        value->setWordWrap(true); row->addWidget(value, 1); info->addLayout(row); return value;
+    };
+    timePlayed_ = statistic("Time played", "gameTimePlayed");
+    lastPlayed_ = statistic("Last played", "gameLastPlayed");
+    currentSession_ = statistic("Current session", "gameCurrentSession");
     detail_ = new QLabel(content); detail_->setWordWrap(true); detail_->setTextFormat(Qt::PlainText); detail_->setProperty("muted", true); info->addWidget(detail_); info->addStretch();
     scroll->setWidget(content); p->addWidget(scroll, 1); body->addWidget(panel); layout->addLayout(body, 1);
     auto footer = new QHBoxLayout; notice_ = new QLabel("", this); notice_->setObjectName("libraryNotice"); notice_->setTextFormat(Qt::PlainText); notice_->setWordWrap(true); footer->addWidget(notice_, 1);
@@ -337,6 +347,9 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
     connect(&syncTimer_, &QTimer::timeout, this, [this] {
         refreshPeerGames(); retryPendingServerSaves(); selectGame();
     });
+    playtimeTimer_.setInterval(1000);
+    connect(&playtimeTimer_, &QTimer::timeout, this, [this] { updatePlaytime(); });
+    playtimeTimer_.start();
     selectGame();
     const auto initial = root.isEmpty() ? loadAppSettings()["gamesRoot"].toString() : root;
     if (!initial.isEmpty()) {
@@ -347,6 +360,7 @@ Window::Window(const QString &root, const QString &launcherExecutable, QUrl meta
     }
 }
 Window::~Window() {
+    playtimeTimer_.stop();
     syncTimer_.stop();
     if (serverRetryProcess_ && serverRetryProcess_->state() != QProcess::NotRunning) {
         serverRetryProcess_->kill(); serverRetryProcess_->waitForFinished(1000);
@@ -492,6 +506,19 @@ void Window::refresh() {
     if (!table_->currentIndex().isValid() && proxy_->rowCount() > 0) table_->selectRow(0);
     selectGame();
 }
+void Window::updatePlaytime() {
+    const auto game = selected();
+    for (auto label : {timePlayed_, lastPlayed_, currentSession_}) { label->setText("—"); label->setToolTip({}); }
+    if (!library_ || game.id.isEmpty() || !rootAvailable() || model_->remoteGames.contains(game.id)) return;
+    try {
+        const auto stats = readPlaytime(library_->root(), game.id, 0);
+        timePlayed_->setText(game.backend == "steam" && stats.sessions == 0 ? "Unavailable for Steam" : formatTrackedTime(stats.totalMs));
+        lastPlayed_->setText(formatLastPlayed(stats.lastPlayed));
+        currentSession_->setText(game.backend == "steam" ? "Unavailable for Steam" : stats.active ? formatTrackedTime(stats.currentMs, true) : "—");
+    } catch (const std::exception &error) {
+        timePlayed_->setText("Unavailable"); timePlayed_->setToolTip(QString::fromUtf8(error.what()));
+    }
+}
 void Window::selectGame() {
     const auto g = selected(); const bool valid = library_ && !g.id.isEmpty();
     const bool accessible = rootAvailable();
@@ -513,6 +540,7 @@ void Window::selectGame() {
     cover_->setGame(valid ? g.name : QString(), metadata);
     description_->setText(metadata.description.isEmpty() ? "No description yet." :
         (metadata.description.size() > 500 ? metadata.description.left(500).trimmed() + "…" : metadata.description));
+    updatePlaytime();
     playtimeValue_->setText(metadata.playtime.value_or("—")); tags_->setText(metadata.tags.isEmpty() ? "No tags yet" : metadata.tags.join(" · "));
     if (valid) {
         if (remote) {

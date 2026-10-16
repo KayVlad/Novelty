@@ -75,6 +75,7 @@ private:
     bool rootAvailable() const;
     void refresh();
     void selectGame();
+    void updatePlaytime();
     void message(const QString &);
     void updateRootLink();
     void removeGame(const QString &id, QDialog *manageDialog);
@@ -105,12 +106,13 @@ private:
     QStackedWidget *views_;
     Cover *cover_;
     QLabel *status_, *setupState_, *syncState_, *description_, *playtimeValue_, *tags_;
+    QLabel *timePlayed_, *lastPlayed_, *currentSession_;
     QLabel *rootLabel_, *title_, *originalTitle_, *detail_, *notice_;
     QPushButton *scanButton_;
     QAction *listPlay_, *listManage_, *listInstall_;
     QLineEdit *search_;
     QFileSystemWatcher watcher_;
-    QTimer scanDelay_, scanPoll_, launchPoll_, syncTimer_;
+    QTimer scanDelay_, scanPoll_, launchPoll_, syncTimer_, playtimeTimer_;
     QProcess *serverRetryProcess_ = nullptr;
     QHash<QString, qint64> serverNextRetry_;
     QHash<QString, int> serverRetryFailures_;

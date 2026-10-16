@@ -1,3 +1,4 @@
+#include "playtime.h"
 #include "core.h"
 #include "setup.h"
 #include "runtime.h"
@@ -428,6 +429,7 @@ Library::Library(QString root) : root_(canonicalPath(root)), connection_(QUuid::
         } catch (...) { db_.rollback(); throw; }
     }
     rebaseMovedLibrary();
+    try { recoverPlaytime(root_); } catch (const std::exception &) { /* Optional statistics never block the library. */ }
 }
 Library::~Library() {
     db_.close(); db_ = QSqlDatabase(); QSqlDatabase::removeDatabase(connection_);
